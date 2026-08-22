@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  plugin:
+    name: host plugin build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: packages/lens-mate/pnpm-lock.yaml
+      - name: install
+        working-directory: packages/lens-mate
+        run: pnpm install --frozen-lockfile
+      - name: build (host plugin)
+        working-directory: packages/lens-mate
+        run: pnpm build
+      - name: validate hand-written client
+        working-directory: packages/lens-mate
+        run: node --check lib/client.js
+
+  app:
+    name: flutter app analyze
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: pub get
+        working-directory: packages/app
+        run: flutter pub get
+      - name: analyze
+        working-directory: packages/app
+        run: flutter analyze

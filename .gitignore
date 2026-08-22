@@ -10,6 +10,7 @@ dist/
 *.aab
 *.ipa
 *.jar
+*.tgz
 
 # ── dart / flutter ───────────────────────────────────────────────
 .dart_tool/

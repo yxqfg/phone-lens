@@ -1,0 +1,32 @@
+# phone-lens bundle patch: inserts the host-side plugin row into the profile.
+# Applied via `dsh plugin --profile web add <path-to-packages/phone-lens>`.
+# All config keys mirror src/config.ts defaults; a deployment overrides them
+# in its own profile layer without touching this file.
+
+- insert:
+    - id: phone-lens
+      name: 'phone-lens'
+      config:
+        server:
+          host: '0.0.0.0'
+          port: 8791
+        limits:
+          maxUploadBytes: 10485760
+          allowedTypes:
+            - 'image/jpeg'
+            - 'image/png'
+          uploadsPerMinute: 10
+          previewFrameMaxBytes: 524288
+        pairing:
+          codeTtlMs: 900000
+        preview:
+          maxWidth: 854
+          maxHeight: 480
+          fps: 10
+          jpegQuality: 70
+        inject:
+          mode: 'followup'
+          notePrefix: '[手机拍照]'
+        target:
+          mode: 'latest'
+          pinnedSessionId: null

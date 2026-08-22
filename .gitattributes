@@ -1,0 +1,4 @@
+# 统一文本换行;Windows PowerShell 脚本保留 CRLF,其余文本用 LF
+* text=auto
+*.ps1 text eol=crlf
+*.sh  text eol=lf

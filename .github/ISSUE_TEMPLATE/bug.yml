@@ -1,0 +1,24 @@
+name: Bug report
+description: 报告一个 bug
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么？
+      description: 尽量给出复现步骤、期望行为与实际行为。
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: dsh / Flutter / Android 版本与设备型号。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志（可脱敏）
+      description: 相关日志或截图。涉及 token 请先脱敏。

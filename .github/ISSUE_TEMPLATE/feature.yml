@@ -1,0 +1,17 @@
+name: Feature request
+description: 提议一个新功能
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题
+      description: 简述你希望解决什么问题或改善什么体验。
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你的思路
+      description: 期望的行为、交互或实现方向。

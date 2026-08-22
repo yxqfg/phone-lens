@@ -1,4 +1,4 @@
-# PhoneLens —— 手机拍照直连编码 Agent
+# PhoneLens —— 手机拍照直连DeepSeek Harness
 
 > 手机拍照 / 实时取景，一键送达本机 **dsh** 会话，成为模型可直接消费的图片输入。
 

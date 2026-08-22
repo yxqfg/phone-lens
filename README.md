@@ -67,6 +67,10 @@ PhoneLens 由两部分组成，放在同一个仓库：
 powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
 ```
 
+> 已发布 npm 后可直接：`dsh plugin --profile web add phone-lens`；或用
+> [Releases](https://github.com/yxqfg/phone-lens/releases) 附带的 tarball 安装。
+> 完整使用说明见 [`docs/usage.md`](docs/usage.md)。
+
 重启 `dsh web`，终端会打印配对二维码；也可以浏览器打开
 `http://127.0.0.1:8791/view.html`（降级取景页：实时画面 + 二维码 + 快门 + 画中画置顶小窗）。
 
@@ -126,7 +130,8 @@ node scripts\smoke\smoke.mjs 8791                                              #
 ├── docs/
 │   ├── architecture.md          # 架构方案：决策、目录结构、数据流、阶段计划
 │   ├── protocol.md              # 传输协议：配对/上传/取景（HTTP + WS）
-│   └── dsh-caps.md              # DSH 能力缝调研：附件注入 / Slot UI / agent 事件
+│   ├── dsh-caps.md              # DSH 能力缝调研：附件注入 / Slot UI / agent 事件
+│   └── usage.md                 # 使用说明：日常操作与常见问题
 ├── packages/
 │   ├── lens-mate/               # dsh 双面插件（电脑端主体，包名 phone-lens）
 │   │   ├── src/                 #   ── host 半边（Node）──

@@ -2,7 +2,7 @@
 
 > 手机拍照 / 实时取景，一键送达本机 **dsh** 会话，成为模型可直接消费的图片输入。
 
-![](C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-16-42-image.png)
+![](assets/screenshots/2026-08-23-02-16-42-image.png)
 
 PhoneLens 由两部分组成，放在同一个仓库：
 
@@ -19,35 +19,36 @@ PhoneLens 由两部分组成，放在同一个仓库：
 
 - **扫码配对**：一次性 8 位配对码，15 分钟有效，签发即焚；设备 token 只存 SHA-256
 
-<img title="" src="file:///C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-00-04-image.png" alt="" width="618" data-align="left"><img title="" src="file:///C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-01-52-f2b73233434adde89da6b78d0c37ade2.jpg" alt="" width="193" data-align="left">
+<img title="" src="assets/screenshots/2026-08-23-02-00-04-image.png" alt="" width="618" data-align="left"><img title="" src="assets/screenshots/2026-08-23-02-01-52-f2b73233434adde89da6b78d0c37ade2.jpg" alt="" width="193" data-align="left">
 
 - **实时取景**：手机以 MJPEG-over-WebSocket 推流，电脑端悬浮小窗 / 独立取景页实时显示
 
-![](C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-07-40-image.png)
+![](assets/screenshots/2026-08-23-02-07-40-image.png)
 
-<img title="" src="file:///C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-07-49-f2f259198929f1bc4ec966e05714bff1.jpg" alt="" width="195">
+<img title="" src="assets/screenshots/2026-08-23-02-07-49-f2f259198929f1bc4ec966e05714bff1.jpg" alt="" width="195">
 
 - **双端快门**：电脑端小窗或手机端任一快门，走同一条上传→注入管线
 
 - **注入进会话**：图片自动写入 dsh 会话输入框，模型下一轮直接看到；可锁定目标会话（默认「最近活跃」）
 
-![](C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-18-30-image.png)
+![](assets/screenshots/2026-08-23-02-18-30-image.png)
 
 - **多设备并存**：多台手机同时配对；电脑端切换预览、手机端「设为主机」一键抢占；未选中的手机暂停推流但仍可上传
 
-<img title="" src="file:///C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-10-18-image.png" alt="" data-align="inline">
+<img title="" src="assets/screenshots/2026-08-23-02-10-18-image.png" alt="" data-align="inline">
 
 
 
-<img title="" src="file:///C:/Users/Lenovo/AppData/Local/Temp/Screenshot_20260823_020953.jpg" alt="Screenshot_20260823_020953.jpg" width="207" data-align="inline">
 
-<img src="file:///C:/Users/Lenovo/xwechat_files/wxid_n1sgsjdrv7522_3bab/temp/RWTemp/2026-08/9e20f478899dc29eb19741386f9343c8/5244f0e504a4fa84edb11c5f496447f9.jpg" title="" alt="5244f0e504a4fa84edb11c5f496447f9.jpg" width="208">
+
+
+<img src="assets/screenshots/5244f0e504a4fa84edb11c5f496447f9.jpg" title="" alt="5244f0e504a4fa84edb11c5f496447f9.jpg" width="208">
 
 
 
 - **自定义裁剪**：90° 旋转、裁剪框不出界、手柄可调、取消即丢弃；相册**批量连续裁剪**（逐张「下一张」→上传→下一张）
 
-<img title="" src="file:///C:/Users/Lenovo/AppData/Roaming/marktext/images/2026-08-23-02-15-19-74d490aad9263243241622a27e25ca9f.png" alt="" width="209">
+<img title="" src="assets/screenshots/2026-08-23-02-15-19-74d490aad9263243241622a27e25ca9f.png" alt="" width="209">
 
 - **颜色校正**：预览红/蓝通道颠倒、肤色失真时一键校正
 - **取景对焦**：点击对焦、长按锁定

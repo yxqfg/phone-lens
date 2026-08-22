@@ -28,6 +28,36 @@ PhoneLens 由两部分组成，放在同一个仓库：
 
 ---
 
+## 🧭 新人快速安装（非开发者）
+
+如果你是**第一次使用、不想折腾开发环境**，照下面两步即可，剩下交给手机扫码。
+
+### 1. 手机端：下载并安装 App
+
+1. 打开仓库右侧的 **Releases** 页（或直接访问 `https://github.com/yxqfg/phone-lens/releases`）
+2. 下载最新版本里的 **`app-release.apk`**
+3. 用手机打开该 APK 安装；首次会提示「允许安装未知来源应用」，允许即可
+4. 安装后打开 **PhoneLens**
+
+> 每次发布都会把打包好的 APK 附带在 Release 页，无需自己编译。
+
+### 2. 电脑端：接入 dsh 插件
+
+1. 先安装 DeepSeek Harness (dsh) 并初始化 web 配置
+2. 下载仓库 **Source code (zip)** 并解压，或用 `git clone`
+3. 管理员 PowerShell 运行：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
+   ```
+4. 重启 `dsh web`，终端会打印配对二维码
+
+### 3. 配对与使用
+
+- 手机 App 扫电脑端二维码 → 配对成功
+- 取景页按快门拍照（可选裁剪）→ 图片进入 dsh 会话；或点「启动预览」→ 电脑端悬浮小窗实时取景
+
+> 需要构建/开发的进阶步骤见下面的「快速开始」。
+
 ## 🚀 快速开始
 
 ### 1. 电脑端：把插件装进 dsh web profile

@@ -58,7 +58,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yxqfg/phone-lens"
+    "url": "git+https://github.com/yxqfg/phone-lens.git"
   },
   "publishConfig": {
     "access": "public"

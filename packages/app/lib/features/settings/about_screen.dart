@@ -57,7 +57,8 @@ class AboutScreen extends StatelessWidget {
               child: Text('联系', style: TextStyle(color: Colors.white54, fontSize: 14)),
             ),
             const _Contact('Bilibili', '云下千风过'),
-            const _Contact('GitHub', '待定'),
+            const _Contact('GitHub', 'github.com/yxqfg/phone-lens'),
+            const _Contact('插件市场', 'awesome-dsh-plugin/awesome-dsh-plugin'),
             const Padding(
               padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
               child: Text('v0.2.0 · PhoneLens 直连取景', style: TextStyle(color: Colors.white38, fontSize: 12)),

@@ -28,6 +28,8 @@ export const VIEW_HTML = `<!doctype html>
   #qrimg { width: 100%; image-rendering: pixelated; background: #fff; padding: 8px; border-radius: 8px; }
   .row { display: flex; gap: 6px; align-items: center; margin: 6px 0; }
   .row code { background: #1d242d; padding: 2px 8px; border-radius: 6px; letter-spacing: .12em; font-size: 15px; }
+  .row a { color: #3b7cb5; text-decoration: none; }
+  .row a:hover { text-decoration: underline; }
   button { background: #1f2937; border: 1px solid #2f3b48; color: #dfe7ee; padding: 6px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; }
   button:hover { background: #28323e; }
   button:disabled { opacity: .45; cursor: default; }
@@ -51,6 +53,7 @@ export const VIEW_HTML = `<!doctype html>
     <img id="qrimg" alt="配对二维码">
     <div class="row"><code id="paircode"></code><button id="refresh">刷新</button></div>
     <div class="row" id="urls"></div>
+    <div class="row"><a href="https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk" target="_blank" rel="noopener">📱 手机还没装 App？点此下载（Android APK）</a></div>
     <h2 style="margin-top:14px">快门</h2>
     <div class="row">
       <button id="shoot" disabled>◉ 拍照并注入</button>

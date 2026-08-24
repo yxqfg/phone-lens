@@ -48,6 +48,8 @@ window.__ModuleLoader__.load({
 .lm-qr img { width: 148px; height: 148px; image-rendering: pixelated; background: #fff; border-radius: 6px; }
 .lm-qr .code { font-size: 16px; letter-spacing: .18em; }
 .lm-qr .hint { font-size: 10px; color: #7d8da0; text-align: center; line-height: 1.45; }
+.lm-qr a.lm-dl { display: block; margin-top: 4px; font-size: 11px; color: #3b7cb5; text-decoration: none; }
+.lm-qr a.lm-dl:hover { text-decoration: underline; }
 .lm-port { display: flex; gap: 6px; align-items: center; font-size: 11px; color: #7d8da0; }
 .lm-port input { width: 64px; background: #0d1117; color: #dfe7ee; border: 1px solid #2f3b48; border-radius: 6px; padding: 3px 6px; font-size: 12px; }
 .lm-flash { font-size: 11px; color: #8fa1b5; min-height: 14px; }
@@ -422,6 +424,7 @@ window.__ModuleLoader__.load({
 											qr && qr.pngDataUrl ? h("img", { src: qr.pngDataUrl, alt: "配对二维码" }) : h("div", { className: "hint" }, "二维码加载中…"),
 											qr ? h("div", { className: "code" }, qr.code) : null,
 											h("div", { className: "hint" }, "手机 App 扫码配对;或在 App 内手动输入", h("br", null), qr && qr.urls && qr.urls[0] ? `${qr.urls[0].replace("http://", "")}:${qr.code}` : ""),
+									h("a", { className: "lm-dl", href: "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk", target: "_blank", rel: "noopener" }, "手机还没装 App？点此下载（Android APK）"),
 										)
 									: null,
 								h("span", { className: `lm-flash${flash.startsWith("已") ? " ok" : ""}` }, flash),

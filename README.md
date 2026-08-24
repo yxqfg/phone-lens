@@ -8,7 +8,7 @@ PhoneLens 由两部分组成，放在同一个仓库：
 
 | 组件            | 路径                   | 说明                                                                                |
 | ------------- | -------------------- | --------------------------------------------------------------------------------- |
-| **主机插件（电脑端）** | `packages/lens-mate` | dsh **双面插件**：host 半边（接收服务，Node HTTP + WebSocket）+ client 半边（dsh Web UI 右下角悬浮取景小窗） |
+| **主机插件（电脑端）** | `packages/phone-lens` | dsh **双面插件**：host 半边（接收服务，Node HTTP + WebSocket）+ client 半边（dsh Web UI 右下角悬浮取景小窗） |
 | **手机 App**    | `packages/app`       | Flutter / Android：扫码配对、实时取景、拍照/裁剪/批量上传、设置                                         |
 
 链路为局域网 HTTP/WebSocket，扫码一次性配对；USB 网络共享复用同一协议。
@@ -105,7 +105,7 @@ powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
 `http://127.0.0.1:8791/view.html`（降级取景页：实时画面 + 二维码 + 快门 + 画中画置顶小窗）。
 
 > 开发调试（不进 dsh，上传落盘到 `~/.dsh/phone-lens/uploads`）：
-> `cd packages\lens-mate; pnpm build; pnpm dev:standalone`
+> `cd packages\phone-lens; pnpm build; pnpm dev:standalone`
 
 ### 2. 手机端：安装 App
 
@@ -145,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File scripts\firewall.ps1
 ### 无手机验证电脑端
 
 ```powershell
-cd packages\lens-mate; $env:LENS_DATA_DIR="$PWD\.smoke-data"; node lib\dev.js   # 终端 A
+cd packages\phone-lens; $env:LENS_DATA_DIR="$PWD\.smoke-data"; node lib\dev.js   # 终端 A
 node scripts\smoke\smoke.mjs 8791                                              # 终端 B
 ```
 
@@ -163,7 +163,7 @@ node scripts\smoke\smoke.mjs 8791                                              #
 │   ├── dsh-caps.md              # DSH 能力缝调研：附件注入 / Slot UI / agent 事件
 │   └── usage.md                 # 使用说明：日常操作与常见问题
 ├── packages/
-│   ├── lens-mate/               # dsh 双面插件（电脑端主体，包名 phone-lens）
+│   ├── phone-lens/               # dsh 双面插件（电脑端主体，包名 phone-lens）
 │   │   ├── src/                 #   ── host 半边（Node）──
 │   │   │   ├── index.ts         #   装配：server + inject + tools + events
 │   │   │   ├── server/          #   http 路由 / 鉴权 / ws hub / 静态取景页
@@ -184,7 +184,7 @@ node scripts\smoke\smoke.mjs 8791                                              #
     └── smoke/                   # 协议冒烟测试
 ```
 
-> 注：插件包名统一为 **`phone-lens`**；目录名沿用 `packages/lens-mate`（文件系统路径），应用显示名为 **PhoneLens**。
+> 注：插件包名与目录名统一为 **`phone-lens`**，应用显示名为 **PhoneLens**。
 
 ---
 
@@ -192,7 +192,7 @@ node scripts\smoke\smoke.mjs 8791                                              #
 
 ```bash
 # 主机插件
-cd packages/lens-mate
+cd packages/phone-lens
 pnpm install
 pnpm build            # tsdown 构建 lib/index.js + lib/dev.js
 
@@ -205,7 +205,7 @@ flutter run            # 或 flutter build apk --release
 **运行插件冒烟**（无真实手机）：
 
 ```powershell
-cd packages\lens-mate; $env:LENS_DATA_DIR="$PWD\.smoke-data"; node lib\dev.js
+cd packages\phone-lens; $env:LENS_DATA_DIR="$PWD\.smoke-data"; node lib\dev.js
 node scripts\smoke\smoke.mjs 8791
 ```
 

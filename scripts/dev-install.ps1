@@ -2,7 +2,7 @@
 # 用法: powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$pkg = Join-Path $root "packages\lens-mate"
+$pkg = Join-Path $root "packages\phone-lens"
 
 Write-Host "==> building phone-lens..."
 Push-Location $pkg

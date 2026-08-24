@@ -14,12 +14,12 @@
 
 ```powershell
 # 1. 构建
-cd packages\lens-mate
+cd packages\phone-lens
 pnpm install
 pnpm build
 
 # 2. 接入 dsh 的 web profile
-dsh plugin --profile web add C:\Users\<you>\phone-lens\packages\lens-mate
+dsh plugin --profile web add C:\Users\<you>\phone-lens\packages\phone-lens
 ```
 
 也可以用仓库根的 `scripts\dev-install.ps1` 一键完成构建与接入，然后重启 `dsh web`，

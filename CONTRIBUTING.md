@@ -15,14 +15,14 @@
 
 本项目为 monorepo，包含两个独立子项目：
 
-- **主机插件**（`packages/lens-mate`，包名 `phone-lens`）：Node/TypeScript，pnpm 构建
+- **主机插件**（`packages/phone-lens`，包名 `phone-lens`）：Node/TypeScript，pnpm 构建
 - **手机 App**（`packages/app`）：Flutter/Dart
 
 请确保已安装 `pnpm` 与 Flutter SDK。
 
 ```bash
 # 主机插件
-cd packages/lens-mate
+cd packages/phone-lens
 pnpm install
 pnpm build            # tsdown 构建 lib/index.js + lib/dev.js
 

@@ -18,15 +18,15 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: packages/lens-mate/pnpm-lock.yaml
+          cache-dependency-path: packages/phone-lens/pnpm-lock.yaml
       - name: install
-        working-directory: packages/lens-mate
+        working-directory: packages/phone-lens
         run: pnpm install --frozen-lockfile
       - name: build (host plugin)
-        working-directory: packages/lens-mate
+        working-directory: packages/phone-lens
         run: pnpm build
       - name: validate hand-written client
-        working-directory: packages/lens-mate
+        working-directory: packages/phone-lens
         run: node --check lib/client.js
 
   app:

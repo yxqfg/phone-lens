@@ -39,7 +39,7 @@
 
 ### D2 · 一个双面 cordis 插件包,标准方式接入 profile
 - package.json 同时声明 `dsh.bundle.patch: "./cordis.patch.yml"`(host 行 insert 进 profile,参考 `dsh-web-app/cordis.patch.yml`)与 `dsh.client: { platform: "web", inject: [...] }`(浏览器 roster,参考 `dsh-client-ui-attachment/package.json`)。
-- 接入命令:`dsh plugin --profile web add <本项目 packages/lens-mate 路径>`(内部转发 pnpm 并自动 reconcile bundles 层,见 `dsh/lib/plugin-9h8shc4d.js`)。
+- 接入命令:`dsh plugin --profile web add <本项目 packages/phone-lens 路径>`(内部转发 pnpm 并自动 reconcile bundles 层,见 `dsh/lib/plugin-9h8shc4d.js`)。
 - client bundle 用 tsdown 构建(官方 dsh.client 包同款),React 等由 shell 静态表供给,额外依赖走 `dsh.client.external`。
 
 ### D3 · 附件注入管线(核心链路)
@@ -115,7 +115,7 @@ ds_siu/
 │   ├── protocol.md                # 配对/上传/取景协议规范(HTTP+WS 帧)
 │   └── dsh-caps.md                # DSH 能力缝调研结论(附件/slot/事件)
 ├── packages/
-│   ├── lens-mate/                 # dsh 双面插件(电脑端主体)
+│   ├── phone-lens/                 # dsh 双面插件(电脑端主体)
 │   │   ├── package.json           # dsh.bundle.patch + dsh.client 声明
 │   │   ├── cordis.patch.yml       # 向 profile insert 本插件 host 行(含默认 config)
 │   │   ├── tsdown.config.ts       # 构建 lib/index.js(host)与 lib/client.js(browser)

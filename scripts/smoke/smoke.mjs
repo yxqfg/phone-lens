@@ -4,7 +4,7 @@
  *
  * Usage: node scripts/smoke/smoke.mjs [port]
  */
-import WebSocket from "../../packages/lens-mate/node_modules/ws/index.js";
+import WebSocket from "../../packages/phone-lens/node_modules/ws/index.js";
 
 const PORT = Number(process.argv[2] ?? 8791);
 const BASE = `http://127.0.0.1:${PORT}`;

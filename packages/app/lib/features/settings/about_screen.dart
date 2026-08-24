@@ -117,9 +117,10 @@ class _Contact extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 3, 20, 3),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(width: 108, child: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 14))),
-          Text(value, style: const TextStyle(color: Colors.white, fontSize: 14)),
+          Expanded(child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 14, height: 1.4))),
         ],
       ),
     );

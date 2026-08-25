@@ -72,14 +72,24 @@ PhoneLens 由两部分组成，放在同一个仓库：
 
 ### 2. 电脑端：接入 dsh 插件
 
-1. 先安装 DeepSeek Harness (dsh) 并初始化 web 配置
-2. 下载仓库 **Source code (zip)** 并解压，或用 `git clone`
-3. 管理员 PowerShell 运行：
-   
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
-   ```
-4. 重启 `dsh web`，终端会打印配对二维码
+**最简单（推荐）：** 已发布到 npm，一条命令装好：
+
+```powershell
+dsh plugin --profile web add phone-lens
+```
+
+然后重启 `dsh web` 即可。
+
+> 也可以直接从 [Releases](https://github.com/yxqfg/phone-lens/releases) 用预构建 tarball：
+> `dsh plugin --profile web add https://github.com/yxqfg/phone-lens/releases/latest/download/phone-lens.tgz`
+
+**进阶（从源码安装）：** 下载仓库 **Source code (zip)** 解压（或 `git clone`），管理员 PowerShell 运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
+```
+
+同样重启 `dsh web`，终端会打印配对二维码。
 
 ### 3. 配对与使用
 
@@ -97,8 +107,12 @@ PhoneLens 由两部分组成，放在同一个仓库：
 powershell -ExecutionPolicy Bypass -File scripts\dev-install.ps1
 ```
 
-> 已发布 npm 后可直接：`dsh plugin --profile web add phone-lens`；或用
-> [Releases](https://github.com/yxqfg/phone-lens/releases) 附带的 tarball 安装。
+> **三种安装方式任选其一：**
+>
+> - **npm（推荐，免构建）**：已发布到 npm，直接 `dsh plugin --profile web add phone-lens`
+> - **tarball（预构建）**：`dsh plugin --profile web add https://github.com/yxqfg/phone-lens/releases/latest/download/phone-lens.tgz`
+> - **源码（开发）**：上面的 `dev-install.ps1` 脚本（需要 pnpm，会构建后接入）
+>
 > 完整使用说明见 [`docs/usage.md`](docs/usage.md)。
 
 重启 `dsh web`，终端会打印配对二维码；也可以浏览器打开

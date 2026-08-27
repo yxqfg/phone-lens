@@ -4,6 +4,15 @@
 [Keep a Changelog](https://keepachangelog.com/)，版本遵循
 [语义化版本](https://semver.org/)。
 
+## [0.3.0] - 2026
+
+### Added
+- Web UI 小窗「点此扫码下载」：手机未装 App 时，点击弹出**二维码浮层**，手机扫码直接下载 APK
+  - 二维码默认指向 **Gitee 发行版**（国内快），浮层内附 Gitee/GitHub 双源备用链接
+  - 新增回环端点 `GET /app-qr.json`（二维码 + 双源地址）
+  - 旧版 host 无该端点时自动回退为纯链接浮层
+  - 新配置项 `app.downloadUrl` 可覆盖二维码指向（默认 Gitee `v0.3.0` 发行版 APK 直链）
+
 ## [0.2.0] - 2026
 
 ### Added

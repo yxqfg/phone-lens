@@ -30,3 +30,6 @@
         target:
           mode: 'latest'
           pinnedSessionId: null
+        app:
+          # 手机 App 下载二维码指向的地址;留空走内置默认(Gitee 发行版直链,国内快)
+          downloadUrl: null

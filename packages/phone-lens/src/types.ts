@@ -14,6 +14,8 @@ export interface LensConfig {
   preview: { maxWidth: number; maxHeight: number; fps: number; jpegQuality: number };
   inject: { mode: "followup" | "steer"; notePrefix: string };
   target: { mode: "latest" | "pinned"; pinnedSessionId: string | null };
+  /** Where the phone App APK can be fetched from (QR + fallback links). */
+  app: { downloadUrl: string; giteeUrl: string; githubUrl: string };
 }
 
 /** Minimal structural view of a dsh ImageAttachmentRef (docs/dsh-caps.md Q1). */

@@ -4,9 +4,9 @@ import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 
 import { createServer } from "node:http";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { WebSocketServer } from "ws";
+import QRCode from "qrcode";
 import * as os from "node:os";
 import { homedir } from "node:os";
-import QRCode from "qrcode";
 import { env } from "node:process";
 
 //#region src/config.ts
@@ -19,6 +19,10 @@ function normalizeConfig(raw) {
 	const preview = r.preview ?? {};
 	const inject = r.inject ?? {};
 	const target = r.target ?? {};
+	const app = r.app ?? {};
+	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.0/app-release.apk";
+	const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
+	const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
 	const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t) => typeof t === "string") : void 0;
 	const mode = inject.mode === "steer" ? "steer" : "followup";
 	return {
@@ -47,6 +51,11 @@ function normalizeConfig(raw) {
 		target: {
 			mode: target.mode === "pinned" ? "pinned" : "latest",
 			pinnedSessionId: typeof target.pinnedSessionId === "string" && target.pinnedSessionId ? target.pinnedSessionId : null
+		},
+		app: {
+			giteeUrl,
+			githubUrl: typeof app.githubUrl === "string" && app.githubUrl ? app.githubUrl : GITHUB_APK,
+			downloadUrl: typeof app.downloadUrl === "string" && app.downloadUrl ? app.downloadUrl : giteeUrl
 		}
 	};
 }
@@ -756,10 +765,10 @@ async function handle$1(deps, req, res, ctx) {
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
 		name: "PhoneLens 直连取景",
-		version: "0.2.0",
+		version: "0.3.0",
 		requiresPairing: true
 	}, cors);
-	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
+	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
 	if (method === "GET" && (path === "/" || path === "/view.html")) {
 		res.writeHead(200, {
 			"content-type": "text/html; charset=utf-8",
@@ -792,6 +801,23 @@ async function handle$1(deps, req, res, ctx) {
 		});
 		res.end(Buffer.from(b64, "base64"));
 		return;
+	}
+	if (method === "GET" && path === "/app-qr.json") {
+		const target = config$1.app.downloadUrl || config$1.app.giteeUrl;
+		const pngDataUrl = await QRCode.toDataURL(target, {
+			errorCorrectionLevel: "M",
+			margin: 2,
+			width: 320
+		});
+		return sendJson(res, 200, {
+			url: target,
+			gitee: config$1.app.giteeUrl,
+			github: config$1.app.githubUrl,
+			pngDataUrl
+		}, {
+			...cors,
+			"cache-control": "no-store"
+		});
 	}
 	if (method === "POST" && path === "/pair") {
 		const body = await readJsonBody(req, 4096);

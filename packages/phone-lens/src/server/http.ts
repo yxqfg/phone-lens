@@ -6,6 +6,7 @@ import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
+import QRCode from "qrcode";
 import type { DeliveryReceipt, LensConfig } from "../types.js";
 import { ERROR_CODES } from "../types.js";
 import type { DeliverySink } from "../inject/deliver.js";
@@ -140,11 +141,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.2.0", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.0", requiresPairing: true }, cors);
   }
 
   // ── loopback-only endpoints (preview page, QR, view stream) ──────────────
-  if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png")) {
+  if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) {
     return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
   }
   if (method === "GET" && (path === "/" || path === "/view.html")) {
@@ -164,6 +165,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     res.writeHead(200, { "content-type": "image/png", "cache-control": "no-store" });
     res.end(Buffer.from(b64, "base64"));
     return;
+  }
+  // App-download QR: encodes the APK URL (Gitee by default) so a phone can
+  // scan it straight from the Web UI overlay and start the download.
+  if (method === "GET" && path === "/app-qr.json") {
+    const target = config.app.downloadUrl || config.app.giteeUrl;
+    const pngDataUrl = await QRCode.toDataURL(target, { errorCorrectionLevel: "M", margin: 2, width: 320 });
+    return sendJson(res, 200, { url: target, gitee: config.app.giteeUrl, github: config.app.githubUrl, pngDataUrl }, { ...cors, "cache-control": "no-store" });
   }
 
   // ── pairing ──────────────────────────────────────────────────────────────

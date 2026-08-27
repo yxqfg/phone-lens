@@ -9,6 +9,11 @@ export function normalizeConfig(raw: unknown): LensConfig {
   const preview = (r.preview ?? {}) as Record<string, any>;
   const inject = (r.inject ?? {}) as Record<string, any>;
   const target = (r.target ?? {}) as Record<string, any>;
+  const app = (r.app ?? {}) as Record<string, any>;
+  // App download sources: Gitee first (CN-friendly), GitHub as the fallback link.
+  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.0/app-release.apk";
+  const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
+  const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
   const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t: unknown): t is string => typeof t === "string") : undefined;
   const mode = inject.mode === "steer" ? "steer" : "followup";
   return {
@@ -38,6 +43,12 @@ export function normalizeConfig(raw: unknown): LensConfig {
     target: {
       mode: target.mode === "pinned" ? "pinned" : "latest",
       pinnedSessionId: typeof target.pinnedSessionId === "string" && target.pinnedSessionId ? target.pinnedSessionId : null,
+    },
+    app: {
+      giteeUrl,
+      githubUrl: typeof app.githubUrl === "string" && app.githubUrl ? app.githubUrl : GITHUB_APK,
+      // The QR encodes this URL; defaults to the Gitee release asset.
+      downloadUrl: typeof app.downloadUrl === "string" && app.downloadUrl ? app.downloadUrl : giteeUrl,
     },
   };
 }

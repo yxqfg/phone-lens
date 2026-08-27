@@ -19,6 +19,9 @@ window.__ModuleLoader__.load({
 
 		const NS = "phone-lens";
 		const PORT_KEY = "phoneLens.port";
+		// App download fallbacks (used when /app-qr.json is unavailable on an older host).
+		const APP_GITEE = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.0/app-release.apk";
+		const APP_GITHUB = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
 		const h = react.createElement;
 
 		// ── styles ────────────────────────────────────────────────────────────
@@ -64,6 +67,13 @@ window.__ModuleLoader__.load({
 .lm-rename { position: absolute; right: 0; bottom: 56px; width: 268px; background: #14181d; border: 1px solid #2a333e; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.6); padding: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 5; }
 .lm-rename-title { font-size: 13px; color: #dfe7ee; font-weight: 600; }
 .lm-rename-input { background: #0d1117; color: #dfe7ee; border: 1px solid #2f3b48; border-radius: 8px; padding: 8px; font-size: 13px; }
+.lm-appqr { position: absolute; right: 0; bottom: 56px; width: 268px; background: #14181d; border: 1px solid #2a333e; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.6); padding: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 6; }
+.lm-appqr-title { font-size: 13px; color: #dfe7ee; font-weight: 600; }
+.lm-appqr-img { width: 168px; height: 168px; image-rendering: pixelated; background: #fff; border-radius: 8px; }
+.lm-appqr-hint { font-size: 10px; color: #7d8da0; text-align: center; line-height: 1.45; }
+.lm-appqr-links { font-size: 11px; display: flex; gap: 5px; align-items: center; color: #7d8da0; }
+.lm-appqr-links a { color: #3b7cb5; text-decoration: none; }
+.lm-appqr-links a:hover { text-decoration: underline; }
 .fab-cam { display: inline-flex; align-items: center; justify-content: center; }
 .fab-cam svg { display: block; }
 @keyframes lm-blast { 0%,100% { background: #6cc0ff; box-shadow: 0 0 16px rgba(108,192,255,.9); } 50% { background: #2a6db8; box-shadow: 0 0 4px rgba(108,192,255,.2); } }
@@ -189,6 +199,7 @@ window.__ModuleLoader__.load({
 			const [pending, setPending] = useState([]); // [{id, name}] waiting to be staged
 			const [devices, setDevices] = useState([]); // [{id,name,active}]
 			const [rename, setRename] = useState(null); // {id, name} — self-drawn rename dialog
+			const [appQr, setAppQr] = useState(null); // app-download QR dialog payload (or {loading}/{fallback:true})
 			const canvasRef = useRef(null);
 			const wsRef = useRef(null);
 			const framesRef = useRef(0);
@@ -322,6 +333,20 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			// Open the app-download dialog: QR (from the host) + source links.
+			// Falls back to the built-in Gitee/GitHub links when the endpoint is
+			// missing (older host half running an older release).
+			async function openAppQr() {
+				setAppQr({ loading: true });
+				try {
+					const r = await fetch(`${baseUrl}/app-qr.json`, { cache: "no-store" });
+					if (!r.ok) throw new Error(`HTTP ${r.status}`);
+					setAppQr(await r.json());
+				} catch (_) {
+					setAppQr({ fallback: true, gitee: APP_GITEE, github: APP_GITHUB });
+				}
+			}
+
 			// pairing QR appears when the panel opens without a camera
 			useEffect(() => {
 				if (open && !camOn && !qr) void refreshQr();
@@ -424,7 +449,7 @@ window.__ModuleLoader__.load({
 											qr && qr.pngDataUrl ? h("img", { src: qr.pngDataUrl, alt: "配对二维码" }) : h("div", { className: "hint" }, "二维码加载中…"),
 											qr ? h("div", { className: "code" }, qr.code) : null,
 											h("div", { className: "hint" }, "手机 App 扫码配对;或在 App 内手动输入", h("br", null), qr && qr.urls && qr.urls[0] ? `${qr.urls[0].replace("http://", "")}:${qr.code}` : ""),
-									h("a", { className: "lm-dl", href: "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk", target: "_blank", rel: "noopener" }, "手机还没装 App？点此下载（Android APK）"),
+									h("a", { className: "lm-dl", href: "#", onClick: (e) => { e.preventDefault(); void openAppQr(); }, title: "弹出二维码,手机扫码下载" }, "手机还没装 App？点此扫码下载"),
 										)
 									: null,
 								h("span", { className: `lm-flash${flash.startsWith("已") ? " ok" : ""}` }, flash),
@@ -455,6 +480,27 @@ window.__ModuleLoader__.load({
 								h("button", { className: "lm-btn", onClick: () => setRename(null) }, "取消"),
 								h("button", { className: "lm-btn primary", onClick: confirmRename }, "确定"),
 							),
+						)
+					: null,
+				appQr
+					? h(
+							"div",
+							{ className: "lm-appqr" },
+							h("div", { className: "lm-appqr-title" }, "扫码下载 PhoneLens App"),
+							appQr.loading
+								? h("div", { className: "lm-appqr-hint" }, "二维码生成中…")
+								: appQr.pngDataUrl
+									? h("img", { className: "lm-appqr-img", src: appQr.pngDataUrl, alt: "App 下载二维码" })
+									: h("div", { className: "lm-appqr-hint" }, "二维码暂不可用,请使用下方链接"),
+							h("div", { className: "lm-appqr-hint" }, appQr.fallback ? "手机端请通过以下链接下载 APK" : "手机扫码直接下载 Android APK(默认 Gitee 国内源)"),
+							h(
+								"div",
+								{ className: "lm-appqr-links" },
+								h("a", { href: appQr.gitee || APP_GITEE, target: "_blank", rel: "noopener" }, "Gitee 国内源"),
+								h("span", null, "·"),
+								h("a", { href: appQr.github || APP_GITHUB, target: "_blank", rel: "noopener" }, "GitHub 国际源"),
+							),
+							h("div", { className: "lm-row", style: { width: "100%" } }, h("button", { className: "lm-btn", onClick: () => setAppQr(null) }, "关闭")),
 						)
 					: null,
 			);

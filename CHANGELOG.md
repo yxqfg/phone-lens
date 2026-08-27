@@ -11,7 +11,7 @@
   - 二维码默认指向 **Gitee 发行版**（国内快），浮层内附 Gitee/GitHub 双源备用链接
   - 新增回环端点 `GET /app-qr.json`（二维码 + 双源地址）
   - 旧版 host 无该端点时自动回退为纯链接浮层
-  - 新配置项 `app.downloadUrl` 可覆盖二维码指向（默认 Gitee `v0.3.0` 发行版 APK 直链）
+  - 新配置项 `app.downloadUrl` 可覆盖二维码指向（默认 Gitee `v0.2.0` 发行版 APK 直链，App 自 v0.2.0 起未变更）
 
 ## [0.2.0] - 2026
 

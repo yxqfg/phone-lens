@@ -23,7 +23,7 @@ function normalizeConfig(raw) {
 	const inject = r.inject ?? {};
 	const target = r.target ?? {};
 	const app = r.app ?? {};
-	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.0/app-release.apk";
+	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.2.0/app-release.apk";
 	const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
 	const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
 	const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t) => typeof t === "string") : void 0;
@@ -74,13 +74,21 @@ function clampInt(value, min, max, fallback) {
 //#endregion
 //#region src/inject/host-sink.ts
 /**
+
 * Phase 2 delivery seam: turns a stored image into a durable dsh user message
+
 * attached to the current/last-active session, so the model sees it on the
+
 * next turn.
+
 *
+
 * The active session is tracked from live agent events (inbox inserts and
+
 * `running` status flips). With no live session the image stays stored but
+
 * no delivery occurs — a real state, not an error.
+
 */
 var HostDeliverySink = class {
 	lastActiveId = null;
@@ -157,10 +165,15 @@ var HostDeliverySink = class {
 //#endregion
 //#region src/inject/target.ts
 /**
+
 * Resolves the session an upload should be injected into.
+
 *
+
 * Phase 1: pure config view, no live agents (the agent-event wiring that
+
 * feeds `latest` lands in Phase 2 — see architecture.md §2 D4).
+
 */
 var TargetTracker = class {
 	constructor(config) {
@@ -215,8 +228,11 @@ var PairingStore = class {
 		};
 	}
 	/**
+	
 	* Verify a submitted code and burn it on success.
+	
 	* Constant-time compare; expired codes read as invalid.
+	
 	*/
 	verify(submitted) {
 		if (this.code === null || this.used) return {
@@ -262,9 +278,13 @@ function tokenHashMatches(recordHash, presentedToken) {
 //#endregion
 //#region src/store/devices.ts
 /**
+
 * Paired-device registry, persisted as JSON under the plugin data dir.
+
 * Records carry token HASHES only; the raw token exists solely in the
+
 * pairing response and the phone's secure storage.
+
 */
 var DeviceStore = class {
 	devices = new Map();
@@ -379,9 +399,13 @@ function magicMatches(mediaType, head) {
 	return false;
 }
 /**
+
 * Persist one image through the durable attachment seam.
+
 * Falls back to a content-addressed file when the dsh attachments service is
+
 * not mounted (standalone dev / unusual profile), so uploads never vanish.
+
 */
 async function admitImage(input, attachments, fallbackDir) {
 	if (attachments) {
@@ -467,9 +491,13 @@ async function buildPairingQr(code, expiresAt, config, originOverride) {
 //#endregion
 //#region src/server/static-view.ts
 /**
+
 * The standalone fallback viewfinder page, served at /view.html (loopback only).
+
 * Same protocol as the future Web UI overlay: WS /ws/view frames + capture control.
+
 * Picture-in-Picture turns it into a true always-on-top mini window.
+
 */
 const VIEW_HTML = `<!doctype html>
 <html lang="zh-CN">
@@ -693,10 +721,15 @@ function isLoopback(req) {
 	return LOOPBACK.has(addr);
 }
 /**
+
 * CORS for the dsh Web UI page (served on another loopback port) so it can
+
 * fetch /qr.json and /status from this receiver. Only same-machine origins
+
 * are echoed — a foreign page must not read the pairing code, and its
+
 * cross-origin JSON POST fails the preflight we never answer.
+
 */
 function corsFor(req) {
 	const origin = req.headers.origin;
@@ -1088,12 +1121,19 @@ async function pruneUploads(dir, max) {
 //#endregion
 //#region src/server/hub.ts
 /**
+
 * The viewfinder hub: MULTIPLE camera uplinks (one per phone, keyed by
+
 * deviceId), N loopback view downlinks. The "active" device is auto-selected
+
 * as the last one to send a frame; the view side can switch it via
+
 * `select_device`. Only the active device's frames are fanned out — a second
+
 * phone connecting no longer kicks the first, so several paired phones coexist
+
 * and the user picks which one to watch / shoot from.
+
 */
 var ViewHub = class {
 	cameras = new Map();
@@ -1385,11 +1425,17 @@ function lensDataDir() {
 //#endregion
 //#region src/index.ts
 /**
+
 * phone-lens host plugin.
+
 *
+
 * Boots the receiver inside the dsh process so uploads can flow straight
+
 * into `ctx.attachments` (and, from Phase 2 on, into agent inboxes) with no
+
 * extra IPC. Everything registered here unwinds with the fiber.
+
 */
 var PhoneLens = class extends Service {
 	static inject = [];

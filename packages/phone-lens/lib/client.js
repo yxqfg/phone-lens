@@ -20,7 +20,8 @@ window.__ModuleLoader__.load({
 		const NS = "phone-lens";
 		const PORT_KEY = "phoneLens.port";
 		// App download fallbacks (used when /app-qr.json is unavailable on an older host).
-		const APP_GITEE = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.0/app-release.apk";
+		// Gitee release carrying the newest APK (App unchanged since v0.2.0).
+		const APP_GITEE = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.2.0/app-release.apk";
 		const APP_GITHUB = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
 		const h = react.createElement;
 

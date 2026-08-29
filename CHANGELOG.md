@@ -4,6 +4,22 @@
 [Keep a Changelog](https://keepachangelog.com/)，版本遵循
 [语义化版本](https://semver.org/)。
 
+## [0.3.1] - 2026
+
+### Added
+- 配对二维码**自动刷新**：临期/被扫后自动换新码，无需手动点「↻ 二维码」
+  - 二维码下方显示**有效期倒计时**（`剩余 mm:ss · 到期自动更新`）
+  - 新设备配对上线事件触发立即换码；30 秒兜底轮询防睡眠/时钟偏差
+  - 自动换码时闪现「二维码已更新」提示
+
+### Fixed
+- 修复配对二维码**一直停在「加载中」**的问题（自动刷新改造时误删了初始拉取逻辑）
+
+### Changed
+- link 开发目录依赖根治：`@deepseek-ai/dsh-llm`、`schemastery` 补回 `devDependencies`，
+  link 进 profile 时可独立解析全部 peer 依赖（详见 CONTRIBUTING.md「link 开发目录必读」）
+- npm 发布配置规范化（repository.url、显式预发布 peer 分支）
+
 ## [0.3.0] - 2026
 
 ### Added

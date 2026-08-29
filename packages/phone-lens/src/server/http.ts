@@ -141,7 +141,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.0", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.1", requiresPairing: true }, cors);
   }
 
   // ── loopback-only endpoints (preview page, QR, view stream) ──────────────

@@ -196,12 +196,14 @@ window.__ModuleLoader__.load({
 			const [link, setLink] = useState("disconnected"); // disconnected | connecting | connected
 			const [fps, setFps] = useState(0);
 			const [qr, setQr] = useState(null);
+			const [, setTick] = useState(0); // 1s heartbeat: re-renders the QR countdown while pairing is visible
 			const [flash, setFlash] = useState("");
 			const [pending, setPending] = useState([]); // [{id, name}] waiting to be staged
 			const [devices, setDevices] = useState([]); // [{id,name,active}]
 			const [rename, setRename] = useState(null); // {id, name} — self-drawn rename dialog
 			const [appQr, setAppQr] = useState(null); // app-download QR dialog payload (or {loading}/{fallback:true})
 			const canvasRef = useRef(null);
+			const lastQrCode = useRef(null); // last pairing code seen — detects auto rotation for the "已更新" flash
 			const wsRef = useRef(null);
 			const framesRef = useRef(0);
 			const rotRef = useRef(0);
@@ -264,7 +266,12 @@ window.__ModuleLoader__.load({
 								})
 								.catch((e) => setFlashErr("自动放入失败: " + String(e && e.message || e).slice(0, 90)));
 						} else if (m.type === "devices") {
-							setDevices(m.devices);
+							setDevices((prev) => {
+								// a NEW device came online → the one-time pairing code was
+								// consumed; rotate the QR so the next scan sees a fresh code
+								if ((m.devices || []).length > (prev ? prev.length : 0)) void refreshQr(true);
+								return m.devices || [];
+							});
 							// an active device present == camera linked; derive both the
 							// canvas visibility and the header/FAB link state from the
 							// device list (host no longer emits `device`)
@@ -324,11 +331,15 @@ window.__ModuleLoader__.load({
 				setFlash(t);
 			}
 
-			async function refreshQr() {
+			async function refreshQr(auto) {
 				try {
 					const r = await fetch(`${baseUrl}/qr.json`, { cache: "no-store" });
 					if (!r.ok) throw new Error(`HTTP ${r.status}`);
-					setQr(await r.json());
+					const data = await r.json();
+					// surfaced only on automatic rotation, so the user sees the code change
+					if (auto && lastQrCode.current && lastQrCode.current !== data.code) setFlashOk("二维码已更新,请扫描最新码");
+					lastQrCode.current = data.code;
+					setQr(data);
 				} catch (e) {
 					setFlashErr(`接收服务不可达(${String(e).slice(0, 60)})`);
 				}
@@ -348,10 +359,26 @@ window.__ModuleLoader__.load({
 				}
 			}
 
-			// pairing QR appears when the panel opens without a camera
+			// pairing QR lifecycle: fetch on first show, then keep itself alive —
+			// refreshes right after expiry (one-time codes burn after 15min),
+			// every 30s as a drift/sleep safety net, and beats a 1s heart so the
+			// countdown stays honest.
 			useEffect(() => {
-				if (open && !camOn && !qr) void refreshQr();
-			}, [open, camOn]);
+				if (!open || camOn) return;
+				if (!qr) {
+					void refreshQr();
+					return;
+				}
+				const remainMs = qr.expiresAt - Date.now();
+				const expireTimer = setTimeout(() => void refreshQr(true), Math.max(remainMs, 0) + 800);
+				const driftTimer = setInterval(() => void refreshQr(true), 30_000);
+				const heartbeat = setInterval(() => setTick((t) => (t + 1) % 1e9), 1000);
+				return () => {
+					clearTimeout(expireTimer);
+					clearInterval(driftTimer);
+					clearInterval(heartbeat);
+				};
+			}, [open, camOn, qr]);
 
 			function shoot() {
 				const ws = wsRef.current;				if (ws && ws.readyState === 1) {
@@ -449,7 +476,22 @@ window.__ModuleLoader__.load({
 											{ className: "lm-qr" },
 											qr && qr.pngDataUrl ? h("img", { src: qr.pngDataUrl, alt: "配对二维码" }) : h("div", { className: "hint" }, "二维码加载中…"),
 											qr ? h("div", { className: "code" }, qr.code) : null,
-											h("div", { className: "hint" }, "手机 App 扫码配对;或在 App 内手动输入", h("br", null), qr && qr.urls && qr.urls[0] ? `${qr.urls[0].replace("http://", "")}:${qr.code}` : ""),
+											h(
+												"div",
+												{ className: "hint" },
+												"手机 App 扫码配对;或在 App 内手动输入",
+												h("br", null),
+												qr && qr.urls && qr.urls[0] ? `${qr.urls[0].replace("http://", "")}:${qr.code}` : "",
+												h("br", null),
+												qr
+													? (() => {
+															const s = Math.max(0, Math.floor((qr.expiresAt - Date.now()) / 1000));
+															return s > 0
+																? `有效期剩余 ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")} · 到期自动更新`
+																: "已到期,正在自动更新…";
+														})()
+													: "",
+											),
 									h("a", { className: "lm-dl", href: "#", onClick: (e) => { e.preventDefault(); void openAppQr(); }, title: "弹出二维码,手机扫码下载" }, "手机还没装 App？点此扫码下载"),
 										)
 									: null,

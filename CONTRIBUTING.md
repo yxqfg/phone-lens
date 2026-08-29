@@ -32,6 +32,27 @@ flutter pub get
 flutter run            # 或 flutter build apk --release
 ```
 
+## ⚠️ link 开发目录进 dsh profile 前的必读事项
+
+把本仓库的插件目录以 `link:` 方式接入 dsh profile（`dsh plugin --profile web add <本目录绝对路径>`）进行开发调试时，**dsh 宿主不会为你的包提供任何依赖**——宿主进程里已有的 service 不等于你的包能解析它们。
+
+**这条坑的教训**：peer 依赖（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/schemastery`）只写在 `peerDependencies` 里、而 `devDependencies` 缺失时，`pnpm install` 不会真正安装它们；link 后 dsh 启动加载插件树时**解析不到依赖，导致整个插件树加载失败、dsh web 服务彻底起不来**（不只是本插件挂）。
+
+因此，link 前必须满足：
+
+1. 在**插件目录内**执行过 `pnpm install`，且 `node_modules` 中能独立解析**全部** peer 依赖（当前为 `@deepseek-ai/cordis`、`@deepseek-ai/dsh-llm`、`@deepseek-ai/schemastery`——它们同时声明在 `devDependencies` 里正是为此）
+2. `pnpm build` 通过、`node --check lib/client.js` 通过
+3. **link 或改动 profile 依赖之后，必须完整启动一次 `dsh web`，并确认接收端口（默认 8791）处于监听、启动日志无插件加载错误**——任务才算完成；改动之前也应先确认当前基线能启动，避免把别人的问题当成自己的
+4. 快速自检命令：
+   ```powershell
+   # 逐个确认 peer 可解析（都应输出路径）
+   node -e "console.log(require.resolve('@deepseek-ai/cordis'))"
+   node -e "console.log(require.resolve('@deepseek-ai/dsh-llm'))"
+   node -e "console.log(require.resolve('@deepseek-ai/schemastery'))"
+   ```
+
+> 注：本仓库根目录没有 package.json（不是 pnpm workspace），依赖安装请在 `packages/phone-lens` 目录内执行。
+
 ## 工作流程
 
 1. **Fork** 本仓库并创建特性分支：`git checkout -b feat/your-change`

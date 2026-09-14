@@ -4,6 +4,15 @@
 [Keep a Changelog](https://keepachangelog.com/)，版本遵循
 [语义化版本](https://semver.org/)。
 
+## [0.3.2] - 2026
+
+### Changed
+- **适配 DSH 0.1.5-rc.1**：`@deepseek-ai/dsh-llm` 的 peer 范围补上新预发布元组的显式分支
+  （0.1.2 / 0.1.3 / 0.1.5），修复新版 harness 下 `0.1.5-rc.x` 被 semver 预发布规则静默排除、
+  可能触发 `ERESOLVE` 的问题
+- devDependencies 升级到与 DSH 0.1.5 配套的版本：cordis `4.0.2`、dsh-llm `0.1.5-rc.2`、
+  schemastery `3.18.2`（构建与模块加载均验证通过）
+
 ## [0.3.1] - 2026
 
 ### Added

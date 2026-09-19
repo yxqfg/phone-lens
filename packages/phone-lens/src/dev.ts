@@ -11,7 +11,6 @@ import { LoggingSink } from "./inject/deliver.js";
 import { TargetTracker } from "./inject/target.js";
 import { DeviceStore } from "./store/devices.js";
 import { PairingStore } from "./store/pairing.js";
-import { AppSettingsStore } from "./store/settings.js";
 import { startLensServer } from "./server/http.js";
 import { ViewHub } from "./server/hub.js";
 import { buildPairingQr } from "./server/qr.js";
@@ -26,7 +25,6 @@ const devices = new DeviceStore(dataDir);
 const hub = new ViewHub(config, (lvl, msg) => log(lvl, msg));
 const targets = new TargetTracker(config);
 const sink = new LoggingSink((lvl, msg) => log(lvl, msg));
-const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
 
 const handle = await startLensServer({
   config,
@@ -36,11 +34,6 @@ const handle = await startLensServer({
   targets,
   sink,
   attachments: () => undefined,
-  appSettings,
-  defaultSaveDir: join(dataDir, "saved"),
-  notifyFolderBatch: async (dir, count) => {
-    log("info", `[folder batch] ${count} files → ${dir} (standalone dev: no session to notify)`);
-  },
   fallbackDir: join(dataDir, "uploads"),
   pendingDir: join(dataDir, "pending"),
   log,

@@ -7,7 +7,6 @@ import { join } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import QRCode from "qrcode";
-import type { AppSettingsStore } from "../store/settings.js";
 import type { DeliveryReceipt, LensConfig } from "../types.js";
 import { ERROR_CODES } from "../types.js";
 import type { DeliverySink } from "../inject/deliver.js";
@@ -27,18 +26,12 @@ export interface ServerDeps {
   hub: ViewHub;
   targets: TargetTracker;
   sink: DeliverySink;
-  /** Read the attachment store lazily 鈥?the service may mount after us. */
+  /** Read the attachment store lazily — the service may mount after us. */
   attachments: () => AttachmentStoreLike | undefined;
   /** Fallback dir for uploads when the attachment service is absent. */
   fallbackDir: string;
   /** Browser-fetchable staging dir for images awaiting user send (composer pre-send). */
   pendingDir: string;
-  /** Runtime-editable app settings (save mode / save dir), persisted to settings.json. */
-  appSettings: AppSettingsStore;
-  /** Built-in save folder used when the user has not overridden saveDir. */
-  defaultSaveDir: string;
-  /** After a folder-mode burst settles, tell the active session where the batch lives. */
-  notifyFolderBatch: (dir: string, count: number) => Promise<void>;
   log: (level: "info" | "warn" | "error", msg: string) => void;
 }
 
@@ -46,13 +39,6 @@ export interface LensServerHandle {
   port: number;
   dispose: () => Promise<void>;
 }
-
-/**
- * Folder save-mode batch accumulator. Module-level on purpose: the upload
- * route (module-scope `handle`) writes it and the debounce timer reads it,
- * while one server instance owns one batch at a time.
- */
-const folderBatch: { count: number; dir: string; timer: ReturnType<typeof setTimeout> | null } = { count: 0, dir: "", timer: null };
 
 /** Boot the receiver: HTTP routes + two websocket endpoints. */
 export async function startLensServer(deps: ServerDeps): Promise<LensServerHandle> {
@@ -153,13 +139,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return;
   }
 
-  // 鈹€鈹€ open endpoints 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+  // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 鐩磋繛鍙栨櫙", version: "0.3.3", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.2", requiresPairing: true }, cors);
   }
 
-  // 鈹€鈹€ loopback-only endpoints (preview page, QR, view stream) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-  if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) {
+  // ── loopback-only endpoints (preview page, QR, view stream) ──────────────
+  if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) {
     return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
   }
   if (method === "GET" && (path === "/" || path === "/view.html")) {
@@ -188,33 +174,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     return sendJson(res, 200, { url: target, gitee: config.app.giteeUrl, github: config.app.githubUrl, pngDataUrl }, { ...cors, "cache-control": "no-store" });
   }
 
-  // 鈹€鈹€ app settings (save mode / save dir) 鈥?loopback only 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-  if (method === "GET" && path === "/app-settings") {
-    const st = deps.appSettings.get();
-    return sendJson(res, 200, { ...st, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, { ...cors, "cache-control": "no-store" });
-  }
-  if (method === "POST" && path === "/app-settings") {
-    const { buf } = await readRawBody(req, 64 * 1024);
-    let patch: { saveMode?: "composer" | "folder" | "both"; saveDir?: string } = {};
-    try {
-      patch = JSON.parse(buf.toString("utf8")) as typeof patch;
-    } catch {
-      return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "body must be JSON");
-    }
-    if (patch.saveMode && !["composer", "folder", "both"].includes(patch.saveMode)) {
-      return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "saveMode must be composer | folder | both");
-    }
-    // switching away from folder modes cancels a pending batch notice
-    if (patch.saveMode === "composer" && folderBatch.timer) {
-      clearTimeout(folderBatch.timer);
-      folderBatch.timer = null;
-      folderBatch.count = 0;
-    }
-    const saved = deps.appSettings.set(patch);
-    return sendJson(res, 200, { ...saved, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, { ...cors, "cache-control": "no-store" });
-  }
-
-  // 鈹€鈹€ pairing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+  // ── pairing ──────────────────────────────────────────────────────────────
   // Rate limit only FAILED attempts (anti-brute-force); a legitimate new
   // device entering a valid code is never throttled, so switching phones
   // "just works" instead of hitting "too many pairing attempts".
@@ -240,7 +200,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     });
   }
 
-  // 鈹€鈹€ authenticated endpoints: loopback or paired device 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+  // ── authenticated endpoints: loopback or paired device ───────────────────
   const auth = loop ? { ok: true } : deviceAuth(req) && devices.authenticate(deviceAuth(req)!.deviceId, deviceAuth(req)!.token) ? { ok: true } : { ok: false };
   if (!auth.ok) return sendError(res, 401, ERROR_CODES.AUTH_REQUIRED, "pair this device first");
 
@@ -269,57 +229,25 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       log("error", `admit failed: ${String(error)}`);
       return sendError(res, 500, ERROR_CODES.STORE_FAILED, String(error));
     }
-    log("info", `stored ${name} (${buf.byteLength}B) 鈫?${admitted.storage}:${admitted.ref.attachmentId}`);
+    log("info", `stored ${name} (${buf.byteLength}B) → ${admitted.storage}:${admitted.ref.attachmentId}`);
 
     // keep the local archive bounded (retention: maxStoredUploads oldest-first)
     if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
 
-    // 鈹€鈹€ delivery routing by the user's save mode 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-    const st = deps.appSettings.get();
-    const folderMode = st.saveMode !== "composer"; // "folder" | "both"
-
-    if (folderMode) {
-      // Save a copy into the user's chosen folder (long-task workflow: the
-      // model reads the folder instead of the chat being flooded).
-      const dir = deps.appSettings.effectiveSaveDir();
-      try {
-        mkdirSync(dir, { recursive: true });
-        writeFileSync(join(dir, name), buf);
-        log("info", `folder-mode saved: ${join(dir, name)}`);
-      } catch (error) {
-        log("warn", `folder save failed (${String(error)}) 鈥?falling back to composer staging`);
-      }
+    // Phase 2 (rev): PRE-SEND semantics. The phone's photo is staged for the
+    // dsh composer, not injected straight into the model — the browser client
+    // fetches this staging copy and drops it into the composer draft; the user
+    // types text and hits send. So no agent.followup here.
+    const pendingPath = join(deps.pendingDir, `${admitted.ref.attachmentId}.jpg`);
+    try {
+      mkdirSync(deps.pendingDir, { recursive: true });
+      writeFileSync(pendingPath, buf);
+      log("info", `staged for composer: ${pendingPath}`);
+    } catch (error) {
+      log("warn", `staging failed: ${String(error)}`);
     }
-
-    const composerMode = st.saveMode !== "folder"; // "composer" | "both"
-    if (composerMode) {
-      // PRE-SEND semantics: stage a copy for the composer draft; the browser
-      // client fetches it and drops it into the composer.
-      const pendingPath = join(deps.pendingDir, `${admitted.ref.attachmentId}.jpg`);
-      try {
-        mkdirSync(deps.pendingDir, { recursive: true });
-        writeFileSync(pendingPath, buf);
-        log("info", `staged for composer: ${pendingPath}`);
-      } catch (error) {
-        log("warn", `staging failed: ${String(error)}`);
-      }
-      hub.broadcastToViews({ type: "pending_image", attachmentId: admitted.ref.attachmentId, name });
-    }
-
-    if (folderMode) {
-      // Batch debounce: when the burst settles (indexNoticeMs without a new
-      // upload), inject ONE folder-index note so the model knows where to read.
-      folderBatch.count += 1;
-      folderBatch.dir = deps.appSettings.effectiveSaveDir();
-      if (folderBatch.timer) clearTimeout(folderBatch.timer);
-      folderBatch.timer = setTimeout(() => {
-        const count = folderBatch.count;
-        const dir = folderBatch.dir;
-        folderBatch.count = 0;
-        folderBatch.timer = null;
-        if (count > 0) void deps.notifyFolderBatch(dir, count);
-      }, st.indexNoticeMs);
-    }
+    hub.broadcastToViews({ type: "pending_image", attachmentId: admitted.ref.attachmentId, name });
+    // no direct delivery; the client owns placing it in the composer
 
     return sendJson(res, 200, {
       ok: true,
@@ -329,7 +257,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       bytes: admitted.ref.bytes,
       storage: admitted.storage,
       delivered: null,
-      deliverReason: folderMode ? (composerMode ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
+      deliverReason: "staged-in-composer",
     });
   }
 
@@ -374,7 +302,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   return sendError(res, 404, ERROR_CODES.BAD_REQUEST, `no route ${method} ${path}`);
 }
 
-// 鈹€鈹€ helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+// ── helpers ─────────────────────────────────────────────────────────────────
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>): void {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...(extraHeaders ?? {}) });

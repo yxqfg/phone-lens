@@ -88,28 +88,4 @@ export class HostDeliverySink implements DeliverySink {
       return { ok: false, sessionId: null, mode: "none", reason: String(e) };
     }
   }
-
-  /**
-   * Inject a plain text note into the active session (no image). Used by the
-   * folder save-mode to tell the model where a finished batch was written.
-   */
-  async deliverText(text: string, mode: "followup" | "steer" = "followup"): Promise<DeliveryReceipt> {
-    const agent = this.resolve();
-    if (!agent) {
-      return { ok: false, sessionId: null, mode: "none", reason: "no active session" };
-    }
-    try {
-      const message = createUserMessage({
-        content: [{ type: "text", text }],
-        source: { kind: "plugin", plugin: "phone-lens" },
-      });
-      this.log("info", `delivering text note to session ${agent.session.id} via ${mode}`);
-      if (mode === "steer") agent.steer(message);
-      else agent.followup(message);
-      return { ok: true, sessionId: String(agent.session.id), mode };
-    } catch (e) {
-      this.log("warn", `text delivery failed: ${String(e)}`);
-      return { ok: false, sessionId: null, mode: "none", reason: String(e) };
-    }
-  }
 }

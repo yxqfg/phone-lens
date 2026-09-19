@@ -970,7 +970,7 @@ async function handle(deps, req, res, ctx) {
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
 		name: "PhoneLens 鐩磋繛鍙栨櫙",
-		version: "0.3.3",
+		version: "0.3.4",
 		requiresPairing: true
 	}, cors);
 	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
@@ -1047,11 +1047,6 @@ async function handle(deps, req, res, ctx) {
 			"folder",
 			"both"
 		].includes(patch.saveMode)) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "saveMode must be composer | folder | both");
-		if (patch.saveMode === "composer" && folderBatch.timer) {
-			clearTimeout(folderBatch.timer);
-			folderBatch.timer = null;
-			folderBatch.count = 0;
-		}
 		const saved = deps.appSettings.set(patch);
 		return sendJson(res, 200, {
 			...saved,
@@ -1060,6 +1055,28 @@ async function handle(deps, req, res, ctx) {
 			...cors,
 			"cache-control": "no-store"
 		});
+	}
+	if (method === "GET" && path === "/batch-status") return sendJson(res, 200, {
+		count: folderBatch.count,
+		dir: folderBatch.dir || deps.appSettings.effectiveSaveDir()
+	}, {
+		...cors,
+		"cache-control": "no-store"
+	});
+	if (method === "POST" && path === "/notify-folder-batch") {
+		const count = folderBatch.count;
+		const dir = folderBatch.dir || deps.appSettings.effectiveSaveDir();
+		folderBatch.count = 0;
+		if (count <= 0) return sendJson(res, 200, {
+			ok: false,
+			reason: "no pending batch"
+		}, cors);
+		await deps.notifyFolderBatch(dir, count);
+		return sendJson(res, 200, {
+			ok: true,
+			count,
+			dir
+		}, cors);
 	}
 	if (method === "POST" && path === "/pair") {
 		const body = await readJsonBody(req, 4096);
@@ -1150,14 +1167,6 @@ async function handle(deps, req, res, ctx) {
 		if (folderMode) {
 			folderBatch.count += 1;
 			folderBatch.dir = deps.appSettings.effectiveSaveDir();
-			if (folderBatch.timer) clearTimeout(folderBatch.timer);
-			folderBatch.timer = setTimeout(() => {
-				const count = folderBatch.count;
-				const dir = folderBatch.dir;
-				folderBatch.count = 0;
-				folderBatch.timer = null;
-				if (count > 0) deps.notifyFolderBatch(dir, count);
-			}, st.indexNoticeMs);
 		}
 		return sendJson(res, 200, {
 			ok: true,

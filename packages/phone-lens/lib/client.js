@@ -402,29 +402,6 @@ window.__ModuleLoader__.load({
 				if (open && !appSt) void loadAppSt();
 			}, [open, appSt]);
 
-			// ── folder batch: poll the counter, notify the model on explicit press ──
-			const [batchCount, setBatchCount] = useState(0);
-			useEffect(() => {
-				if (!open || !appSt || appSt.saveMode === "composer") return;
-				const iv = setInterval(async () => {
-					try {
-						const r = await fetch(`${baseUrl}/batch-status`, { cache: "no-store" });
-						if (r.ok) setBatchCount(((await r.json()).count) || 0);
-					} catch {}
-				}, 3000);
-				return () => clearInterval(iv);
-			}, [open, appSt]);
-			async function notifyFolderBatch() {
-				try {
-					const r = await fetch(`${baseUrl}/notify-folder-batch`, { method: "POST" });
-					const j = await r.json();
-					if (j.ok) { setBatchCount(0); setFlashOk(`已通知模型:本批 ${j.count} 张 → ${j.dir}`); }
-					else setFlashErr("没有待通知的批次");
-				} catch (e) {
-					setFlashErr("通知失败: " + String(e && e.message || e).slice(0, 70));
-				}
-			}
-
 			// pairing QR lifecycle: fetch on first show, then keep itself alive —
 			// refreshes right after expiry (one-time codes burn after 15min),
 			// every 30s as a drift/sleep safety net, and beats a 1s heart so the
@@ -592,12 +569,7 @@ window.__ModuleLoader__.load({
 													)
 												: null,
 											appSt.saveMode !== "composer"
-												? h(
-														"div",
-														{ className: "lm-row", style: { alignItems: "center" } },
-														h("button", { className: "lm-btn primary", style: { flex: "none" }, disabled: batchCount === 0, onClick: () => void notifyFolderBatch(), title: "在对话里通知模型:本批 N 张已保存至目录" }, batchCount > 0 ? `📢 通知模型(本批 ${batchCount} 张)` : "📢 通知模型"),
-														h("span", { className: "lm-appst-hint", style: { flex: 1 } }, batchCount > 0 ? `已存 ${batchCount} 张,拍完点此通知` : "拍完一批后点此通知模型"),
-													)
+												? h("div", { className: "lm-appst-hint" }, "一批传完(停约15秒)后,自动在对话里通知模型到该目录读取")
 												: null,
 										)
 									: null,

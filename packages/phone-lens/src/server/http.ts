@@ -155,7 +155,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // 鈹€鈹€ open endpoints 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 鐩磋繛鍙栨櫙", version: "0.3.4", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 鐩磋繛鍙栨櫙", version: "0.3.3", requiresPairing: true }, cors);
   }
 
   // 鈹€鈹€ loopback-only endpoints (preview page, QR, view stream) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -204,21 +204,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (patch.saveMode && !["composer", "folder", "both"].includes(patch.saveMode)) {
       return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "saveMode must be composer | folder | both");
     }
+    // switching away from folder modes cancels a pending batch notice
+    if (patch.saveMode === "composer" && folderBatch.timer) {
+      clearTimeout(folderBatch.timer);
+      folderBatch.timer = null;
+      folderBatch.count = 0;
+    }
     const saved = deps.appSettings.set(patch);
     return sendJson(res, 200, { ...saved, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, { ...cors, "cache-control": "no-store" });
-  }
-  // Folder batch: the Web UI polls the counter and, on an explicit user press,
-  // asks the host to inject the folder-index note. The tool never speaks first.
-  if (method === "GET" && path === "/batch-status") {
-    return sendJson(res, 200, { count: folderBatch.count, dir: folderBatch.dir || deps.appSettings.effectiveSaveDir() }, { ...cors, "cache-control": "no-store" });
-  }
-  if (method === "POST" && path === "/notify-folder-batch") {
-    const count = folderBatch.count;
-    const dir = folderBatch.dir || deps.appSettings.effectiveSaveDir();
-    folderBatch.count = 0;
-    if (count <= 0) return sendJson(res, 200, { ok: false, reason: "no pending batch" }, cors);
-    await deps.notifyFolderBatch(dir, count);
-    return sendJson(res, 200, { ok: true, count, dir }, cors);
   }
 
   // 鈹€鈹€ pairing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -314,11 +307,18 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
 
     if (folderMode) {
-      // Manual-trigger workflow: uploads land in the folder and bump the batch
-      // counter only. The user explicitly presses "notify model" in the Web UI
-      // when the batch is done — the tool never speaks for the user.
+      // Batch debounce: when the burst settles (indexNoticeMs without a new
+      // upload), inject ONE folder-index note so the model knows where to read.
       folderBatch.count += 1;
       folderBatch.dir = deps.appSettings.effectiveSaveDir();
+      if (folderBatch.timer) clearTimeout(folderBatch.timer);
+      folderBatch.timer = setTimeout(() => {
+        const count = folderBatch.count;
+        const dir = folderBatch.dir;
+        folderBatch.count = 0;
+        folderBatch.timer = null;
+        if (count > 0) void deps.notifyFolderBatch(dir, count);
+      }, st.indexNoticeMs);
     }
 
     return sendJson(res, 200, {

@@ -863,7 +863,7 @@ async function handle(deps, req, res, ctx) {
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
 		name: "PhoneLens 直连取景",
-		version: "0.3.2",
+		version: "0.3.5",
 		requiresPairing: true
 	}, cors);
 	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");

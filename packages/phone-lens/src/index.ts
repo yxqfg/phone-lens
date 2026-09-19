@@ -6,6 +6,7 @@ import { HostDeliverySink, type EventedAgent } from "./inject/host-sink.js";
 import { TargetTracker } from "./inject/target.js";
 import { DeviceStore } from "./store/devices.js";
 import { PairingStore } from "./store/pairing.js";
+import { AppSettingsStore } from "./store/settings.js";
 import { startLensServer, type LensServerHandle } from "./server/http.js";
 import { ViewHub } from "./server/hub.js";
 import { buildPairingQr } from "./server/qr.js";
@@ -38,6 +39,7 @@ export default class PhoneLens extends Service {
     const devices = new DeviceStore(dataDir);
     const hub = new ViewHub(config, (level, msg) => log(level, msg));
     const targets = new TargetTracker(config);
+    const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
     // Phase 2: real delivery into a live dsh session; the LoggingSink remains
     // the standalone/dev fallback. Agent events keep the sink's active target.
     const sink = new HostDeliverySink(config, (level, msg) => log(level, msg));
@@ -63,6 +65,16 @@ export default class PhoneLens extends Service {
       targets,
       sink,
       attachments,
+      appSettings,
+      // folder save-mode: after a burst of uploads settles, tell the model
+      // where the batch was written so it can read the folder directly.
+      notifyFolderBatch: async (dir, count) => {
+        const receipt = await sink.deliverText(
+          `📁 PhoneLens：本批 ${count} 张图片已保存至「${dir}」，需要时可按文件名顺序直接读取该目录处理。`,
+        );
+        if (!receipt.ok) log("warn", `folder batch notice not delivered: ${receipt.reason ?? "unknown"}`);
+        else log("info", `folder batch notice delivered to ${receipt.sessionId} (${count} files → ${dir})`);
+      },
       fallbackDir: join(dataDir, "uploads"),
       pendingDir: join(dataDir, "pending"),
       log,

@@ -160,6 +160,50 @@ var HostDeliverySink = class {
 			};
 		}
 	}
+	/**
+	
+	* Inject a plain text note into the active session (no image). Used by the
+	
+	* folder save-mode to tell the model where a finished batch was written.
+	
+	*/
+	async deliverText(text, mode = "followup") {
+		const agent = this.resolve();
+		if (!agent) return {
+			ok: false,
+			sessionId: null,
+			mode: "none",
+			reason: "no active session"
+		};
+		try {
+			const message = createUserMessage({
+				content: [{
+					type: "text",
+					text
+				}],
+				source: {
+					kind: "plugin",
+					plugin: "phone-lens"
+				}
+			});
+			this.log("info", `delivering text note to session ${agent.session.id} via ${mode}`);
+			if (mode === "steer") agent.steer(message);
+			else agent.followup(message);
+			return {
+				ok: true,
+				sessionId: String(agent.session.id),
+				mode
+			};
+		} catch (e) {
+			this.log("warn", `text delivery failed: ${String(e)}`);
+			return {
+				ok: false,
+				sessionId: null,
+				mode: "none",
+				reason: String(e)
+			};
+		}
+	}
 };
 
 //#endregion
@@ -368,6 +412,55 @@ var DeviceStore = class {
 	}
 	count() {
 		return this.devices.size;
+	}
+};
+
+//#endregion
+//#region src/store/settings.ts
+const VALID_MODES = [
+	"composer",
+	"folder",
+	"both"
+];
+var AppSettingsStore = class {
+	data;
+	constructor(file, defaultSaveDir) {
+		this.file = file;
+		this.defaultSaveDir = defaultSaveDir;
+		this.data = {
+			saveMode: "composer",
+			saveDir: "",
+			indexNoticeMs: 15e3
+		};
+		this.load();
+	}
+	load() {
+		try {
+			const raw = JSON.parse(readFileSync(this.file, "utf8"));
+			if (VALID_MODES.includes(raw.saveMode)) this.data.saveMode = raw.saveMode;
+			if (typeof raw.saveDir === "string") this.data.saveDir = raw.saveDir;
+			if (Number.isInteger(raw.indexNoticeMs) && raw.indexNoticeMs >= 3e3) this.data.indexNoticeMs = raw.indexNoticeMs;
+		} catch {}
+	}
+	get() {
+		return { ...this.data };
+	}
+	/** Effective absolute folder (resolved default when unset). */
+	effectiveSaveDir() {
+		return this.data.saveDir.trim() || this.defaultSaveDir;
+	}
+	set(patch) {
+		if (patch.saveMode && VALID_MODES.includes(patch.saveMode)) this.data.saveMode = patch.saveMode;
+		if (typeof patch.saveDir === "string") this.data.saveDir = patch.saveDir.trim();
+		if (Number.isInteger(patch.indexNoticeMs) && patch.indexNoticeMs >= 3e3) this.data.indexNoticeMs = patch.indexNoticeMs;
+		this.persist();
+		return this.get();
+	}
+	persist() {
+		try {
+			mkdirSync(join(this.file, ".."), { recursive: true });
+			writeFileSync(this.file, JSON.stringify(this.data, null, 2));
+		} catch {}
 	}
 };
 
@@ -768,6 +861,20 @@ function queryOf(req) {
 
 //#endregion
 //#region src/server/http.ts
+/**
+
+* Folder save-mode batch accumulator. Module-level on purpose: the upload
+
+* route (module-scope `handle`) writes it and the debounce timer reads it,
+
+* while one server instance owns one batch at a time.
+
+*/
+const folderBatch = {
+	count: 0,
+	dir: "",
+	timer: null
+};
 /** Boot the receiver: HTTP routes + two websocket endpoints. */
 async function startLensServer(deps) {
 	const { config, pairing, devices, hub, targets, sink, log } = deps;
@@ -862,11 +969,11 @@ async function handle(deps, req, res, ctx) {
 		return;
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
-		name: "PhoneLens 直连取景",
-		version: "0.3.2",
+		name: "PhoneLens 鐩磋繛鍙栨櫙",
+		version: "0.3.3",
 		requiresPairing: true
 	}, cors);
-	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
+	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
 	if (method === "GET" && (path === "/" || path === "/view.html")) {
 		res.writeHead(200, {
 			"content-type": "text/html; charset=utf-8",
@@ -912,6 +1019,43 @@ async function handle(deps, req, res, ctx) {
 			gitee: config.app.giteeUrl,
 			github: config.app.githubUrl,
 			pngDataUrl
+		}, {
+			...cors,
+			"cache-control": "no-store"
+		});
+	}
+	if (method === "GET" && path === "/app-settings") {
+		const st = deps.appSettings.get();
+		return sendJson(res, 200, {
+			...st,
+			effectiveSaveDir: deps.appSettings.effectiveSaveDir()
+		}, {
+			...cors,
+			"cache-control": "no-store"
+		});
+	}
+	if (method === "POST" && path === "/app-settings") {
+		const { buf } = await readRawBody(req, 64 * 1024);
+		let patch = {};
+		try {
+			patch = JSON.parse(buf.toString("utf8"));
+		} catch {
+			return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "body must be JSON");
+		}
+		if (patch.saveMode && ![
+			"composer",
+			"folder",
+			"both"
+		].includes(patch.saveMode)) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "saveMode must be composer | folder | both");
+		if (patch.saveMode === "composer" && folderBatch.timer) {
+			clearTimeout(folderBatch.timer);
+			folderBatch.timer = null;
+			folderBatch.count = 0;
+		}
+		const saved = deps.appSettings.set(patch);
+		return sendJson(res, 200, {
+			...saved,
+			effectiveSaveDir: deps.appSettings.effectiveSaveDir()
 		}, {
 			...cors,
 			"cache-control": "no-store"
@@ -973,21 +1117,48 @@ async function handle(deps, req, res, ctx) {
 			log("error", `admit failed: ${String(error)}`);
 			return sendError(res, 500, ERROR_CODES.STORE_FAILED, String(error));
 		}
-		log("info", `stored ${name} (${buf.byteLength}B) → ${admitted.storage}:${admitted.ref.attachmentId}`);
+		log("info", `stored ${name} (${buf.byteLength}B) 鈫?${admitted.storage}:${admitted.ref.attachmentId}`);
 		if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
-		const pendingPath = join(deps.pendingDir, `${admitted.ref.attachmentId}.jpg`);
-		try {
-			mkdirSync(deps.pendingDir, { recursive: true });
-			writeFileSync(pendingPath, buf);
-			log("info", `staged for composer: ${pendingPath}`);
-		} catch (error) {
-			log("warn", `staging failed: ${String(error)}`);
+		const st = deps.appSettings.get();
+		const folderMode = st.saveMode !== "composer";
+		if (folderMode) {
+			const dir = deps.appSettings.effectiveSaveDir();
+			try {
+				mkdirSync(dir, { recursive: true });
+				writeFileSync(join(dir, name), buf);
+				log("info", `folder-mode saved: ${join(dir, name)}`);
+			} catch (error) {
+				log("warn", `folder save failed (${String(error)}) 鈥?falling back to composer staging`);
+			}
 		}
-		hub.broadcastToViews({
-			type: "pending_image",
-			attachmentId: admitted.ref.attachmentId,
-			name
-		});
+		const composerMode = st.saveMode !== "folder";
+		if (composerMode) {
+			const pendingPath = join(deps.pendingDir, `${admitted.ref.attachmentId}.jpg`);
+			try {
+				mkdirSync(deps.pendingDir, { recursive: true });
+				writeFileSync(pendingPath, buf);
+				log("info", `staged for composer: ${pendingPath}`);
+			} catch (error) {
+				log("warn", `staging failed: ${String(error)}`);
+			}
+			hub.broadcastToViews({
+				type: "pending_image",
+				attachmentId: admitted.ref.attachmentId,
+				name
+			});
+		}
+		if (folderMode) {
+			folderBatch.count += 1;
+			folderBatch.dir = deps.appSettings.effectiveSaveDir();
+			if (folderBatch.timer) clearTimeout(folderBatch.timer);
+			folderBatch.timer = setTimeout(() => {
+				const count = folderBatch.count;
+				const dir = folderBatch.dir;
+				folderBatch.count = 0;
+				folderBatch.timer = null;
+				if (count > 0) deps.notifyFolderBatch(dir, count);
+			}, st.indexNoticeMs);
+		}
 		return sendJson(res, 200, {
 			ok: true,
 			attachmentId: admitted.ref.attachmentId,
@@ -996,7 +1167,7 @@ async function handle(deps, req, res, ctx) {
 			bytes: admitted.ref.bytes,
 			storage: admitted.storage,
 			delivered: null,
-			deliverReason: "staged-in-composer"
+			deliverReason: folderMode ? composerMode ? "saved-and-staged" : "saved-to-folder" : "staged-in-composer"
 		});
 	}
 	if (method === "GET" && path.startsWith("/pending/") && loop) {
@@ -1452,6 +1623,7 @@ var PhoneLens = class extends Service {
 		const devices = new DeviceStore(dataDir);
 		const hub = new ViewHub(config, (level, msg) => log(level, msg));
 		const targets = new TargetTracker(config);
+		const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
 		const sink = new HostDeliverySink(config, (level, msg) => log(level, msg));
 		const attachments = () => ctx.get?.("attachments");
 		const onAgent = (agent) => sink.track(agent);
@@ -1471,6 +1643,12 @@ var PhoneLens = class extends Service {
 			targets,
 			sink,
 			attachments,
+			appSettings,
+			notifyFolderBatch: async (dir, count) => {
+				const receipt = await sink.deliverText(`📁 PhoneLens：本批 ${count} 张图片已保存至「${dir}」，需要时可按文件名顺序直接读取该目录处理。`);
+				if (!receipt.ok) log("warn", `folder batch notice not delivered: ${receipt.reason ?? "unknown"}`);
+				else log("info", `folder batch notice delivered to ${receipt.sessionId} (${count} files → ${dir})`);
+			},
 			fallbackDir: join(dataDir, "uploads"),
 			pendingDir: join(dataDir, "pending"),
 			log

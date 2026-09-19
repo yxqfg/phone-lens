@@ -68,6 +68,14 @@ window.__ModuleLoader__.load({
 .lm-rename { position: absolute; right: 0; bottom: 56px; width: 268px; background: #14181d; border: 1px solid #2a333e; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.6); padding: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 5; }
 .lm-rename-title { font-size: 13px; color: #dfe7ee; font-weight: 600; }
 .lm-rename-input { background: #0d1117; color: #dfe7ee; border: 1px solid #2f3b48; border-radius: 8px; padding: 8px; font-size: 13px; }
+.lm-appst { display: flex; flex-direction: column; gap: 5px; padding: 6px; background: #10141a; border: 1px dashed #2a333e; border-radius: 8px; }
+.lm-appst-row { display: flex; gap: 5px; align-items: center; }
+.lm-appst-label { font-size: 10px; color: #7d8da0; flex: none; width: 30px; }
+.lm-mode { flex: 1; padding: 4px 2px; border-radius: 6px; border: 1px solid #2f3b48; background: #1f2937; color: #8fa1b5; font-size: 10px; cursor: pointer; }
+.lm-mode:hover { background: #28323e; }
+.lm-mode.on { border-color: #3b7cb5; color: #dfe7ee; background: #2a5d8f; }
+.lm-appst-dir { flex: 1; min-width: 0; background: #0d1117; color: #dfe7ee; border: 1px solid #2f3b48; border-radius: 6px; padding: 3px 6px; font-size: 11px; }
+.lm-appst-hint { font-size: 10px; color: #7d8da0; line-height: 1.4; }
 .lm-appqr { position: absolute; right: 0; bottom: 56px; width: 268px; background: #14181d; border: 1px solid #2a333e; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.6); padding: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 6; }
 .lm-appqr-title { font-size: 13px; color: #dfe7ee; font-weight: 600; }
 .lm-appqr-img { width: 168px; height: 168px; image-rendering: pixelated; background: #fff; border-radius: 8px; }
@@ -202,6 +210,8 @@ window.__ModuleLoader__.load({
 			const [devices, setDevices] = useState([]); // [{id,name,active}]
 			const [rename, setRename] = useState(null); // {id, name} — self-drawn rename dialog
 			const [appQr, setAppQr] = useState(null); // app-download QR dialog payload (or {loading}/{fallback:true})
+			const [appSt, setAppSt] = useState(null); // {saveMode, saveDir, effectiveSaveDir} from /app-settings
+			const [dirDraft, setDirDraft] = useState(""); // staged save-dir edit
 			const canvasRef = useRef(null);
 			const lastQrCode = useRef(null); // last pairing code seen — detects auto rotation for the "已更新" flash
 			const wsRef = useRef(null);
@@ -359,6 +369,39 @@ window.__ModuleLoader__.load({
 				}
 			}
 
+			// ── delivery-mode settings (composer / folder / both) ─────────────
+			async function loadAppSt() {
+				try {
+					const r = await fetch(`${baseUrl}/app-settings`, { cache: "no-store" });
+					if (!r.ok) throw new Error(`HTTP ${r.status}`);
+					const s = await r.json();
+					setAppSt(s);
+					setDirDraft(s.effectiveSaveDir || "");
+				} catch (_) {
+					setAppSt(null); // older host: hide the controls silently
+				}
+			}
+			async function saveAppSt(patch) {
+				try {
+					const r = await fetch(`${baseUrl}/app-settings`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(patch),
+					});
+					if (!r.ok) throw new Error(`HTTP ${r.status}`);
+					const s = await r.json();
+					setAppSt(s);
+					setDirDraft(s.effectiveSaveDir || "");
+					setFlashOk(s.saveMode === "composer" ? "已切换:仅放入对话" : s.saveMode === "folder" ? "已切换:仅存文件夹" : "已切换:对话+文件夹");
+				} catch (e) {
+					setFlashErr("设置保存失败: " + String(e && e.message || e).slice(0, 70));
+				}
+			}
+			// load once when the panel opens
+			useEffect(() => {
+				if (open && !appSt) void loadAppSt();
+			}, [open, appSt]);
+
 			// pairing QR lifecycle: fetch on first show, then keep itself alive —
 			// refreshes right after expiry (one-time codes burn after 15min),
 			// every 30s as a drift/sleep safety net, and beats a 1s heart so the
@@ -368,8 +411,7 @@ window.__ModuleLoader__.load({
 				if (!qr) {
 					void refreshQr();
 					return;
-				}
-				const remainMs = qr.expiresAt - Date.now();
+				}				const remainMs = qr.expiresAt - Date.now();
 				const expireTimer = setTimeout(() => void refreshQr(true), Math.max(remainMs, 0) + 800);
 				const driftTimer = setInterval(() => void refreshQr(true), 30_000);
 				const heartbeat = setInterval(() => setTick((t) => (t + 1) % 1e9), 1000);
@@ -496,6 +538,41 @@ window.__ModuleLoader__.load({
 										)
 									: null,
 								h("span", { className: `lm-flash${flash.startsWith("已") ? " ok" : ""}` }, flash),
+								appSt
+									? h(
+											"div",
+											{ className: "lm-appst" },
+											h(
+												"div",
+												{ className: "lm-appst-row" },
+												h("span", { className: "lm-appst-label" }, "投递"),
+												[
+													["composer", "💬 对话", "拍照后放入对话框草稿(默认)"],
+													["folder", "📁 文件夹", "拍照后仅保存到下方文件夹,不占对话框"],
+													["both", "两者", "放入对话框的同时保存到文件夹"],
+												].map(([m, label, tip]) =>
+													h(
+														"button",
+														{ key: m, className: "lm-mode" + (appSt.saveMode === m ? " on" : ""), title: tip, onClick: () => void saveAppSt({ saveMode: m }) },
+														label,
+													),
+												),
+											),
+											appSt.saveMode !== "composer"
+												? h(
+														"div",
+														{ className: "lm-appst-row" },
+														h("span", { className: "lm-appst-label" }, "目录"),
+														h("input", { className: "lm-appst-dir", value: dirDraft, onChange: (e) => setDirDraft(e.target.value), placeholder: "保存文件夹的完整路径", spellCheck: false }),
+														h("button", { className: "lm-btn", style: { flex: "none", padding: "3px 8px" }, title: "保存目录", onClick: () => void saveAppSt({ saveDir: dirDraft }) }, "存"),
+														h("button", { className: "lm-btn", style: { flex: "none", padding: "3px 8px" }, title: "复制路径", onClick: () => { navigator.clipboard && navigator.clipboard.writeText(appSt.effectiveSaveDir).then(() => setFlashOk("路径已复制")); } }, "⧉"),
+													)
+												: null,
+											appSt.saveMode !== "composer"
+												? h("div", { className: "lm-appst-hint" }, "一批传完(停约15秒)后,自动在对话里通知模型到该目录读取")
+												: null,
+										)
+									: null,
 								h(
 									"div",
 									{ className: "lm-port" },

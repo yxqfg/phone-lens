@@ -120,9 +120,10 @@ window.__ModuleLoader__.load({
 
 		// ── composable pre-send (dsh composer draft) ───────────────────────────
 		// The phone photo is staged as a composer draft attachment, NOT injected
-		// into the model: the user types text next and hits send. Uses the dsh
-		// channel confirmed from source: sessions.scope(sessionId) → conversation
-		// service → createDraftImages(files) → input.for(actx).addImages(ids).
+		// into the model: the user types text next and hits send. On dsh 0.1.7+
+		// the composer is a Lexical editor whose intake is package-internal, so
+		// we dispatch a synthetic paste event and the editor's own paste handler
+		// admits the file (intakeFiles → createDrafts) — the only stable seam.
 		let hostCtx = null; // set in apply() so the component can reach the runtime
 
 		function currentSessionId(ctx) {

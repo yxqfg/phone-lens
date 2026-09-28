@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sensors_plus/sensors_plus.dart';
@@ -380,11 +381,19 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// Reads the live window size (not MediaQuery, which lags a frame when
   /// called from didChangeMetrics).
   int _streamRotation() {
-    // physical (sensor) orientation, independent of system auto-rotate
-    if (_physLandscape) return 0;
     final sensor = _camera?.description.sensorOrientation ?? 90;
-    final base = ((sensor / 90) % 4 + 4) % 4;
-    return base == 3 ? 270 : 90;
+    if (_physLandscape) {
+      // Landscape has TWO flavors. Measured on-device: leaning the phone
+      // LEFT (top toward the left, ax > 0) is the sensor's native upright
+      // side for the usual 90° sensor (rotation 0); leaning RIGHT flips the
+      // buffer upside down (180). Getting this backwards makes BOTH leans
+      // render upside-down on the PC.
+      final base = _physLeanLeft ? sensor + 270 : sensor + 90;
+      return ((base % 360) + 360) % 360;
+    }
+    // physical (sensor) orientation, independent of system auto-rotate
+    final b = ((sensor / 90) % 4 + 4) % 4;
+    return b == 3 ? 270 : 90;
   }
 
   void _onCameraImage(CameraImage image) {
@@ -444,6 +453,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     try {
       final file = await camera.takePicture();
       var bytes = await File(file.path).readAsBytes();
+      // WYSIWYG: bake the photo to what the viewfinder showed at shutter
+      // time. takePicture pixels are always portrait-upright (CameraX bakes
+      // the display rotation and this app is portrait-locked), so the extra
+      // spin vs. the preview is (streamRotation - sensorOrientation) mod 360
+      // — 0 when held upright, ±90 when leaned. Without this, photos sent to
+      // the PC ignore the preview orientation entirely.
+      final extra = ((_streamRotation() - camera.description.sensorOrientation) % 360 + 360) % 360;
+      if (extra != 0) {
+        bytes = await compute(_rotateJpeg, _RotateArgs(bytes, extra));
+      }
       const maxBytes = 10 * 1024 * 1024;
       if (bytes.length > maxBytes) {
         bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
@@ -970,6 +989,25 @@ class _FitArgs {
   final int maxBytes;
   final int maxDim;
   _FitArgs(this.bytes, this.maxBytes, this.maxDim);
+}
+
+/// Bake a photo to the orientation the viewfinder showed. [clockwise] is the
+/// extra clockwise spin (see _streamRotation); 0 returns the bytes untouched
+/// so the common upright case pays no re-encode.
+Uint8List _rotateJpeg(_RotateArgs args) {
+  final decoded = img.decodeImage(args.bytes);
+  if (decoded == null) return args.bytes;
+  var baked = img.bakeOrientation(decoded);
+  if (args.clockwise != 0) {
+    baked = img.copyRotate(baked, angle: args.clockwise);
+  }
+  return Uint8List.fromList(img.encodeJpg(baked, quality: 92));
+}
+
+class _RotateArgs {
+  final Uint8List bytes;
+  final int clockwise;
+  const _RotateArgs(this.bytes, this.clockwise);
 }
 
 /// Small translucent confirmation banner at the top of the screen; auto-hides

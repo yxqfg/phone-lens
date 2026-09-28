@@ -6,6 +6,7 @@ import { HostDeliverySink, type EventedAgent } from "./inject/host-sink.js";
 import { TargetTracker } from "./inject/target.js";
 import { DeviceStore } from "./store/devices.js";
 import { PairingStore } from "./store/pairing.js";
+import { AppSettingsStore } from "./store/settings.js";
 import { startLensServer, type LensServerHandle } from "./server/http.js";
 import { ViewHub } from "./server/hub.js";
 import { buildPairingQr } from "./server/qr.js";
@@ -36,6 +37,8 @@ export default class PhoneLens extends Service {
 
     const pairing = new PairingStore(config.pairing.codeTtlMs);
     const devices = new DeviceStore(dataDir);
+    // user-selected capture mode + folder target (web UI settings panel)
+    const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
     const hub = new ViewHub(config, (level, msg) => log(level, msg));
     const targets = new TargetTracker(config);
     // Phase 2: real delivery into a live dsh session; the LoggingSink remains
@@ -65,6 +68,7 @@ export default class PhoneLens extends Service {
       attachments,
       fallbackDir: join(dataDir, "uploads"),
       pendingDir: join(dataDir, "pending"),
+      appSettings,
       log,
     })
       .then(async (h) => {

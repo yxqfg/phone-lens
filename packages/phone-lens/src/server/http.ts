@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import QRCode from "qrcode";
@@ -14,6 +14,7 @@ import { admitImage, magicMatches, type AttachmentStoreLike } from "../inject/ad
 import type { TargetTracker } from "../inject/target.js";
 import type { DeviceStore } from "../store/devices.js";
 import { hashToken, mintDeviceToken, type PairingStore } from "../store/pairing.js";
+import { SAVE_MODES, type AppSettingsStore, type SaveMode } from "../store/settings.js";
 import type { ViewHub } from "./hub.js";
 import { buildPairingQr } from "./qr.js";
 import { VIEW_HTML } from "./static-view.js";
@@ -32,6 +33,8 @@ export interface ServerDeps {
   fallbackDir: string;
   /** Browser-fetchable staging dir for images awaiting user send (composer pre-send). */
   pendingDir: string;
+  /** User-selected capture mode + folder target (web UI settings). */
+  appSettings: AppSettingsStore;
   log: (level: "info" | "warn" | "error", msg: string) => void;
 }
 
@@ -39,6 +42,9 @@ export interface LensServerHandle {
   port: number;
   dispose: () => Promise<void>;
 }
+
+/** Process-lifetime marker: surfaces service rebuilds via /status. */
+const SERVER_BOOT_AT = Date.now();
 
 /** Boot the receiver: HTTP routes + two websocket endpoints. */
 export async function startLensServer(deps: ServerDeps): Promise<LensServerHandle> {
@@ -109,6 +115,7 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
     port: config.server.port,
     dispose: async () => {
       clearInterval(heartbeat);
+      hub.dispose();
       hub.detachAll();
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -141,11 +148,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.5", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.7", requiresPairing: true }, cors);
   }
 
   // ── loopback-only endpoints (preview page, QR, view stream) ──────────────
-  if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) {
+  if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) {
     return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
   }
   if (method === "GET" && (path === "/" || path === "/view.html")) {
@@ -220,7 +227,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const captureId = q.get("captureId");
     const note = q.get("note") ?? (captureId ? hub.noteFor(captureId) : undefined);
     if (captureId) hub.consumeCapture(captureId);
-    const name = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
+    const rawName = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
+    const name = sanitizeFileName(rawName);
 
     let admitted;
     try {
@@ -234,20 +242,52 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     // keep the local archive bounded (retention: maxStoredUploads oldest-first)
     if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
 
-    // Phase 2 (rev): PRE-SEND semantics. The phone's photo is staged for the
-    // dsh composer, not injected straight into the model — the browser client
-    // fetches this staging copy and drops it into the composer draft; the user
-    // types text and hits send. So no agent.followup here.
-    const pendingPath = join(deps.pendingDir, `${admitted.ref.attachmentId}.jpg`);
-    try {
-      mkdirSync(deps.pendingDir, { recursive: true });
-      writeFileSync(pendingPath, buf);
-      log("info", `staged for composer: ${pendingPath}`);
-    } catch (error) {
-      log("warn", `staging failed: ${String(error)}`);
+    // Capture-mode routing (user-selected in the web UI settings). The photo
+    // always lands in the attachment store first; the mode decides what
+    // happens next:
+    //   composer → stage for the dsh composer draft (paste pre-send)
+    //   folder   → additionally/only write the file to the user's folder
+    // A failed folder write never loses the photo — it falls back to staging.
+    const st = deps.appSettings.get();
+    const wantFolder = st.saveMode !== "composer";
+    const wantComposer = st.saveMode !== "folder";
+    let savedDir: string | null = null;
+    if (wantFolder) {
+      const dir = deps.appSettings.effectiveSaveDir();
+      try {
+        mkdirSync(dir, { recursive: true });
+        const fileName = nextAvailableName(dir, name);
+        const target = resolveUnder(dir, fileName);
+        if (!target) throw new Error("resolved path escapes the save directory");
+        writeFileSync(target, buf);
+        savedDir = dir;
+        log("info", `folder-mode saved: ${target}`);
+      } catch (error) {
+        log("warn", `folder save failed (${String(error)}) — falling back to composer staging`);
+      }
     }
-    hub.broadcastToViews({ type: "pending_image", attachmentId: admitted.ref.attachmentId, name });
-    // no direct delivery; the client owns placing it in the composer
+
+    // PRE-SEND semantics. The phone's photo is staged for the dsh composer,
+    // not injected straight into the model — the browser client fetches this
+    // staging copy and drops it into the composer draft; the user types text
+    // and hits send. So no agent.followup here.
+    if (wantComposer || !savedDir) {
+      const pendingPath = resolveUnder(deps.pendingDir, pendingFileName(admitted.ref.attachmentId));
+      try {
+        if (!pendingPath) throw new Error("resolved path escapes the pending directory");
+        mkdirSync(deps.pendingDir, { recursive: true });
+        writeFileSync(pendingPath, buf);
+        log("info", `staged for composer: ${pendingPath}`);
+      } catch (error) {
+        log("warn", `staging failed: ${String(error)}`);
+      }
+      hub.broadcastToViews({ type: "pending_image", attachmentId: admitted.ref.attachmentId, name });
+      // no direct delivery; the client owns placing it in the composer
+    } else {
+      // folder-only save: bypass the composer; surface a local UI hint on the
+      // view — never a chat message (the tool does not speak for the user).
+      hub.broadcastToViews({ type: "upload_saved", name, dir: savedDir });
+    }
 
     return sendJson(res, 200, {
       ok: true,
@@ -257,14 +297,15 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       bytes: admitted.ref.bytes,
       storage: admitted.storage,
       delivered: null,
-      deliverReason: "staged-in-composer",
+      deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
     });
   }
 
   // Browser client fetches the staged photo to place into the composer draft.
   if (method === "GET" && path.startsWith("/pending/") && loop) {
     const id = path.slice("/pending/".length).split("/")[0] ?? "";
-    const file = join(deps.pendingDir, `${id}.jpg`);
+    const file = resolveUnder(deps.pendingDir, pendingFileName(id));
+    if (!file) return sendError(res, 404, ERROR_CODES.BAD_REQUEST, "pending image not found");
     try {
       const data = await readFile(file);
       res.writeHead(200, { "content-type": "image/jpeg", "cache-control": "no-store", ...cors });
@@ -278,6 +319,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (method === "GET" && path === "/status") {
     const cameraDeviceId = ctx.getCurrentCamera();
     return sendJson(res, 200, {
+      bootAt: SERVER_BOOT_AT,
       devices: devices.list().map((d) => ({ id: d.deviceId, name: d.name, model: d.model, online: d.deviceId === cameraDeviceId, streaming: d.deviceId === cameraDeviceId, lastSeenAt: d.lastSeenAt })),
       camera: hub.stats(),
       preview: config.preview,
@@ -288,6 +330,23 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   if (method === "GET" && path === "/targets") {
     return sendJson(res, 200, { targets: targets.list(), default: targets.resolve()?.sessionId ?? null }, cors);
+  }
+
+  // Web UI settings: capture mode (composer / folder / both) + target folder.
+  // Loopback-only; the settings live on the host because the folder save runs here.
+  if (method === "GET" && path === "/app-settings") {
+    const st = deps.appSettings.get();
+    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, cors);
+  }
+  if (method === "POST" && path === "/app-settings") {
+    const body = await readJsonBody(req, 4096);
+    if (!body) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "invalid JSON body");
+    const patch: { saveMode?: SaveMode; saveDir?: string } = {};
+    if (typeof body.saveMode === "string" && SAVE_MODES.includes(body.saveMode as SaveMode)) patch.saveMode = body.saveMode as SaveMode;
+    if (typeof body.saveDir === "string") patch.saveDir = body.saveDir;
+    const st = deps.appSettings.set(patch);
+    log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"}`);
+    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, cors);
   }
 
   // View-side control also arrives over /ws/view; a loopback HTTP trigger is
@@ -303,6 +362,44 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+/** Strip path separators / reserved characters so a phone-supplied upload
+ *  name can never escape the target directory or hide as a dotfile. */
+function sanitizeFileName(input: string): string {
+  const base = basename(input)
+    .replace(/[<>:"|?*\u0000-\u001F]/g, "_")
+    .replace(/^[\s.]+/, "")
+    .trim();
+  return base || "shot.jpg";
+}
+
+/** Pick `name`, then `name (2).ext`, `name (3).ext`, … — folder saves never overwrite. */
+function nextAvailableName(dir: string, name: string): string {
+  if (!existsSync(join(dir, name))) return name;
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let n = 2; ; n++) {
+    const candidate = `${stem} (${n})${ext}`;
+    if (!existsSync(join(dir, candidate))) return candidate;
+  }
+}
+
+/** Pending-staging filename for an attachment id. Ids may be URN-ish
+ *  ("file:<digest>" without the dsh attachment service) and Windows forbids
+ *  ":" in filenames — flatten to a portable name, write and read alike. */
+function pendingFileName(attachmentId: string): string {
+  return `${attachmentId.replace(/[^A-Za-z0-9._-]/g, "_")}.jpg`;
+}
+
+/** Resolve `name` under `baseDir` and refuse anything that escapes it
+ *  (defense in depth on top of sanitizeFileName — e.g. a crafted name that
+ *  survives sanitization but still resolves outside the base). */
+function resolveUnder(baseDir: string, name: string): string | null {
+  const base = resolve(baseDir);
+  const target = resolve(base, name);
+  return target === base || target.startsWith(base + sep) ? target : null;
+}
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>): void {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", ...(extraHeaders ?? {}) });

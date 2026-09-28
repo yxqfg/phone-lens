@@ -83,8 +83,13 @@ export type ViewServerMessage =
   | { type: "frame_meta"; width: number; height: number; rotation?: number }
   | { type: "devices"; devices: { id: string; name: string; active: boolean }[] }
   | { type: "device"; online: boolean; name?: string }
+  // host→view: the ACTIVE phone's stream stalled (user turned preview off on
+  // the phone) or resumed. `on:false` lets the web UI clear the last frame.
+  | { type: "preview_state"; on: boolean }
   | { type: "capture_pending"; captureId: string; note?: string }
   | { type: "pending_image"; attachmentId: string; name?: string }
+  // folder-only save: the photo bypassed the composer; surface a local hint.
+  | { type: "upload_saved"; name?: string; dir: string }
   | { type: "injected"; captureId?: string; attachmentId: string; sessionId: string | null; ok: boolean; reason?: string; name?: string }
   | { type: "upload"; attachmentId: string; storage: string; name?: string }
   | { type: "error"; code: string; message?: string };

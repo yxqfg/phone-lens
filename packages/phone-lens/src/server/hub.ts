@@ -15,6 +15,16 @@ interface CamState {
 }
 
 /**
+ * How long the ACTIVE device's stream may go silent before views are told the
+ * preview was turned off. The phone app never announces "preview off" — it
+ * just stops pushing frames (the WS stays up) — so the host derives the state:
+ * a live, open camera uplink with no frames for this long means the user
+ * switched preview off on the phone. Device disconnects are signalled
+ * separately via the `devices` list.
+ */
+const PREVIEW_STALL_MS = 3_000;
+
+/**
  * The viewfinder hub: MULTIPLE camera uplinks (one per phone, keyed by
  * deviceId), N loopback view downlinks. The "active" device is auto-selected
  * as the last one to send a frame; the view side can switch it via
@@ -29,17 +39,29 @@ export class ViewHub {
   /** captureId → { note, requestedAt } until the matching upload lands or timeout. */
   private pendingCaptures = new Map<string, { note?: string; requestedAt: number }>();
   private readonly captureTimeoutMs = 60_000;
+  /** Whether the active device is confirmed to be streaming (hello/frame seen). */
+  private previewOn = false;
+  private stallTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly config: LensConfig,
     private readonly log: (level: "info" | "warn", msg: string) => void,
-  ) {}
+  ) {
+    this.stallTimer = setInterval(() => this.checkPreviewStall(), 1_000);
+  }
+
+  /** Stop the stall watchdog (server dispose). */
+  dispose(): void {
+    if (this.stallTimer) clearInterval(this.stallTimer);
+    this.stallTimer = null;
+  }
 
   // ── camera side ───────────────────────────────────────────────────────────
 
   attachCamera(deviceId: string, ws: WebSocket, name: string): void {
     const prev = this.cameras.get(deviceId);
     if (prev) {
+      this.log("warn", `camera re-attach: kicking previous ws for ${deviceId.slice(0, 8)}`);
       try {
         prev.ws.close(1000, "new-instance");
       } catch {}
@@ -53,7 +75,8 @@ export class ViewHub {
     else this.sendControl(deviceId, { type: "pause_preview" });
     this.log("info", `camera uplink: ${name} (${deviceId.slice(0, 8)})`);
 
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
+      this.log("warn", `camera ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (${name} ${deviceId.slice(0, 8)})`);
       if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
     });
     ws.on("message", (data, isBinary) => {
@@ -69,6 +92,7 @@ export class ViewHub {
 
   detachCamera(deviceId: string): void {
     const cam = this.cameras.get(deviceId);
+    this.log("warn", `detachCamera(${deviceId.slice(0, 8)}) had-camera=${!!cam}`);
     if (cam) this.cameras.delete(deviceId);
     if (this.activeDeviceId === deviceId) {
       const next = [...this.cameras.keys()].at(-1) ?? null;
@@ -104,10 +128,14 @@ export class ViewHub {
       case "hello":
         cam.meta = { width: msg.width, height: msg.height, fps: msg.fps, ...(msg.rotation !== void 0 ? { rotation: msg.rotation } : {}) };
         if (this.activeDeviceId === deviceId) {
+          // hello is the phone's "stream starting" announcement (sent on every
+          // _startStream) — treat it as preview-on for the view side.
+          this.markPreviewActive();
           this.broadcastToViews({ type: "frame_meta", width: msg.width, height: msg.height, ...(msg.rotation !== void 0 ? { rotation: msg.rotation } : {}) });
         }
         break;
       case "bye":
+        this.log("warn", `camera sent bye: ${deviceId.slice(0, 8)}`);
         this.detachCamera(deviceId);
         break;
       case "claim_active":
@@ -143,17 +171,45 @@ export class ViewHub {
     }
     // only the ACTIVE device drives the view; others just keep their own state
     if (this.activeDeviceId === deviceId) {
+      this.markPreviewActive();
       for (const view of this.views) {
         if (view.readyState === view.OPEN) view.send(frame, { binary: true });
       }
     }
   }
 
+  /** Flip the view-side preview state to on (once) when stream activity returns. */
+  private markPreviewActive(): void {
+    if (this.previewOn) return;
+    this.previewOn = true;
+    this.broadcastToViews({ type: "preview_state", on: true });
+  }
+
+  /**
+   * Watchdog: an open, ACTIVE camera uplink that has gone silent means the
+   * user turned preview off on the phone (the app keeps the WS while only
+   * stopping its frame pump). Tell views so they can clear the stale frame.
+   * Disconnected devices are NOT handled here — the `devices` broadcast owns
+   * the offline state on the view side.
+   */
+  private checkPreviewStall(): void {
+    if (!this.previewOn) return;
+    const active = this.activeCam();
+    if (!active || active.ws.readyState !== active.ws.OPEN) return;
+    if (Date.now() - active.lastFrameAt <= PREVIEW_STALL_MS) return;
+    this.previewOn = false;
+    this.broadcastToViews({ type: "preview_state", on: false });
+    this.log("info", `active preview stalled >${PREVIEW_STALL_MS}ms — notified views (preview off)`);
+  }
+
   // ── view side ─────────────────────────────────────────────────────────────
 
   attachView(ws: WebSocket, hooks: { onRefreshPairing?: () => void; onRenameDevice?: (deviceId: string, name: string) => void } = {}): void {
     this.views.add(ws);
-    ws.on("close", () => this.views.delete(ws));
+    ws.on("close", (code, reason) => {
+      this.log("warn", `view ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (views left: ${this.views.size - 1})`);
+      this.views.delete(ws);
+    });
     ws.on("message", (data, isBinary) => {
       if (isBinary) return;
       const msg = parseViewClient(data.toString());
@@ -181,7 +237,12 @@ export class ViewHub {
       } satisfies ViewServerMessage),
     );
     this.broadcastDevicesTo(ws);
-    if (active?.lastFrame && ws.readyState === ws.OPEN) ws.send(active.lastFrame, { binary: true });
+    // initial preview state so a freshly (re)loaded view renders the correct
+    // canvas/placeholder instead of guessing
+    ws.send(JSON.stringify({ type: "preview_state", on: this.previewOn } satisfies ViewServerMessage));
+    // only replay a cached frame while the stream is confirmed fresh; a stale
+    // frame would flash an old picture before the "preview off" state lands
+    if (this.previewOn && active?.lastFrame && ws.readyState === ws.OPEN) ws.send(active.lastFrame, { binary: true });
   }
 
   viewCount(): number {
@@ -215,7 +276,10 @@ export class ViewHub {
 
   private pushActiveFrameToViews(): void {
     const active = this.activeCam();
-    if (active?.lastFrame) {
+    // replay the cached frame only when the preview is confirmed streaming;
+    // otherwise views would briefly show an old picture before the stall
+    // watchdog reports "preview off"
+    if (this.previewOn && active?.lastFrame) {
       for (const view of this.views) {
         if (view.readyState === view.OPEN) view.send(active.lastFrame, { binary: true });
       }

@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
@@ -298,6 +298,60 @@ var DeviceStore = class {
 	}
 	count() {
 		return this.devices.size;
+	}
+};
+
+//#endregion
+//#region src/store/settings.ts
+const SAVE_MODES = [
+	"composer",
+	"folder",
+	"both"
+];
+/**
+* User-facing capture settings, persisted as JSON under the plugin data dir.
+* Stored host-side on purpose: the folder save happens on this machine, and
+* every loopback view (overlay, /view.html) must see the same mode.
+*/
+var AppSettingsStore = class {
+	data;
+	constructor(file, defaultSaveDir) {
+		this.file = file;
+		this.defaultSaveDir = defaultSaveDir;
+		this.data = {
+			saveMode: "composer",
+			saveDir: ""
+		};
+		this.load();
+	}
+	load() {
+		if (!existsSync(this.file)) return;
+		try {
+			const raw = JSON.parse(readFileSync(this.file, "utf8"));
+			if (SAVE_MODES.includes(raw.saveMode)) this.data.saveMode = raw.saveMode;
+			if (typeof raw.saveDir === "string") this.data.saveDir = raw.saveDir;
+		} catch {}
+	}
+	get() {
+		return { ...this.data };
+	}
+	/** Effective absolute folder (resolved default when unset). */
+	effectiveSaveDir() {
+		return this.data.saveDir.trim() || this.defaultSaveDir;
+	}
+	set(patch) {
+		if (patch.saveMode && SAVE_MODES.includes(patch.saveMode)) this.data.saveMode = patch.saveMode;
+		if (typeof patch.saveDir === "string") this.data.saveDir = patch.saveDir.replace(/^["']|["']$/g, "").trim();
+		this.persist();
+		return this.get();
+	}
+	persist() {
+		try {
+			mkdirSync(join(this.file, ".."), { recursive: true });
+			const tmp = `${this.file}.tmp`;
+			writeFileSync(tmp, JSON.stringify(this.data, null, 2), "utf8");
+			renameSync(tmp, this.file);
+		} catch {}
 	}
 };
 
@@ -698,6 +752,8 @@ function queryOf(req) {
 
 //#endregion
 //#region src/server/http.ts
+/** Process-lifetime marker: surfaces service rebuilds via /status. */
+const SERVER_BOOT_AT = Date.now();
 /** Boot the receiver: HTTP routes + two websocket endpoints. */
 async function startLensServer(deps) {
 	const { config: config$1, pairing: pairing$1, devices: devices$1, hub: hub$1, targets: targets$1, sink: sink$1, log: log$1 } = deps;
@@ -764,18 +820,19 @@ async function startLensServer(deps) {
 		done(404, "Not Found");
 	});
 	const heartbeat = setInterval(() => hub$1.pingAll(), 2e4);
-	await new Promise((resolve, reject) => {
+	await new Promise((resolve$1, reject) => {
 		server.once("error", reject);
-		server.listen(config$1.server.port, config$1.server.host, () => resolve());
+		server.listen(config$1.server.port, config$1.server.host, () => resolve$1());
 	});
 	log$1("info", `phone-lens listening on ${config$1.server.host}:${config$1.server.port} (paired devices: ${devices$1.count()})`);
 	return {
 		port: config$1.server.port,
 		dispose: async () => {
 			clearInterval(heartbeat);
+			hub$1.dispose();
 			hub$1.detachAll();
 			for (const client of wss.clients) client.terminate();
-			await new Promise((resolve) => server.close(() => resolve()));
+			await new Promise((resolve$1) => server.close(() => resolve$1()));
 		}
 	};
 }
@@ -793,10 +850,10 @@ async function handle$1(deps, req, res, ctx) {
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
 		name: "PhoneLens 直连取景",
-		version: "0.3.5",
+		version: "0.3.7",
 		requiresPairing: true
 	}, cors);
-	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
+	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
 	if (method === "GET" && (path === "/" || path === "/view.html")) {
 		res.writeHead(200, {
 			"content-type": "text/html; charset=utf-8",
@@ -891,7 +948,8 @@ async function handle$1(deps, req, res, ctx) {
 		const captureId = q.get("captureId");
 		const note = q.get("note") ?? (captureId ? hub$1.noteFor(captureId) : void 0);
 		if (captureId) hub$1.consumeCapture(captureId);
-		const name = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
+		const rawName = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
+		const name = sanitizeFileName(rawName);
 		let admitted;
 		try {
 			admitted = await admitImage({
@@ -905,18 +963,43 @@ async function handle$1(deps, req, res, ctx) {
 		}
 		log$1("info", `stored ${name} (${buf.byteLength}B) → ${admitted.storage}:${admitted.ref.attachmentId}`);
 		if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config$1.limits.maxStoredUploads).catch((error) => log$1("warn", `upload pruning failed: ${String(error)}`));
-		const pendingPath = join(deps.pendingDir, `${admitted.ref.attachmentId}.jpg`);
-		try {
-			mkdirSync(deps.pendingDir, { recursive: true });
-			writeFileSync(pendingPath, buf);
-			log$1("info", `staged for composer: ${pendingPath}`);
-		} catch (error) {
-			log$1("warn", `staging failed: ${String(error)}`);
+		const st = deps.appSettings.get();
+		const wantFolder = st.saveMode !== "composer";
+		const wantComposer = st.saveMode !== "folder";
+		let savedDir = null;
+		if (wantFolder) {
+			const dir = deps.appSettings.effectiveSaveDir();
+			try {
+				mkdirSync(dir, { recursive: true });
+				const fileName = nextAvailableName(dir, name);
+				const target = resolveUnder(dir, fileName);
+				if (!target) throw new Error("resolved path escapes the save directory");
+				writeFileSync(target, buf);
+				savedDir = dir;
+				log$1("info", `folder-mode saved: ${target}`);
+			} catch (error) {
+				log$1("warn", `folder save failed (${String(error)}) — falling back to composer staging`);
+			}
 		}
-		hub$1.broadcastToViews({
-			type: "pending_image",
-			attachmentId: admitted.ref.attachmentId,
-			name
+		if (wantComposer || !savedDir) {
+			const pendingPath = resolveUnder(deps.pendingDir, pendingFileName(admitted.ref.attachmentId));
+			try {
+				if (!pendingPath) throw new Error("resolved path escapes the pending directory");
+				mkdirSync(deps.pendingDir, { recursive: true });
+				writeFileSync(pendingPath, buf);
+				log$1("info", `staged for composer: ${pendingPath}`);
+			} catch (error) {
+				log$1("warn", `staging failed: ${String(error)}`);
+			}
+			hub$1.broadcastToViews({
+				type: "pending_image",
+				attachmentId: admitted.ref.attachmentId,
+				name
+			});
+		} else hub$1.broadcastToViews({
+			type: "upload_saved",
+			name,
+			dir: savedDir
 		});
 		return sendJson(res, 200, {
 			ok: true,
@@ -926,12 +1009,13 @@ async function handle$1(deps, req, res, ctx) {
 			bytes: admitted.ref.bytes,
 			storage: admitted.storage,
 			delivered: null,
-			deliverReason: "staged-in-composer"
+			deliverReason: savedDir ? wantComposer ? "saved-and-staged" : "saved-to-folder" : "staged-in-composer"
 		});
 	}
 	if (method === "GET" && path.startsWith("/pending/") && loop) {
 		const id = path.slice(9).split("/")[0] ?? "";
-		const file = join(deps.pendingDir, `${id}.jpg`);
+		const file = resolveUnder(deps.pendingDir, pendingFileName(id));
+		if (!file) return sendError(res, 404, ERROR_CODES.BAD_REQUEST, "pending image not found");
 		try {
 			const data = await readFile(file);
 			res.writeHead(200, {
@@ -948,6 +1032,7 @@ async function handle$1(deps, req, res, ctx) {
 	if (method === "GET" && path === "/status") {
 		const cameraDeviceId = ctx.getCurrentCamera();
 		return sendJson(res, 200, {
+			bootAt: SERVER_BOOT_AT,
 			devices: devices$1.list().map((d) => ({
 				id: d.deviceId,
 				name: d.name,
@@ -969,6 +1054,28 @@ async function handle$1(deps, req, res, ctx) {
 		targets: targets$1.list(),
 		default: targets$1.resolve()?.sessionId ?? null
 	}, cors);
+	if (method === "GET" && path === "/app-settings") {
+		const st = deps.appSettings.get();
+		return sendJson(res, 200, {
+			saveMode: st.saveMode,
+			saveDir: st.saveDir,
+			effectiveSaveDir: deps.appSettings.effectiveSaveDir()
+		}, cors);
+	}
+	if (method === "POST" && path === "/app-settings") {
+		const body = await readJsonBody(req, 4096);
+		if (!body) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "invalid JSON body");
+		const patch = {};
+		if (typeof body.saveMode === "string" && SAVE_MODES.includes(body.saveMode)) patch.saveMode = body.saveMode;
+		if (typeof body.saveDir === "string") patch.saveDir = body.saveDir;
+		const st = deps.appSettings.set(patch);
+		log$1("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"}`);
+		return sendJson(res, 200, {
+			saveMode: st.saveMode,
+			saveDir: st.saveDir,
+			effectiveSaveDir: deps.appSettings.effectiveSaveDir()
+		}, cors);
+	}
 	if (method === "POST" && path === "/capture" && loop) {
 		const captureId = randomUUID();
 		const ok = hub$1.requestCapture(captureId, queryOf(req).get("note") ?? void 0);
@@ -976,6 +1083,37 @@ async function handle$1(deps, req, res, ctx) {
 		return sendJson(res, 202, { captureId });
 	}
 	return sendError(res, 404, ERROR_CODES.BAD_REQUEST, `no route ${method} ${path}`);
+}
+/** Strip path separators / reserved characters so a phone-supplied upload
+*  name can never escape the target directory or hide as a dotfile. */
+function sanitizeFileName(input) {
+	const base = basename(input).replace(/[<>:"|?*\u0000-\u001F]/g, "_").replace(/^[\s.]+/, "").trim();
+	return base || "shot.jpg";
+}
+/** Pick `name`, then `name (2).ext`, `name (3).ext`, … — folder saves never overwrite. */
+function nextAvailableName(dir, name) {
+	if (!existsSync(join(dir, name))) return name;
+	const dot = name.lastIndexOf(".");
+	const stem = dot > 0 ? name.slice(0, dot) : name;
+	const ext = dot > 0 ? name.slice(dot) : "";
+	for (let n = 2;; n++) {
+		const candidate = `${stem} (${n})${ext}`;
+		if (!existsSync(join(dir, candidate))) return candidate;
+	}
+}
+/** Pending-staging filename for an attachment id. Ids may be URN-ish
+*  ("file:<digest>" without the dsh attachment service) and Windows forbids
+*  ":" in filenames — flatten to a portable name, write and read alike. */
+function pendingFileName(attachmentId) {
+	return `${attachmentId.replace(/[^A-Za-z0-9._-]/g, "_")}.jpg`;
+}
+/** Resolve `name` under `baseDir` and refuse anything that escapes it
+*  (defense in depth on top of sanitizeFileName — e.g. a crafted name that
+*  survives sanitization but still resolves outside the base). */
+function resolveUnder(baseDir, name) {
+	const base = resolve(baseDir);
+	const target = resolve(base, name);
+	return target === base || target.startsWith(base + sep) ? target : null;
 }
 function sendJson(res, status, body, extraHeaders) {
 	res.writeHead(status, {
@@ -1002,7 +1140,7 @@ async function readJsonBody(req, limit) {
 	}
 }
 function readRawBody(req, maxBytes) {
-	return new Promise((resolve, reject) => {
+	return new Promise((resolve$1, reject) => {
 		const chunks = [];
 		let size = 0;
 		let truncated = false;
@@ -1012,7 +1150,7 @@ function readRawBody(req, maxBytes) {
 				truncated = true;
 				chunks.length = 0;
 				req.destroy();
-				resolve({
+				resolve$1({
 					buf: Buffer.alloc(0),
 					truncated
 				});
@@ -1020,7 +1158,7 @@ function readRawBody(req, maxBytes) {
 			}
 			chunks.push(chunk);
 		});
-		req.on("end", () => resolve({
+		req.on("end", () => resolve$1({
 			buf: Buffer.concat(chunks),
 			truncated
 		}));
@@ -1052,6 +1190,22 @@ async function pruneUploads(dir, max) {
 //#region src/server/hub.ts
 /**
 
+* How long the ACTIVE device's stream may go silent before views are told the
+
+* preview was turned off. The phone app never announces "preview off" — it
+
+* just stops pushing frames (the WS stays up) — so the host derives the state:
+
+* a live, open camera uplink with no frames for this long means the user
+
+* switched preview off on the phone. Device disconnects are signalled
+
+* separately via the `devices` list.
+
+*/
+const PREVIEW_STALL_MS = 3e3;
+/**
+
 * The viewfinder hub: MULTIPLE camera uplinks (one per phone, keyed by
 
 * deviceId), N loopback view downlinks. The "active" device is auto-selected
@@ -1072,13 +1226,23 @@ var ViewHub = class {
 	/** captureId → { note, requestedAt } until the matching upload lands or timeout. */
 	pendingCaptures = new Map();
 	captureTimeoutMs = 6e4;
+	/** Whether the active device is confirmed to be streaming (hello/frame seen). */
+	previewOn = false;
+	stallTimer = null;
 	constructor(config$1, log$1) {
 		this.config = config$1;
 		this.log = log$1;
+		this.stallTimer = setInterval(() => this.checkPreviewStall(), 1e3);
+	}
+	/** Stop the stall watchdog (server dispose). */
+	dispose() {
+		if (this.stallTimer) clearInterval(this.stallTimer);
+		this.stallTimer = null;
 	}
 	attachCamera(deviceId, ws, name) {
 		const prev = this.cameras.get(deviceId);
 		if (prev) {
+			this.log("warn", `camera re-attach: kicking previous ws for ${deviceId.slice(0, 8)}`);
 			try {
 				prev.ws.close(1e3, "new-instance");
 			} catch {}
@@ -1099,7 +1263,8 @@ var ViewHub = class {
 		if (this.activeDeviceId === deviceId) this.sendControl(deviceId, { type: "resume_preview" });
 		else this.sendControl(deviceId, { type: "pause_preview" });
 		this.log("info", `camera uplink: ${name} (${deviceId.slice(0, 8)})`);
-		ws.on("close", () => {
+		ws.on("close", (code, reason) => {
+			this.log("warn", `camera ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (${name} ${deviceId.slice(0, 8)})`);
 			if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
 		});
 		ws.on("message", (data, isBinary) => {
@@ -1113,6 +1278,7 @@ var ViewHub = class {
 	}
 	detachCamera(deviceId) {
 		const cam = this.cameras.get(deviceId);
+		this.log("warn", `detachCamera(${deviceId.slice(0, 8)}) had-camera=${!!cam}`);
 		if (cam) this.cameras.delete(deviceId);
 		if (this.activeDeviceId === deviceId) {
 			const next = [...this.cameras.keys()].at(-1) ?? null;
@@ -1145,14 +1311,18 @@ var ViewHub = class {
 					fps: msg.fps,
 					...msg.rotation !== void 0 ? { rotation: msg.rotation } : {}
 				};
-				if (this.activeDeviceId === deviceId) this.broadcastToViews({
-					type: "frame_meta",
-					width: msg.width,
-					height: msg.height,
-					...msg.rotation !== void 0 ? { rotation: msg.rotation } : {}
-				});
+				if (this.activeDeviceId === deviceId) {
+					this.markPreviewActive();
+					this.broadcastToViews({
+						type: "frame_meta",
+						width: msg.width,
+						height: msg.height,
+						...msg.rotation !== void 0 ? { rotation: msg.rotation } : {}
+					});
+				}
 				break;
 			case "bye":
+				this.log("warn", `camera sent bye: ${deviceId.slice(0, 8)}`);
 				this.detachCamera(deviceId);
 				break;
 			case "claim_active":
@@ -1188,12 +1358,50 @@ var ViewHub = class {
 			cam.frameCount = 0;
 		}
 		if (this.activeDeviceId === deviceId) {
+			this.markPreviewActive();
 			for (const view of this.views) if (view.readyState === view.OPEN) view.send(frame, { binary: true });
 		}
 	}
+	/** Flip the view-side preview state to on (once) when stream activity returns. */
+	markPreviewActive() {
+		if (this.previewOn) return;
+		this.previewOn = true;
+		this.broadcastToViews({
+			type: "preview_state",
+			on: true
+		});
+	}
+	/**
+	
+	* Watchdog: an open, ACTIVE camera uplink that has gone silent means the
+	
+	* user turned preview off on the phone (the app keeps the WS while only
+	
+	* stopping its frame pump). Tell views so they can clear the stale frame.
+	
+	* Disconnected devices are NOT handled here — the `devices` broadcast owns
+	
+	* the offline state on the view side.
+	
+	*/
+	checkPreviewStall() {
+		if (!this.previewOn) return;
+		const active = this.activeCam();
+		if (!active || active.ws.readyState !== active.ws.OPEN) return;
+		if (Date.now() - active.lastFrameAt <= PREVIEW_STALL_MS) return;
+		this.previewOn = false;
+		this.broadcastToViews({
+			type: "preview_state",
+			on: false
+		});
+		this.log("info", `active preview stalled >${PREVIEW_STALL_MS}ms — notified views (preview off)`);
+	}
 	attachView(ws, hooks = {}) {
 		this.views.add(ws);
-		ws.on("close", () => this.views.delete(ws));
+		ws.on("close", (code, reason) => {
+			this.log("warn", `view ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (views left: ${this.views.size - 1})`);
+			this.views.delete(ws);
+		});
 		ws.on("message", (data, isBinary) => {
 			if (isBinary) return;
 			const msg = parseViewClient(data.toString());
@@ -1221,7 +1429,11 @@ var ViewHub = class {
 			paired: true
 		}));
 		this.broadcastDevicesTo(ws);
-		if (active?.lastFrame && ws.readyState === ws.OPEN) ws.send(active.lastFrame, { binary: true });
+		ws.send(JSON.stringify({
+			type: "preview_state",
+			on: this.previewOn
+		}));
+		if (this.previewOn && active?.lastFrame && ws.readyState === ws.OPEN) ws.send(active.lastFrame, { binary: true });
 	}
 	viewCount() {
 		return this.views.size;
@@ -1250,7 +1462,7 @@ var ViewHub = class {
 	}
 	pushActiveFrameToViews() {
 		const active = this.activeCam();
-		if (active?.lastFrame) {
+		if (this.previewOn && active?.lastFrame) {
 			for (const view of this.views) if (view.readyState === view.OPEN) view.send(active.lastFrame, { binary: true });
 		}
 		if (active) this.broadcastToViews({
@@ -1359,6 +1571,7 @@ const dataDir = process.env.LENS_DATA_DIR ?? lensDataDir();
 const log = (level, msg) => console[level](`[phone-lens:dev] ${msg}`);
 const pairing = new PairingStore(config.pairing.codeTtlMs);
 const devices = new DeviceStore(dataDir);
+const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
 const hub = new ViewHub(config, (lvl, msg) => log(lvl, msg));
 const targets = new TargetTracker(config);
 const sink = new LoggingSink((lvl, msg) => log(lvl, msg));
@@ -1372,6 +1585,7 @@ const handle = await startLensServer({
 	attachments: () => void 0,
 	fallbackDir: join(dataDir, "uploads"),
 	pendingDir: join(dataDir, "pending"),
+	appSettings,
 	log
 });
 const qr = await buildPairingQr(pairing.current().code, pairing.current().expiresAt, config);

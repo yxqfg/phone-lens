@@ -1456,7 +1456,7 @@ var PhoneLens = class extends Service {
 		const attachments = () => ctx.get?.("attachments");
 		const onAgent = (agent) => sink.track(agent);
 		const offAgent = (agent) => sink.untrack(agent);
-		ctx.on?.("agent/session-start", (payload) => onAgent(payload.agent));
+		ctx.on?.("agent/created", (payload) => onAgent(payload.agent));
 		ctx.on?.("agent/inbox/inserted", (payload) => onAgent(payload.agent));
 		ctx.on?.("agent/status", (payload) => {
 			if (payload.status === "running") onAgent(payload.agent);

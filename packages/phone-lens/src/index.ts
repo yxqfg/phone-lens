@@ -47,7 +47,7 @@ export default class PhoneLens extends Service {
     // listeners): the sink tracks the last-active session for delivery.
     const onAgent = (agent: EventedAgent) => sink.track(agent);
     const offAgent = (agent: EventedAgent) => sink.untrack(agent);
-    ctx.on?.("agent/session-start", (payload: { agent: EventedAgent }) => onAgent(payload.agent));
+    ctx.on?.("agent/created", (payload: { agent: EventedAgent }) => onAgent(payload.agent));
     ctx.on?.("agent/inbox/inserted", (payload: { agent: EventedAgent }) => onAgent(payload.agent));
     ctx.on?.("agent/status", (payload: { agent: EventedAgent; status: string }) => {
       if (payload.status === "running") onAgent(payload.agent);

@@ -127,8 +127,12 @@ window.__ModuleLoader__.load({
 
 		function currentSessionId(ctx) {
 			try {
-				// cordis: accessing a service as a ctx property requires it in
-				// `inject`; use ctx.get() instead (never throws for absent).
+				// rc.2: the current session lives on the uiSession binding source,
+				// not on sessions.list.getSnapshot().current (removed in 0.1.7).
+				const ui = ctx.get("uiSession");
+				const key = ui?.current?.value?.key;
+				if (key) return key;
+				// pre-0.1.7 fallback.
 				const sessions = ctx.get("sessions");
 				if (!sessions) throw new Error("no sessions service");
 				const list = sessions.list;
@@ -141,25 +145,34 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		// rc.2 composer is a Lexical editor; its root element carries the
+		// data-lexical-editor marker. Fall back to any visible contenteditable.
+		function findComposerEditor() {
+			const lexical = document.querySelector('div[data-lexical-editor="true"][contenteditable="true"]');
+			if (lexical) return lexical;
+			const candidates = document.querySelectorAll('[contenteditable="true"]');
+			for (const el of candidates) {
+				if (el.getClientRects().length > 0) return el;
+			}
+			return null;
+		}
+
 		async function stageIntoComposer(ctx, port, attachmentId) {
-			if (!ctx) throw new Error("no runtime ctx (phone-lens host not wired)");
 			const resp = await fetch(`http://127.0.0.1:${port}/pending/${attachmentId}`).catch((e) => { throw new Error("fetch pending: " + String(e)); });
 			if (!resp.ok) throw new Error("pending fetch HTTP " + resp.status);
 			const buf = await resp.arrayBuffer();
 			const file = new File([buf], `phone-${attachmentId.slice(0, 8)}.jpg`, { type: "image/jpeg" });
-			const sid = currentSessionId(ctx);
-			if (!sid) throw new Error("no current session id");
-			// scope-addressed: ctx.get('sessions').scope(sid) → scoped actx
-			const sessions = ctx.get("sessions");
-			const actx = sessions.scope(sid);
-			if (!actx) throw new Error("no session scope for " + sid);
-			const conv = actx.get("conversation");
-			if (!conv) throw new Error("no conversation service in scope");
-			const atts = conv.createDraftImages([file]);
-			if (!atts || !atts.length) throw new Error("createDraftImages empty");
-			const input = conv.input.for(actx);
-			const ok = input.addImages(atts.map((a) => a.id));
-			if (ok !== true) throw new Error("input.addImages rejected (busy admission?)");
+			// rc.2 path: the composer's own paste handler admits image files
+			// through the official intake (intakeFiles → createDrafts), so we
+			// dispatch a synthetic paste instead of touching package-internal
+			// draft APIs. The composer is bound to the current session already.
+			const editor = findComposerEditor();
+			if (!editor) throw new Error("no composer input (open a session first)");
+			editor.focus({ preventScroll: true });
+			const dt = new DataTransfer();
+			dt.items.add(file);
+			const ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+			editor.dispatchEvent(ev);
 			return true;
 		}
 

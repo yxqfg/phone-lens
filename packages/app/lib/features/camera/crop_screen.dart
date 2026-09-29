@@ -191,12 +191,30 @@ class _CropScreenState extends State<CropScreen> {
         title: Text(title),
         leading: IconButton(
           icon: const Icon(Icons.close),
-          // Batch mode: discard ALL remaining images, not just this one.
-          onPressed: () => Navigator.of(context).pop(),
+          // Batch mode: discards ALL remaining images (already-uploaded ones
+          // stay), so it asks; single mode just drops this one photo.
+          onPressed: () async {
+            if (_isBatch && _hasNext) {
+              final remaining = widget.batch!.length - _currentIndex;
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('丢弃剩余照片?'),
+                  content: Text('将丢弃剩余 $remaining 张(含当前);已上传的不受影响。'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('继续裁剪')),
+                    FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('丢弃')),
+                  ],
+                ),
+              );
+              if (ok != true) return;
+            }
+            if (context.mounted) Navigator.of(context).pop();
+          },
         ),
         actions: [
           IconButton(
-            tooltip: '逆时针旋转90°', // image.copyRotate(90) is clockwise → show CCW label? rotate button just rotates 90° each press
+            tooltip: '顺时针旋转90°', // image.copyRotate(90) rotates clockwise
             icon: const Icon(Icons.rotate_90_degrees_cw),
             onPressed: _uploading ? null : _rotate90,
           ),

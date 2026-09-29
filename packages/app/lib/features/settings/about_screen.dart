@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../ui/background_art.dart';
 
@@ -34,23 +35,24 @@ class AboutScreen extends StatelessWidget {
             _section('快速上手'),
             const _Step('1. 电脑端', '启动 dsh 后,右下角出现 📷 悬浮窗;点击展开。'),
             const _Step('2. 配对', '手机 App 扫描悬浮窗里的二维码(或手动输入 主机:端口:配对码);设备名会自动用手机型号。'),
-            const _Step('3. 拍照', '电脑端点「拍照并放入输入框」,或手机 App 按快门;照片进入 dsh 对话输入框。'),
+            const _Step('3. 拍照', '电脑端点「拍照并注入」,或手机 App 按快门;照片按电脑端设置的拍摄模式进入输入框或文件夹。'),
             const _Step('4. 发送', '在 dsh 输入框补充文字,点发送,图片即随消息进入会话。'),
             _section('常用设置'),
-            const _Step('多设备', '多个手机可同时配对;电脑端小窗可选看某台,双击设备名可重命名;未选中的手机会暂停推流但仍可上传。'),
-            const _Step('设为主机', '取景页点「设为主机」自动开启本机推流,并把电脑端预览切换到本机,其他设备随即暂停。'),
+            const _Step('拍摄模式', '电脑端小窗可选「自动注入对话 / 注入并存文件夹 / 仅存文件夹」;手机端发送成功的提示会随之变化。'),
+            const _Step('多设备', '多个手机可同时配对;电脑端小窗可选看某台,双击设备名可重命名;未选中的手机会暂停预览但仍可上传。'),
+            const _Step('设为主机', '取景页点「设为主机」自动开启本机预览,并把电脑端预览切换到本机,其他设备随即暂停。'),
             const _Step('对焦', '设置 → 画面 → 「取景对焦」:开启后点击对焦、长按锁定对焦。'),
             const _Step('裁剪', '设置 → 裁剪:默认框选范围、手柄大小可调;裁剪页点 ✕ 丢弃、点「完成」输出。'),
             const _Step('批量上传', '相册多选直接批量发送;开启裁剪后逐张裁切并自动上传,中途点 ✕ 丢弃剩余全部。'),
             const _Step('自动切换', '设置 → 配对与设备 → 「自动选择可用连接」:当前电脑不可达时自动切到可用的已配对电脑(默认关)。'),
             _section('连接与异常处理'),
             const _Step('配对失败', '确认手机与电脑在同一局域网;重新扫码(配对码15分钟有效,过期可点「刷新」)。'),
-            const _Step('预览无画面', '检查手机「推流」是否开启、接收服务(8791)是否在运行;多设备时点「设为主机」或到电脑端选中本机。'),
+            const _Step('预览无画面', '检查手机取景页「启动预览」是否打开、电脑端接收服务(默认端口 8791)是否在运行;多设备时点「设为主机」或到电脑端选中本机。'),
             const _Step('颜色异常', '设置 → 画面 → 打开「颜色校正(红蓝互换)」。'),
-            const _Step('连不上 / 频繁断开', '确认防火墙放行了 8791(仅私有网段);手机与电脑用同一Wi-Fi或USB网络共享。'),
+            const _Step('连不上 / 频繁断开', '确认防火墙放行了接收服务端口(默认 8791,仅私有网段);手机与电脑用同一Wi-Fi或USB网络共享。'),
             const _Step('找不到配对入口', '设置 → 配对与设备 → 扫码新增配对。'),
-            const _Step('本机提示“暂停推流”', '另一台手机正占用电脑端预览;本机仍可上传图片,点「设为主机」即切回本机。'),
-            const _Step('换网络后连不上', '开启「自动选择可用连接」,或在设置里点选另一台已配对电脑激活。'),
+            const _Step('本机提示“预览暂停”', '另一台手机正在使用电脑端预览;本机仍可上传图片,点「设为主机」即切回本机。'),
+            const _Step('换网络后连不上', '开启「自动选择可用连接」,或在设置里点选另一台已配对电脑,选择「设为活动连接」。'),
             const SizedBox(height: 8),
             const Padding(
               padding: EdgeInsets.fromLTRB(20, 6, 20, 6),
@@ -61,7 +63,7 @@ class AboutScreen extends StatelessWidget {
             const _Contact('插件市场', 'awesome-dsh-plugin/awesome-dsh-plugin'),
             const Padding(
               padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
-              child: Text('v0.2.0 · PhoneLens 直连取景', style: TextStyle(color: Colors.white38, fontSize: 12)),
+              child: Text('v0.3.8 · PhoneLens 直连取景', style: TextStyle(color: Colors.white38, fontSize: 12)),
             ),
             // illustration pinned at the very bottom-right of the scroll
             const Padding(
@@ -120,7 +122,19 @@ class _Contact extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(width: 108, child: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 14))),
-          Expanded(child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 14, height: 1.4))),
+          Expanded(
+            child: GestureDetector(
+              // tap-to-copy: no url_launcher dependency, still makes the
+              // handles usable instead of dead text
+              onTap: () {
+                Clipboard.setData(ClipboardData(text: value));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('已复制'), duration: Duration(milliseconds: 1200)),
+                );
+              },
+              child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 14, height: 1.4)),
+            ),
+          ),
         ],
       ),
     );

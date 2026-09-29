@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
 import '../../core/api.dart';
@@ -16,6 +17,7 @@ import '../../core/preview_encoder.dart';
 import '../../core/routes.dart';
 import '../../core/global_link.dart';
 import '../../ui/background_art.dart';
+import '../pair/pair_screen.dart';
 import 'crop_screen.dart';
 
 /// Camera-app style viewfinder: full-ratio (never cropped) preview with
@@ -113,7 +115,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
               _socket?.sendHello(
                 ps?.width.round() ?? 1280,
                 ps?.height.round() ?? 720,
-                widget.store.previewParams['fps'] ?? 6,
+                widget.store.previewParams['fps'] ?? 10,
                 _streamRotation(),
               );
             }
@@ -161,22 +163,35 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       _socket?.sendHello(
         ps?.width.round() ?? 1280,
         ps?.height.round() ?? 720,
-        widget.store.previewParams['fps'] ?? 6,
+        widget.store.previewParams['fps'] ?? 10,
         _streamRotation(),
       );
     }
   }
 
   bool _cameraInitBusy = false;
+  bool _cameraInitPending = false;
+  // Camera epoch: bumped by every release; an init whose epoch is superseded
+  // must dispose its controller instead of assigning it (covers "release ran
+  // while initialize() was in flight" — camera under a covering route).
+  int _cameraGen = 0;
+  Future<void>? _cameraDisposing;
   /// True when the stream delivers plugin-encoded JPEG frames directly
   /// (color-correct by construction — no hand-rolled YUV assembly).
   bool _jpegStreamMode = false;
 
   Future<void> _initCamera() async {
-    if (_cameraInitBusy) return;
+    if (_cameraInitBusy) {
+      _cameraInitPending = true; // re-run after the in-flight one settles
+      return;
+    }
     _cameraInitBusy = true;
     try {
+      // let any dispose from a previous release finish BEFORE opening the
+      // next controller — parallel open/close can raise CAMERA_IN_USE
+      await _cameraDisposing;
       await _releaseCamera();
+      final gen = _cameraGen;
       try {
         final cameras = await availableCameras();
         final back = cameras.firstWhere(
@@ -195,7 +210,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         );
         await controller.initialize();
         final jpeg = false;
-        if (!mounted) {
+        if (!mounted || gen != _cameraGen) {
           await controller.dispose();
           return;
         }
@@ -214,27 +229,41 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         debugPrint('[lens-mate] camera stream mode: yuv420(hand-assembled) — jpeg stream delivers no frames on this device');
         // preview streaming defaults ON — it's a framing aid, not a video
         // upload; users turn it off explicitly when they want to.
-        if (!_streaming) _toggleStream();
+        // A host-paused phone must NOT resume by itself (multi-device rule).
+        if (!_streaming && !_hostPaused) _toggleStream();
       } catch (e) {
-        if (mounted) setState(() => _cameraError = '相机初始化失败: $e');
+        debugPrint('[lens-mate] camera init failed: $e');
+        if (mounted) setState(() => _cameraError = '相机初始化失败,请检查相机权限未被占用后重试');
       }
     } finally {
       _cameraInitBusy = false;
+      if (_cameraInitPending) {
+        _cameraInitPending = false;
+        scheduleMicrotask(_initCamera);
+      }
     }
   }
 
   /// Dispose the controller (stops any image stream); `_streaming` survives
   /// as the desired state and is restored by the next [_initCamera].
   Future<void> _releaseCamera() async {
+    _cameraGen++;
     final cam = _camera;
     _camera = null;
     if (mounted) setState(() => _cameraReady = false);
-    await cam?.dispose();
+    final f = cam?.dispose();
+    if (f != null) _cameraDisposing = f;
+    await f;
   }
+
+  bool _authProbeDone = false; // one 401 probe per link lifetime
+  bool _authFailed = false; // receiver no longer knows our token
 
   void _connectSocket() {
     final s = _server;
     if (s == null) return;
+    _authProbeDone = false;
+    _authFailed = false;
     final socket = CameraSocket(
       'ws://${s.host}:${s.port}/ws/camera?deviceId=${s.deviceId}&token=${s.token}',
     );
@@ -242,8 +271,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     socket.states.listen((st) {
       globalLink.value = st; // share with settings list
       if (mounted) setState(() => _link = st);
-      // Auto-select when the current receiver drops and autoSelect is on.
-      if (st == LensLinkState.disconnected && widget.store.autoSelect) _autoSelectAvailable();
+      if (st == LensLinkState.connected) {
+        _reconnectStreak = 0;
+        _authProbeDone = false;
+        _authFailed = false;
+      } else if (st == LensLinkState.disconnected) {
+        _reconnectStreak++;
+        _maybeProbeAuth();
+        // Auto-select when the current receiver drops and autoSelect is on.
+        if (widget.store.autoSelect) _autoSelectAvailable();
+      }
     });
     socket.onPreviewState = (active) => _onHostPreviewState(active);
     _cmdSub = socket.commands.listen(_onRemoteShutter);
@@ -267,23 +304,53 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _refreshPreviewParams(s);
   }
 
+  /// After several failed reconnects, check ONCE whether the receiver still
+  /// accepts our token — devices.json resets (reinstall/profile switch)
+  /// otherwise leave the app retrying forever with no way out but re-pairing.
+  int _reconnectStreak = 0;
+  Future<void> _maybeProbeAuth() async {
+    if (_authProbeDone || _reconnectStreak < 5) return;
+    _authProbeDone = true;
+    final s = _server;
+    if (s == null) return;
+    try {
+      await _api.status(s);
+      // reachable + authed: the failures were plain network flakiness
+    } on LensApiError catch (e) {
+      if (e.code == 'AUTH_REQUIRED' && mounted) {
+        setState(() => _authFailed = true);
+      }
+    } catch (_) {
+      // network-level failure: keep the generic "not connected" state
+    }
+  }
+
   /// Auto-select an available paired receiver when autoSelect is on and the
   /// current one dropped (network switch, receiver restarted, …).
+  bool _autoSelecting = false;
   Future<void> _autoSelectAvailable() async {
-    final current = widget.store.server;
-    final servers = widget.store.servers();
-    if (current == null || servers.length < 2) return;
-    for (final s in servers) {
-      if (s.id == current.id) continue;
-      if (await _api.reachable(s)) {
-        await widget.store.setActive(s.id);
-        _socket?.close();
-        _socket = null;
-        _connectSocket(); // rebind to the new receiver
-        if (mounted) setState(() {});
-        _toast('已切换到可用连接: ${s.name}');
-        return;
+    if (_autoSelecting) return; // socket retries fire this repeatedly
+    _autoSelecting = true;
+    try {
+      final current = widget.store.server;
+      final servers = widget.store.servers();
+      if (current == null || servers.length < 2) return;
+      for (final s in servers) {
+        if (s.id == current.id) continue;
+        if (!mounted) return;
+        if (await _api.reachable(s)) {
+          if (!mounted) return;
+          await widget.store.setActive(s.id);
+          _socket?.close();
+          _socket = null;
+          _connectSocket(); // rebind to the new receiver
+          if (mounted) setState(() {});
+          _toast('已切换到可用连接: ${s.name}');
+          return;
+        }
       }
+    } finally {
+      _autoSelecting = false;
     }
   }
 
@@ -319,7 +386,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// our own preview stream is running.
   Future<void> _makeMain() async {
     if (_socket == null) return;
+    // claim_active is only delivered on a live socket — a dead link would
+    // make the success toast below a lie
+    if (_link != LensLinkState.connected) {
+      _toast('未连接电脑');
+      return;
+    }
     _socket?.makeMain();
+    // optimistic: the host will confirm by resuming us (and re-pausing if it
+    // disagrees); this unblocks _startStream below
+    if (mounted) setState(() => _hostPaused = false);
     if (cameraReadyCheck && !_streaming) await _startStream();
     _toast('已设为主机,电脑端预览已切换为本机');
   }
@@ -333,6 +409,11 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   }
 
   Future<void> _startStream() async {
+    if (_hostPaused) {
+      // another device owns the PC preview; the way out is claiming it
+      _toast('其他设备正在使用电脑端预览,点「设为主机」可切回本机');
+      return;
+    }
     final camera = _camera;
     if (camera == null || !camera.value.isInitialized) return;
     if (_streaming) return;
@@ -342,6 +423,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     } catch (e) {
       debugPrint('[lens-mate] startImageStream failed: $e');
       if (mounted) setState(() => _streaming = false);
+      _toast('预览启动失败,请重试');
       return;
     }
     // announce the SENSOR frame shape + rotation so PC-side canvases can
@@ -350,7 +432,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _socket?.sendHello(
       ps?.width.round() ?? 1280,
       ps?.height.round() ?? 720,
-      widget.store.previewParams['fps'] ?? 6,
+      widget.store.previewParams['fps'] ?? 10,
       _streamRotation(),
     );
   }
@@ -358,19 +440,26 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   Future<void> _stopStream() async {
     final camera = _camera;
     if (camera == null || !_streaming) return;
-    await camera.stopImageStream();
+    // flip the flag BEFORE awaiting: a second tap while stopImageStream is
+    // in flight would otherwise double-stop and throw
     if (mounted) setState(() => _streaming = false);
+    try {
+      await camera.stopImageStream();
+    } catch (e) {
+      debugPrint('[lens-mate] stopImageStream failed: $e');
+    }
   }
 
   /// Host asked this phone to pause (another device owns the preview) or resume
   /// (control switched back). Pausing keeps the connection + upload usable.
   Future<void> _onHostPreviewState(bool active) async {
     if (!active) {
-      if (_streaming) await _stopStream();
-      if (mounted) {
-        setState(() => _hostPaused = true);
-        _longToast('其他设备正在进行占用电脑端预览推流,不过本设备仍可以上传图片');
-      }
+      await _stopStream();
+      if (!mounted) return;
+      // reconnect handshakes re-send pause — only surface it once
+      if (_hostPaused) return;
+      setState(() => _hostPaused = true);
+      _longToast('其他设备正在使用电脑端预览;本机仍可正常上传图片');
     } else {
       if (mounted) setState(() => _hostPaused = false);
       if (cameraReadyCheck) await _startStream(); // resume seamlessly
@@ -400,7 +489,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _camFrames++;
     if (!_streaming) return;
     final p = widget.store.previewParams;
-    final minGap = 1000 ~/ (p['fps'] ?? 6);
+    // a 0 fps (mis)config must not raise IntegerDivisionByZero per frame
+    final fps = (p['fps'] ?? 10) <= 0 ? 10 : (p['fps'] ?? 10);
+    final minGap = 1000 ~/ fps;
     final now = DateTime.now();
     if (now.difference(_lastFramePushed).inMilliseconds < minGap) {
       _gapDrops++;
@@ -426,9 +517,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _lastFramePushed = now;
     _encoder.encode(
       snap,
-      p['maxShort'] ?? 360,
-      p['maxLong'] ?? 640,
-      p['quality'] ?? 62,
+      p['maxShort'] ?? 480,
+      p['maxLong'] ?? 854,
+      p['quality'] ?? 70,
     );
   }
 
@@ -447,6 +538,12 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       return;
     }
     if (_sending || DateTime.now().millisecondsSinceEpoch - _lastSendAt < 1200) {
+      // throttled: tell the user (local) / the host (remote) instead of silence
+      if (captureId != null) {
+        _socket?.reportCapture(captureId, 'declined', 'throttled');
+      } else {
+        _toast('处理中,请稍候');
+      }
       return;
     }
     setState(() => _sending = true);
@@ -463,7 +560,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       if (extra != 0) {
         bytes = await compute(_rotateJpeg, _RotateArgs(bytes, extra));
       }
-      const maxBytes = 10 * 1024 * 1024;
+      final maxBytes = widget.store.maxUploadBytes;
       if (bytes.length > maxBytes) {
         bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
       }
@@ -479,7 +576,11 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           ),
         );
         // cancel/back on the cropper discards the photo entirely — never send it
-        if (cropped == null) return;
+        if (cropped == null) {
+          if (captureId != null) _socket?.reportCapture(captureId, 'declined', 'cancelled');
+          _toast('已丢弃本次照片');
+          return;
+        }
         bytes = cropped;
       }
       await _send(s, bytes: bytes, name: _shotName(), captureId: captureId, note: note);
@@ -514,6 +615,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     }
     final files = await ImagePicker().pickMultiImage(limit: 12);
     if (files.isEmpty || !mounted) return;
+    final maxBytes = widget.store.maxUploadBytes;
 
     if (_cropBeforeSend) {
       // Read every picked image up front so the crop session can advance
@@ -522,7 +624,6 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       final batchNames = <String>[];
       for (final f in files) {
         var bytes = await f.readAsBytes();
-        const maxBytes = 10 * 1024 * 1024;
         if (bytes.length > maxBytes) bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
         batchBytes.add(bytes);
         batchNames.add(_galleryName(f.name));
@@ -534,7 +635,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             bytes: batchBytes.first,
             batch: batchBytes,
             batchNames: batchNames,
-            onBatchUpload: (b, name) => _send(s, bytes: b, name: name, captureId: null, note: null),
+            // silent: per-item toasts would fight the crop screen's overlay;
+            // the final pop returns the success count
+            onBatchUpload: (b, name) => _send(s, bytes: b, name: name, captureId: null, note: null, silent: true),
             defaultCropRatio: widget.store.defaultCropRatio,
             handleSize: widget.store.handleSize,
           ),
@@ -544,36 +647,70 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       return;
     }
 
-    // Crop OFF: plain batch upload.
+    // Crop OFF: plain batch upload. Serial, per-item failures counted (not
+    // silently swelling the total); a RATE_LIMITED item waits out the
+    // receiver's per-minute window once, then retries.
+    var okCount = 0;
     for (final f in files) {
-      var bytes = await f.readAsBytes();
-      const maxBytes = 10 * 1024 * 1024;
-      if (bytes.length > maxBytes) bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
-      await _send(s, bytes: bytes, name: _galleryName(f.name), captureId: null, note: null);
       if (!mounted) return;
+      var bytes = await f.readAsBytes();
+      if (bytes.length > maxBytes) bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
+      var receipt = await _sendOne(s, bytes: bytes, name: _galleryName(f.name), captureId: null, note: null);
+      if (!receipt.ok && receipt.errorCode == 'RATE_LIMITED') {
+        _longToast('达到电脑端每分钟上传上限,稍候自动续传…');
+        await Future<void>.delayed(const Duration(seconds: 61));
+        if (!mounted) return;
+        receipt = await _sendOne(s, bytes: bytes, name: _galleryName(f.name), captureId: null, note: null);
+      }
+      if (receipt.ok) okCount++;
     }
-    _toast('已批量上传 ${files.length} 张');
+    if (!mounted) return;
+    if (okCount == files.length) {
+      _toast('已批量上传 $okCount 张');
+    } else {
+      _longToast('已上传 $okCount/${files.length} 张,失败 ${files.length - okCount} 张(详见历史)');
+    }
   }
 
   String _galleryName(String name) {
     final clean = name.replaceAll(RegExp(r'[^\w.\-]+'), '_');
-    final base = clean.isEmpty ? 'photo' : clean;
-    final ext = base.toLowerCase().endsWith('.png') ? '.png' : '.jpg';
-    return '${base}_${DateTime.now().millisecondsSinceEpoch % 100000}.$ext';
+    // strip the ORIGINAL extension before appending ours (no more
+    // "IMG_001.png_12345.png"), but remember whether it was a PNG
+    final isPng = clean.toLowerCase().endsWith('.png');
+    var base = clean.isEmpty ? 'photo' : clean;
+    base = base.replaceFirst(RegExp(r'\.[A-Za-z0-9]+$'), '');
+    return '${base}_${DateTime.now().millisecondsSinceEpoch % 100000}.${isPng ? 'png' : 'jpg'}';
   }
 
-  Future<void> _send(PairedServer s,
+  /// Declare the format from magic bytes, not the file extension — the
+  /// receiver validates the declared content-type against the actual byte
+  /// header, so a PNG gallery shot declared as jpeg fails 415 every time.
+  String _sniffMediaType(Uint8List bytes) {
+    if (bytes.length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return 'image/jpeg';
+    if (bytes.length >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) {
+      return 'image/png';
+    }
+    return 'image/jpeg'; // unknown formats: let the receiver's check reject them
+  }
+
+  /// Core upload + history bookkeeping; NEVER throws (network-level errors
+  /// become a failed receipt so history rows and capture receipts still land).
+  Future<UploadReceipt> _sendOne(PairedServer s,
       {required Uint8List bytes, required String name, String? captureId, String? note}) async {
-    final target = widget.store.targetSession;
-    final receipt = await _api.upload(
-      s,
-      bytes: bytes,
-      mediaType: 'image/jpeg',
-      name: name,
-      note: note,
-      captureId: captureId,
-      target: target,
-    );
+    UploadReceipt receipt;
+    try {
+      receipt = await _api.upload(
+        s,
+        bytes: bytes,
+        mediaType: _sniffMediaType(bytes),
+        name: name,
+        note: note,
+        captureId: captureId,
+      );
+    } catch (e) {
+      debugPrint('[lens-mate] upload error: $e');
+      receipt = UploadReceipt(ok: false, errorCode: 'NETWORK_ERROR');
+    }
     // history per user mode: noTrace skips the record entirely
     final mode = widget.store.historyMode;
     if (mode != LensStore.historyNoTrace) {
@@ -595,18 +732,57 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         'bytes': bytes.length,
         'ok': receipt.ok,
         'attachmentId': receipt.attachmentId,
-        'session': receipt.deliveredSessionId,
         'reason': receipt.reason,
+        'errorCode': receipt.errorCode,
         'captureId': captureId,
         'server': s.name,
         'imagePath': imagePath,
       });
     }
-    if (captureId != null) _socket?.reportCapture(captureId, 'taken');
-    if (!mounted) return;
-    // short, non-blocking confirmation — the photo was staged for the dsh
-    // composer (pre-send); the user types text on the computer and sends.
-    _toast(receipt.ok ? '已放入对话框输入框' : '发送失败');
+    // report the TRUTH: a failed upload is 'failed', never 'taken'
+    if (captureId != null) {
+      _socket?.reportCapture(captureId, receipt.ok ? 'taken' : 'failed', receipt.ok ? null : receipt.errorCode);
+    }
+    return receipt;
+  }
+
+  Future<void> _send(PairedServer s,
+      {required Uint8List bytes, required String name, String? captureId, String? note, bool silent = false}) async {
+    final receipt = await _sendOne(s, bytes: bytes, name: name, captureId: captureId, note: note);
+    if (!mounted || silent) return;
+    // The toast must match the receiver's actual capture mode (v0.3.7):
+    // composer-only / composer+folder / folder-only say different things.
+    _toast(_sendToastText(receipt));
+  }
+
+  String _sendToastText(UploadReceipt r) {
+    if (!r.ok) return '发送失败(${_uploadErrorText(r.errorCode)})';
+    switch (r.reason) {
+      case 'saved-to-folder':
+        return '已保存到电脑文件夹';
+      case 'saved-and-staged':
+        return '已放入电脑输入框,并存到电脑文件夹';
+      default: // 'staged-in-composer' / unknown → the classic promise
+        return '已放入电脑输入框';
+    }
+  }
+
+  String _uploadErrorText(String code) {
+    switch (code) {
+      case 'RATE_LIMITED':
+        return '发送过于频繁';
+      case 'TOO_LARGE':
+        return '图片过大';
+      case 'BAD_MAGIC':
+      case 'TYPE_NOT_ALLOWED':
+        return '图片格式不支持';
+      case 'AUTH_REQUIRED':
+        return '配对已失效,请重新扫码';
+      case 'NETWORK_ERROR':
+        return '网络异常';
+      default:
+        return code.isEmpty ? '未知错误' : code;
+    }
   }
 
   void _toast(String msg) => _showToast(msg, const Duration(milliseconds: 1500));
@@ -641,6 +817,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _accelSub?.cancel();
     _cmdSub?.cancel();
     _fpsTimer?.cancel();
+    _focusHideTimer?.cancel();
+    // a toast mid-flight would otherwise linger on the next screen forever
+    _toastEntry?.remove();
+    _toastEntry = null;
     _socket?.close();
     _encoder.stop();
     _camera?.dispose();
@@ -662,7 +842,31 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             child: _cameraError != null
                 ? Center(
                     child: Padding(
-                        padding: const EdgeInsets.all(24), child: Text(_cameraError!, style: const TextStyle(color: Colors.white70))))
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(_cameraError!, style: const TextStyle(color: Colors.white70), textAlign: TextAlign.center),
+                          const SizedBox(height: 14),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              TextButton.icon(
+                                icon: const Icon(Icons.refresh, size: 18),
+                                label: const Text('重试'),
+                                onPressed: _initCamera,
+                              ),
+                              TextButton.icon(
+                                icon: const Icon(Icons.settings, size: 18),
+                                label: const Text('应用设置'),
+                                onPressed: openAppSettings,
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
                 : _previewOrEmpty(),
           ),
         ],
@@ -698,7 +902,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             ),
             const SizedBox(width: 4),
             Text(
-              _hostPaused ? '暂停推流' : (_streaming ? '推流中' : '推流关'),
+              _hostPaused ? '预览暂停' : (_streaming ? '预览中' : '预览关'),
               style: TextStyle(fontSize: 11, color: _hostPaused ? Colors.white54 : Colors.white70),
             ),
             const SizedBox(width: 12),
@@ -707,16 +911,11 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
                 _hostPaused
                     ? '本设备仍可上传图片'
                     : _streaming
-                        ? '预览中 ${_currentFps}fps ${_jpegStreamMode ? "jpeg" : _encoder.engineLabel} c:$_camFrames d:$_busyDrops n:$_snapNulls'
+                        ? '预览中 ${_currentFps}fps'
                         : '预览已停止',
                 style: const TextStyle(fontSize: 11, color: Colors.white70),
                 overflow: TextOverflow.ellipsis,
               ),
-            ),
-            Text(
-              widget.store.targetSession == null ? '目标:最近活跃' : '目标:${widget.store.targetSession!.substring(0, 8)}…',
-              style: const TextStyle(fontSize: 11, color: Colors.white54),
-              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),
@@ -744,6 +943,57 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   Widget _disconnectedEmpty() {
     final connecting = _link == LensLinkState.connecting;
+    // token rejected (receiver device table reset) → the only way out is
+    // re-pairing; generic network advice would send the user in circles
+    if (_authFailed && !connecting) {
+      return Stack(
+        children: [
+          const BackgroundArt(widthFactor: 0.45),
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.qr_code_scanner, color: Colors.white54, size: 42),
+                  const SizedBox(height: 12),
+                  const Text('配对已失效', style: TextStyle(color: Colors.white, fontSize: 16)),
+                  const SizedBox(height: 10),
+                  const Text(
+                    '电脑端已不再识别本机(可能重装或重置过)。\n请重新扫码配对。',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.6),
+                  ),
+                  const SizedBox(height: 14),
+                  FilledButton.icon(
+                    icon: const Icon(Icons.qr_code_scanner, size: 18),
+                    label: const Text('重新配对'),
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => PairScreen(
+                          store: widget.store,
+                          // deviceId is REUSED now, so server.id stays the
+                          // same and this screen does NOT rebuild on key
+                          // change — rebind the socket manually with the
+                          // fresh token
+                          onPaired: () {
+                            if (!mounted) return;
+                            _socket?.close();
+                            _socket = null;
+                            _connectSocket();
+                            setState(() {});
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    }
     return Stack(
       children: [
         const BackgroundArt(widthFactor: 0.45),
@@ -761,7 +1011,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
                 ),
                 const SizedBox(height: 10),
                 const Text(
-                  '请确认已配对并激活当前设备;\n手机与电脑需在同一局域网。\n若已配对,在当前设备列表点此电脑设为「活动」。',
+                  '请确认手机与电脑在同一局域网;\n可在 设置 → 配对与设备 中切换连接,或长按电源重启电脑端 dsh。',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.6),
                 ),

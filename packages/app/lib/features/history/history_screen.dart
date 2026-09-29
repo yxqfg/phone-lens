@@ -20,11 +20,27 @@ class HistoryScreen extends StatefulWidget {
 }
 
 class _HistoryScreenState extends State<HistoryScreen> {
-  final Set<int> _selected = {};
+  // entry KEYS (LensStore.historyKey), never indices — remote captures can
+  // insert rows while the user has a selection, which would silently shift
+  // indices and delete the wrong entries
+  final Set<String> _selected = {};
   bool _selecting = false;
   int _clearArm = -1; // countdown seconds; -1 = disarmed
 
   Future<void> _deleteSelected() async {
+    final count = _selected.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('删除所选 $count 条?'),
+        content: const Text('所选记录及其留档图片将被删除。'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
     await widget.store.removeHistory({..._selected});
     if (mounted) {
       setState(() {
@@ -122,9 +138,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
                           );
                         }
                       } catch (e) {
+                        debugPrint('gal save failed: $e');
                         if (ctx.mounted) {
                           ScaffoldMessenger.of(ctx).showSnackBar(
-                            SnackBar(content: Text('保存失败: $e')),
+                            const SnackBar(content: Text('保存失败,请重试')),
                           );
                         }
                       }
@@ -180,29 +197,43 @@ class _HistoryScreenState extends State<HistoryScreen> {
               ],
             ),
       body: items.isEmpty
-          ? const Center(child: Text('还没有发送记录'))
+          ? Center(
+              // "no records" vs "recording disabled" are different truths
+              child: Text(
+                widget.store.historyMode == LensStore.historyNoTrace
+                    ? '已开启「不留任何痕迹」,发送不会留记录\n(可在 设置 → 发送历史 中更改)'
+                    : '还没有发送记录',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white54),
+              ),
+            )
           : ListView.builder(
               itemCount: items.length,
               itemBuilder: (context, i) {
                 final it = items[i];
                 final ok = it['ok'] == true;
-                final injected = it['session'] != null;
+                // receiver v0.3.7 reports WHERE the photo went; the legacy
+                // injected/已注入 branch (delivered.sessionId) is dead because
+                // delivery is staged pre-send and never reported per session
+                final savedToFolder = it['reason'] == 'saved-to-folder';
+                final stagedAndSaved = it['reason'] == 'saved-and-staged';
                 final hasImage = (it['imagePath'] as String?) != null;
+                final key = LensStore.historyKey(it);
                 final at = DateTime.tryParse(it['at'] as String? ?? '');
                 final kb = ((it['bytes'] as num?) ?? 0) / 1024;
                 return ListTile(
                   onLongPress: () => setState(() {
                     _selecting = true;
-                    _selected.add(i);
+                    _selected.add(key);
                   }),
                   leading: _selecting
                       ? Checkbox(
-                          value: _selected.contains(i),
+                          value: _selected.contains(key),
                           onChanged: (v) => setState(() {
                             if (v == true) {
-                              _selected.add(i);
+                              _selected.add(key);
                             } else {
-                              _selected.remove(i);
+                              _selected.remove(key);
                             }
                           }),
                         )
@@ -228,16 +259,22 @@ class _HistoryScreenState extends State<HistoryScreen> {
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Text(
-                              injected ? '已注入' : '已发送',
+                              !ok
+                                  ? '失败'
+                                  : savedToFolder
+                                      ? '已存文件夹'
+                                      : stagedAndSaved
+                                          ? '已发送+存档'
+                                          : '已发送',
                               style: TextStyle(
-                                color: injected ? Colors.green : Colors.orange,
+                                color: !ok ? Colors.red : (savedToFolder ? Colors.lightBlueAccent : Colors.green),
                                 fontSize: 12,
                               ),
                             ),
                             IconButton(
                               icon: const Icon(Icons.delete_outline, size: 20),
                               tooltip: '删除此条',
-                              onPressed: () => widget.store.removeHistory({i}).then((_) {
+                              onPressed: () => widget.store.removeHistory({key}).then((_) {
                                 if (mounted) setState(() {});
                               }),
                             ),

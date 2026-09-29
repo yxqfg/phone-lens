@@ -141,7 +141,10 @@ Uint8List encodeSnapshotJpeg(
   final h = snap.height;
   final uvW = snap.uvWidth;
   final uvH = snap.uvHeight;
-  final scale = _min3(maxShort / w, maxLong / h, 1.0);
+  // w is the LONG side of the sensor buffer, h the short side: the long-side
+  // budget constrains w and the short-side budget constrains h (swapping the
+  // two shrinks the fallback path well below the requested box).
+  final scale = _min3(maxLong / w, maxShort / h, 1.0);
   final dw = (w * scale).round();
   final dh = (h * scale).round();
   final rgb = img.Image(width: dw, height: dh);

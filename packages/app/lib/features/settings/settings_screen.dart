@@ -7,7 +7,7 @@ import '../../ui/background_art.dart';
 import '../pair/pair_screen.dart';
 import 'about_screen.dart';
 
-/// Receiver management (multiple pairings, one active), target session, history.
+/// Receiver management (multiple pairings, one active), history.
 class SettingsScreen extends StatefulWidget {
   final LensStore store;
   final VoidCallback onChanged;
@@ -18,35 +18,6 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  final _api = LensApi();
-  List<SessionTarget> _targets = [];
-  bool _loadingTargets = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadTargets();
-  }
-
-  @override
-  void dispose() {
-    _api.dispose();
-    super.dispose();
-  }
-
-  Future<void> _loadTargets() async {
-    final server = widget.store.server;
-    if (server == null) return;
-    setState(() => _loadingTargets = true);
-    try {
-      final targets = await _api.targets(server);
-      if (mounted) setState(() => _targets = targets);
-    } catch (_) {
-      if (mounted) setState(() => _targets = const []);
-    } finally {
-      if (mounted) setState(() => _loadingTargets = false);
-    }
-  }
 
   Future<void> _serverActions(PairedServer s) async {
     final active = widget.store.server?.id == s.id;
@@ -128,7 +99,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final servers = widget.store.servers();
     final activeId = widget.store.server?.id;
-    final selected = widget.store.targetSession;
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
       body: ListView(
@@ -171,33 +141,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               await widget.store.setAutoSelect(v);
               if (mounted) setState(() {});
             },
-          ),
-          const SectionHeader('注入目标'),
-          ListTile(
-            leading: const Icon(Icons.center_focus_strong),
-            title: const Text('最近活跃会话(默认)'),
-            trailing: selected == null ? const Icon(Icons.check, color: Colors.green) : null,
-            onTap: () async {
-              await widget.store.setTargetSession(null);
-              if (mounted) setState(() {});
-            },
-          ),
-          if (_loadingTargets) const Padding(padding: EdgeInsets.all(12), child: Center(child: CircularProgressIndicator())),
-          for (final t in _targets)
-            ListTile(
-              leading: const Icon(Icons.tag),
-              title: Text('${t.title.isEmpty ? t.sessionId.substring(0, 12) : t.title} ${t.active ? "(活跃)" : ""}'),
-              subtitle: Text(t.sessionId, overflow: TextOverflow.ellipsis),
-              trailing: selected == t.sessionId ? const Icon(Icons.check, color: Colors.green) : null,
-              onTap: () async {
-                await widget.store.setTargetSession(t.sessionId);
-                if (mounted) setState(() {});
-              },
-            ),
-          TextButton.icon(
-            onPressed: _loadTargets,
-            icon: const Icon(Icons.refresh),
-            label: const Text('刷新目标列表'),
           ),
           const SectionHeader('画面'),
           SwitchListTile(

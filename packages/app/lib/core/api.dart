@@ -71,7 +71,8 @@ class PairResult {
   final PairedServer server;
   final PreviewParams preview;
   final int maxUploadBytes;
-  PairResult(this.server, this.preview, this.maxUploadBytes);
+  final int uploadsPerMinute;
+  PairResult(this.server, this.preview, this.maxUploadBytes, this.uploadsPerMinute);
 }
 
 class PreviewParams {
@@ -97,13 +98,6 @@ class UploadReceipt {
   });
 }
 
-class SessionTarget {
-  final String sessionId;
-  final String title;
-  final bool active;
-  SessionTarget(this.sessionId, this.title, this.active);
-}
-
 class LensApi {
   final http.Client _http = http.Client();
 
@@ -126,7 +120,14 @@ class LensApi {
           }),
         )
         .timeout(const Duration(seconds: 8));
-    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    // Decode AFTER the status check — wrong-port services answer with HTML
+    // error pages, and a raw FormatException must not leak to the UI.
+    Map<String, dynamic> body;
+    try {
+      body = jsonDecode(resp.body) as Map<String, dynamic>;
+    } catch (_) {
+      throw LensApiError('PAIR_FAILED', 'HTTP ${resp.statusCode}: 该地址不是有效的配对服务');
+    }
     if (resp.statusCode != 200) {
       final err = body['error'] as Map<String, dynamic>?;
       throw LensApiError(err?['code'] as String? ?? 'PAIR_FAILED', err?['message'] as String? ?? 'pairing failed');
@@ -148,10 +149,11 @@ class LensApi {
       PreviewParams(
         (preview['maxWidth'] as num?)?.toInt() ?? 854,
         (preview['maxHeight'] as num?)?.toInt() ?? 480,
-        (preview['fps'] as num?)?.toInt() ?? 6,
-        (preview['jpegQuality'] as num?)?.toInt() ?? 60,
+        (preview['fps'] as num?)?.toInt() ?? 10,
+        (preview['jpegQuality'] as num?)?.toInt() ?? 70,
       ),
       (limits['maxUploadBytes'] as num?)?.toInt() ?? 10 * 1024 * 1024,
+      (limits['uploadsPerMinute'] as num?)?.toInt() ?? 10,
     );
   }
 
@@ -163,14 +165,12 @@ class LensApi {
     required String name,
     String? note,
     String? captureId,
-    String? target,
     http.Client? client,
   }) async {
     final uri = Uri.parse('${server.baseUrl}/upload').replace(queryParameters: {
       'name': name,
       if (note?.isNotEmpty == true) 'note': note!,
       if (captureId != null) 'captureId': captureId,
-      if (target?.isNotEmpty == true) 'target': target!,
     });
     final resp = await (client ?? _http)
         .post(
@@ -179,7 +179,13 @@ class LensApi {
           body: bytes,
         )
         .timeout(const Duration(seconds: 30));
-    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    Map<String, dynamic> body;
+    try {
+      body = jsonDecode(resp.body) as Map<String, dynamic>;
+    } catch (_) {
+      // non-JSON error page (reverse proxy 502 HTML, …) — surface the status
+      return UploadReceipt(ok: false, errorCode: 'HTTP_${resp.statusCode}');
+    }
     if (resp.statusCode != 200) {
       final err = body['error'] as Map<String, dynamic>?;
       return UploadReceipt(ok: false, reason: err?['message'] as String?, errorCode: err?['code'] as String? ?? 'UPLOAD_FAILED');
@@ -194,22 +200,6 @@ class LensApi {
     );
   }
 
-  Future<List<SessionTarget>> targets(PairedServer server) async {
-    final resp = await _http
-        .get(Uri.parse('${server.baseUrl}/targets'), headers: server.authHeaders)
-        .timeout(const Duration(seconds: 5));
-    if (resp.statusCode != 200) return const [];
-    final body = jsonDecode(resp.body) as Map<String, dynamic>;
-    final list = (body['targets'] as List?) ?? const [];
-    return list
-        .map((t) => SessionTarget(
-              (t as Map<String, dynamic>)['sessionId'] as String,
-              ((t)['title'] as String?) ?? '',
-              ((t)['active'] as bool?) ?? false,
-            ))
-        .toList();
-  }
-
   Future<Map<String, dynamic>> status(PairedServer server) async {
     final resp = await _http
         .get(Uri.parse('${server.baseUrl}/status'), headers: server.authHeaders)
@@ -222,11 +212,13 @@ class LensApi {
     return jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>;
   }
 
-  /// Cheap reachability probe: true when the receiver answers /info.
+  /// Reachability probe: true only when the receiver answers an AUTHED
+  /// request — a stored token that the receiver no longer recognizes
+  /// (devices.json reset) must not read as "available" for auto-switch.
   Future<bool> reachable(PairedServer server) async {
     try {
       final resp = await _http
-          .get(Uri.parse('${server.baseUrl}/info'))
+          .get(Uri.parse('${server.baseUrl}/status'), headers: server.authHeaders)
           .timeout(const Duration(seconds: 3));
       return resp.statusCode == 200;
     } catch (_) {
@@ -251,7 +243,6 @@ class LensStore {
   static const _kServers = 'lens.servers';
   static const _kActive = 'lens.activeServer';
   static const _kLegacyServer = 'lens.server';
-  static const _kTarget = 'lens.targetSession';
   static const _kHistory = 'lens.history';
   static const _kPreview = 'lens.preview';
   static const _kPreviewParams = 'lens.previewParams';
@@ -261,6 +252,37 @@ class LensStore {
   static const _kHandleSize = 'lens.handleSize';
   static const _kFocusEnabled = 'lens.focusEnabled';
   static const _kAutoSelect = 'lens.autoSelect';
+  static const _kDeviceId = 'lens.deviceId';
+  static const _kDeviceName = 'lens.deviceName';
+  static const _kLimits = 'lens.limits';
+
+  /// Stable device identity: REUSED across pairings so re-pairing the same
+  /// PC refreshes the token on the SAME host-side device record instead of
+  /// accumulating a new one per scan.
+  String get deviceId => _prefs.getString(_kDeviceId) ?? '';
+  Future<void> setDeviceId(String v) => _prefs.setString(_kDeviceId, v);
+
+  String get deviceName => _prefs.getString(_kDeviceName) ?? 'phone';
+  Future<void> setDeviceName(String v) => _prefs.setString(_kDeviceName, v);
+
+  /// Upload limits last advertised by the active receiver (serverInfo).
+  int get maxUploadBytes => _limits()?['maxUploadBytes'] ?? 10 * 1024 * 1024;
+  int get uploadsPerMinute => _limits()?['uploadsPerMinute'] ?? 10;
+
+  Map<String, int>? _limits() {
+    final raw = decode(_prefs.getString(_kLimits));
+    if (raw == null) return null;
+    return {
+      if (raw['maxUploadBytes'] != null) 'maxUploadBytes': (raw['maxUploadBytes'] as num).toInt(),
+      if (raw['uploadsPerMinute'] != null) 'uploadsPerMinute': (raw['uploadsPerMinute'] as num).toInt(),
+    };
+  }
+
+  Future<void> saveLimits(int maxUploadBytes, int uploadsPerMinute) =>
+      _prefs.setString(_kLimits, jsonEncode({
+        'maxUploadBytes': maxUploadBytes,
+        'uploadsPerMinute': uploadsPerMinute,
+      }));
 
   /// Tap-to-focus + long-press lock on the viewfinder. Off by default (pure
   /// mode: no focus interaction, plain auto-focus).
@@ -314,9 +336,12 @@ class LensStore {
     return all.firstWhereOrNull((s) => s.id == active) ?? (all.isNotEmpty ? all.first : null);
   }
 
-  /// Register a freshly paired receiver and make it active.
+  /// Register a freshly paired receiver and make it active. Records for the
+  /// same host:port are replaced — re-pairing must not pile up dead-token
+  /// duplicates of the same PC.
   Future<void> addServer(PairedServer s) async {
-    final all = servers()..removeWhere((x) => x.id == s.id);
+    final all = servers()
+      ..removeWhere((x) => x.id == s.id || (x.host == s.host && x.port == s.port));
     all.add(s);
     await _prefs.setString(_kServers, jsonEncode(all.map((e) => e.toJson()).toList()));
     await _prefs.setString(_kActive, s.id);
@@ -350,16 +375,6 @@ class LensStore {
     _prefs.remove(_kLegacyServer);
   }
 
-  // ── target session ──────────────────────────────────────────────────────
-
-  String? get targetSession {
-    final v = _prefs.getString(_kTarget);
-    return (v == null || v.isEmpty) ? null : v;
-  }
-
-  Future<void> setTargetSession(String? id) =>
-      (id == null || id.isEmpty) ? _prefs.remove(_kTarget) : _prefs.setString(_kTarget, id);
-
   // ── preview overrides / history ─────────────────────────────────────────
 
   Map<String, dynamic>? get previewOverrides => decode(_prefs.getString(_kPreview));
@@ -370,13 +385,15 @@ class LensStore {
   }
 
   // Preview parameters last advertised by the active receiver (serverInfo).
+  // Fallbacks mirror the host's own defaults (config.ts) so a missing field
+  // degrades to the same values the receiver would have sent.
   Map<String, int> get previewParams {
     final raw = decode(_prefs.getString(_kPreviewParams));
     return {
-      'maxShort': (raw?['maxShort'] as num?)?.toInt() ?? 360,
-      'maxLong': (raw?['maxLong'] as num?)?.toInt() ?? 640,
-      'fps': (raw?['fps'] as num?)?.toInt() ?? 6,
-      'quality': (raw?['quality'] as num?)?.toInt() ?? 62,
+      'maxShort': (raw?['maxShort'] as num?)?.toInt() ?? 480,
+      'maxLong': (raw?['maxLong'] as num?)?.toInt() ?? 854,
+      'fps': (raw?['fps'] as num?)?.toInt() ?? 10,
+      'quality': (raw?['quality'] as num?)?.toInt() ?? 70,
     };
   }
 
@@ -398,19 +415,28 @@ class LensStore {
     return (raw?['items'] as List?)?.map((e) => Map<String, dynamic>.from(e as Map)).toList() ?? [];
   }
 
+  /// Stable per-entry key: entries written before ids existed fall back to a
+  /// content fingerprint.
+  static String historyKey(Map<String, dynamic> item) =>
+      item['id'] as String? ?? '${item['at']}|${item['name']}|${item['bytes']}';
+
   Future<void> addHistory(Map<String, dynamic> item) async {
+    // unique id so multi-select stays correct while remote captures insert
+    // new rows concurrently (indices would drift)
+    item['id'] ??= '${DateTime.now().microsecondsSinceEpoch}';
     final items = history..insert(0, item);
     if (items.length > 200) items.removeRange(200, items.length);
     await _prefs.setString(_kHistory, jsonEncode({'items': items}));
   }
 
-  /// Delete the entries at [indices]; removes their archived image files too.
-  Future<void> removeHistory(Set<int> indices) async {
+  /// Delete the entries matching [keys] (see [historyKey]); removes their
+  /// archived image files too.
+  Future<void> removeHistory(Set<String> keys) async {
     final items = history;
     final kept = <Map<String, dynamic>>[];
     for (var i = 0; i < items.length; i++) {
       final it = items[i];
-      if (indices.contains(i)) {
+      if (keys.contains(historyKey(it))) {
         final p = it['imagePath'] as String?;
         if (p != null) {
           final f = File(p);

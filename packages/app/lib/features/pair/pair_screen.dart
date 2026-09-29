@@ -26,6 +26,10 @@ class _PairScreenState extends State<PairScreen> {
   String? _error;
   bool _showManual = false;
   Key _scannerKey = UniqueKey();
+  /// Payload whose pairing already FAILED: never auto-retry it — the scanner
+  /// re-detects the same QR several times a second and the receiver
+  /// rate-limits failed attempts (10/min), so retries just burn the budget.
+  String? _failedPayload;
 
   @override
   void dispose() {
@@ -35,22 +39,33 @@ class _PairScreenState extends State<PairScreen> {
   }
 
   Future<String> _deviceName() async {
+    final stored = widget.store.deviceName;
+    if (stored.isNotEmpty && stored != 'phone') return stored;
     try {
       final info = await DeviceInfoPlugin().androidInfo;
       final model = info.model.trim();
-      if (model.isNotEmpty) return model;
+      if (model.isNotEmpty) {
+        await widget.store.setDeviceName(model);
+        return model;
+      }
     } catch (_) {}
     return 'Android ${DateTime.now().millisecondsSinceEpoch % 1000}';
   }
 
-  Future<void> _pair({required String host, required int port, required String code}) async {
+  Future<void> _pair({required String host, required int port, required String code, String? payload}) async {
     if (_busy) return;
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      final deviceId = const Uuid().v4();
+      // REUSE the persisted device identity: re-pairing the same PC must
+      // refresh the token on the SAME host-side record, not spawn a new one
+      var deviceId = widget.store.deviceId;
+      if (deviceId.isEmpty) {
+        deviceId = const Uuid().v4();
+        await widget.store.setDeviceId(deviceId);
+      }
       final deviceName = await _deviceName();
       final result = await _api.pair(
         host: host,
@@ -60,7 +75,7 @@ class _PairScreenState extends State<PairScreen> {
         deviceName: deviceName,
         deviceModel: deviceName, // host may uniquify duplicate names
       );
-      // adopt the receiver's preview budgets (its preview.* config)
+      // adopt the receiver's preview budgets + upload limits
       final pv = result.preview;
       await widget.store.savePreviewParams({
         'maxShort': pv.maxHeight < pv.maxWidth ? pv.maxHeight : pv.maxWidth,
@@ -68,25 +83,61 @@ class _PairScreenState extends State<PairScreen> {
         'fps': pv.fps,
         'quality': pv.jpegQuality,
       });
+      await widget.store.saveLimits(result.maxUploadBytes, result.uploadsPerMinute);
       await widget.store.addServer(result.server);
       widget.onPaired?.call();
       if (!mounted) return;
       if (Navigator.of(context).canPop()) Navigator.of(context).pop();
     } catch (e) {
-      setState(() => _error = e.toString());
+      _failedPayload = payload;
+      if (mounted) setState(() => _error = _pairErrorText(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
+  /// Human-readable pairing failures — raw exceptions (SocketException,
+  /// FormatException) and raw host error codes must not reach the user.
+  String _pairErrorText(Object e) {
+    if (e is LensApiError) {
+      switch (e.code) {
+        case 'PAIR_CODE_INVALID':
+          return '配对码错误。若多次失败,请在电脑端刷新二维码后再扫。';
+        case 'PAIR_CODE_EXPIRED':
+          return '配对码已过期,请在电脑端刷新二维码后重新扫码。';
+        case 'RATE_LIMITED':
+          return '尝试过于频繁,请等待一分钟后重试。';
+        case 'PAIR_FAILED':
+          return e.message; // already human-readable (non-pairing service)
+        default:
+          return '配对失败(${e.code})';
+      }
+    }
+    final msg = e.toString();
+    if (msg.contains('SocketException') || msg.contains('TimeoutException') || msg.contains('timed out')) {
+      return '连接失败:请确认手机与电脑在同一网络,地址端口无误。';
+    }
+    return '配对失败: $msg';
+  }
+
   void _onScan(String raw) {
     final uri = Uri.tryParse(raw);
     if (uri == null || !raw.startsWith('lensmate://pair')) return;
+    // protocol version gate: a future host format must fail loudly, not
+    // parse into wrong fields
+    final v = int.tryParse(uri.queryParameters['v'] ?? '1') ?? 1;
+    if (v > 1) {
+      if (mounted && _error != '电脑端 PhoneLens 版本过新,请更新手机 App 后再配对。') {
+        setState(() => _error = '电脑端 PhoneLens 版本过新,请更新手机 App 后再配对。');
+      }
+      return;
+    }
+    if (raw == _failedPayload) return; // already tried and failed — no auto-retry
     final host = uri.queryParameters['host'];
     final port = int.tryParse(uri.queryParameters['port'] ?? '');
     final code = uri.queryParameters['code'];
     if (host == null || port == null || code == null) return;
-    _pair(host: host, port: port, code: code);
+    _pair(host: host, port: port, code: code, payload: raw);
   }
 
   void _onManual() {
@@ -94,18 +145,23 @@ class _PairScreenState extends State<PairScreen> {
     // accept "host:port:code" or "host:code" (default port)
     final parts = text.split(':');
     if (parts.length == 3) {
-      _pair(host: parts[0], port: int.tryParse(parts[1]) ?? 8791, code: parts[2]);
+      final port = int.tryParse(parts[1]);
+      if (port == null) {
+        setState(() => _error = '端口格式错误:应为数字(如 8791)');
+        return;
+      }
+      _pair(host: parts[0], port: port, code: parts[2]);
     } else if (parts.length == 2) {
       _pair(host: parts[0], port: 8791, code: parts[1]);
     } else {
-      setState(() => _error = '格式:主机:端口:配对码');
+      setState(() => _error = '格式:主机:端口:配对码 或 主机:配对码(默认端口 8791)');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('LensMate 配对')),
+      appBar: AppBar(title: const Text('PhoneLens 配对')),
       body: Stack(
         children: [
           const BackgroundArt(widthFactor: 0.42),
@@ -115,10 +171,10 @@ class _PairScreenState extends State<PairScreen> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
-                  '扫描电脑端展示的配对二维码\n(dsh 终端或 http://127.0.0.1:8791/view.html)',
+                  '扫描电脑端 dsh 悬浮窗或终端里展示的配对二维码',
                   style: Theme.of(context).textTheme.bodyMedium,
-              textAlign: TextAlign.center,
-            ),
+                  textAlign: TextAlign.center,
+                ),
             const SizedBox(height: 12),
             Expanded(
               child: ClipRRect(
@@ -193,7 +249,7 @@ class _ScannerError extends StatelessWidget {
     final msg = error.toString();
     String hint;
     if (msg.contains('permissionDenied') || msg.contains('PermissionDenied')) {
-      hint = '相机权限被拒绝。请在系统设置中允许 LensMate 使用相机。';
+      hint = '相机权限被拒绝。请在系统设置中允许 PhoneLens 使用相机。';
     } else if (msg.contains('Unspecified') || msg.contains('camera') || msg.contains('Camera')) {
       hint = '相机启动失败,可能被其他应用占用。';
     } else {

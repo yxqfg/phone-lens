@@ -18,7 +18,6 @@ class CaptureCommand {
 /// encode at a time (slow encode drops frames rather than queueing).
 class CameraSocket {
   final String url;
-  final _frames = StreamController<Uint8List>.broadcast();
   final _commands = StreamController<CaptureCommand>.broadcast();
   final _states = StreamController<LensLinkState>.broadcast();
 
@@ -48,9 +47,16 @@ class CameraSocket {
   Future<void> _connect() async {
     if (_closedByUser) return;
     _setState(LensLinkState.connecting);
+    WebSocketChannel? ws;
     try {
-      final ws = WebSocketChannel.connect(Uri.parse(url));
+      ws = WebSocketChannel.connect(Uri.parse(url));
       await ws.ready.timeout(const Duration(seconds: 6));
+      // close() raced us while we were awaiting the handshake — this fresh
+      // connection belongs to nobody, drop it instead of leaking it
+      if (_closedByUser) {
+        await ws.sink.close();
+        return;
+      }
       _ws = ws;
       _attempt = 0;
       _setState(LensLinkState.connected);
@@ -67,7 +73,7 @@ class CameraSocket {
           }
         },
         onDone: () {
-          debugPrint('[lens-mate] camera ws closed (code=${ws.closeCode} reason=${ws.closeReason}) attempt=$_attempt');
+          debugPrint('[lens-mate] camera ws closed (code=${ws?.closeCode} reason=${ws?.closeReason}) attempt=$_attempt');
           _scheduleReconnect();
         },
         onError: (Object e) {
@@ -77,6 +83,10 @@ class CameraSocket {
         cancelOnError: true,
       );
     } catch (_) {
+      // handshake timeout/failure: kill the half-open channel too
+      try {
+        await ws?.sink.close();
+      } catch (_) {}
       _scheduleReconnect();
     }
   }
@@ -111,7 +121,12 @@ class CameraSocket {
       _lastBigFrameLog = DateTime.now().millisecondsSinceEpoch;
       debugPrint('[lens-mate] big frame ${jpeg.length}B (dropped-ws=$_drops)');
     }
-    _ws?.sink.add(jpeg);
+    try {
+      _ws?.sink.add(jpeg);
+    } catch (_) {
+      // sink can already be closed when onDone hasn't reached us yet
+      _drops++;
+    }
   }
 
   int _drops = 0;
@@ -133,7 +148,10 @@ class CameraSocket {
   }
 
   void _send(String text) {
-    if (_state == LensLinkState.connected) _ws?.sink.add(text);
+    if (_state != LensLinkState.connected) return;
+    try {
+      _ws?.sink.add(text);
+    } catch (_) {}
   }
 
   Future<void> close() async {
@@ -141,7 +159,6 @@ class CameraSocket {
     _reconnect?.cancel();
     await _ws?.sink.close();
     _setState(LensLinkState.disconnected);
-    await _frames.close();
     await _commands.close();
     await _states.close();
   }

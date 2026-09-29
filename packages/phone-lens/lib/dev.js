@@ -20,7 +20,7 @@ function normalizeConfig(raw) {
 	const inject = r.inject ?? {};
 	const target = r.target ?? {};
 	const app = r.app ?? {};
-	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.2.0/app-release.apk";
+	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.8/app-release.apk";
 	const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
 	const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
 	const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t) => typeof t === "string") : void 0;
@@ -706,13 +706,17 @@ function isLoopback(req) {
 }
 /**
 
-* CORS for the dsh Web UI page (served on another loopback port) so it can
+* CORS for the dsh Web UI page (served on another loopback port, or the
 
-* fetch /qr.json and /status from this receiver. Only same-machine origins
+* desktop shell's `dsh-app://` origin) so it can fetch /qr.json and /status
 
-* are echoed — a foreign page must not read the pairing code, and its
+* from this receiver. Only same-machine origins are echoed — a foreign page
 
-* cross-origin JSON POST fails the preflight we never answer.
+* must not read the pairing code, and its cross-origin JSON POST fails the
+
+* preflight we never answer. `dsh-app:` is a privileged scheme registered by
+
+* the desktop shell; only the shell's own renderer can ever present it.
 
 */
 function corsFor(req) {
@@ -721,7 +725,7 @@ function corsFor(req) {
 	try {
 		const u = new URL(origin);
 		const host = u.hostname.replace(/^\[|\]$/g, "");
-		if (u.protocol === "http:" && LOOPBACK.has(host)) return {
+		if (u.protocol === "http:" && LOOPBACK.has(host) || u.protocol === "dsh-app:") return {
 			"access-control-allow-origin": origin,
 			"access-control-allow-methods": "GET, POST, OPTIONS",
 			"access-control-allow-headers": "content-type, x-lm-device, x-lm-token",

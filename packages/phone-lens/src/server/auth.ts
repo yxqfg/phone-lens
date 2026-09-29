@@ -30,10 +30,12 @@ export function isLoopback(req: IncomingMessage): boolean {
 }
 
 /**
- * CORS for the dsh Web UI page (served on another loopback port) so it can
- * fetch /qr.json and /status from this receiver. Only same-machine origins
- * are echoed — a foreign page must not read the pairing code, and its
- * cross-origin JSON POST fails the preflight we never answer.
+ * CORS for the dsh Web UI page (served on another loopback port, or the
+ * desktop shell's `dsh-app://` origin) so it can fetch /qr.json and /status
+ * from this receiver. Only same-machine origins are echoed — a foreign page
+ * must not read the pairing code, and its cross-origin JSON POST fails the
+ * preflight we never answer. `dsh-app:` is a privileged scheme registered by
+ * the desktop shell; only the shell's own renderer can ever present it.
  */
 export function corsFor(req: IncomingMessage): Record<string, string> {
   const origin = req.headers.origin;
@@ -41,7 +43,7 @@ export function corsFor(req: IncomingMessage): Record<string, string> {
   try {
     const u = new URL(origin);
     const host = u.hostname.replace(/^\[|\]$/g, "");
-    if (u.protocol === "http:" && LOOPBACK.has(host)) {
+    if ((u.protocol === "http:" && LOOPBACK.has(host)) || u.protocol === "dsh-app:") {
       return {
         "access-control-allow-origin": origin,
         "access-control-allow-methods": "GET, POST, OPTIONS",

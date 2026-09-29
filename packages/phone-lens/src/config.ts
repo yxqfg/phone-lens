@@ -11,9 +11,10 @@ export function normalizeConfig(raw: unknown): LensConfig {
   const target = (r.target ?? {}) as Record<string, any>;
   const app = (r.app ?? {}) as Record<string, any>;
   // App download sources: Gitee first (CN-friendly), GitHub as the fallback link.
-  // Points at the Gitee release carrying the newest APK — the App itself has
-  // not changed since v0.2.0; bump this only when a new APK ships.
-  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.2.0/app-release.apk";
+  // Points at the Gitee release carrying the newest APK; bump this only when
+  // a new APK ships. GitHub assets are always named app-release.apk so the
+  // latest/download link keeps working across releases.
+  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.8/app-release.apk";
   const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
   const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
   const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t: unknown): t is string => typeof t === "string") : undefined;

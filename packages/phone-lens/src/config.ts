@@ -1,5 +1,15 @@
 import type { LensConfig } from "./types.js";
 
+/**
+ * Offline fallback for the Gitee APK download link. Since v1.0.2 the actual
+ * link is resolved from Gitee's public latest-release API at runtime (see
+ * server/apk-link.ts), so this constant needs NO per-release bump anymore —
+ * it only serves when the API is unreachable, and deliberately points at a
+ * release known to exist (pointing it at a future tag would 404 until that
+ * release is actually published).
+ */
+export const GITEE_APK_DEFAULT = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.0.0/app-release.apk";
+
 /** Coerce an unknown config object (cordis patch row / CLI overrides) into LensConfig. */
 export function normalizeConfig(raw: unknown): LensConfig {
   const r = (raw ?? {}) as Record<string, any>;
@@ -10,16 +20,13 @@ export function normalizeConfig(raw: unknown): LensConfig {
   const inject = (r.inject ?? {}) as Record<string, any>;
   const target = (r.target ?? {}) as Record<string, any>;
   const app = (r.app ?? {}) as Record<string, any>;
-  // App download sources: Gitee first (CN-friendly), GitHub as the fallback link.
-  // ⚠️ RELEASE CHECKLIST: Gitee has NO GitHub-style `releases/latest/download/`
-  // short link (it 302s to /repository/archive/ and 404s), so this constant
-  // MUST be bumped to the new tag every time a new APK ships — shipping a
-  // stale link makes every scanned QR download the OLD APK (v1.0.0 shipped
-  // with a v0.3.11 link this way). GitHub needs no bump: assets are always
-  // named app-release.apk, so latest/download keeps working.
-  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.0.0/app-release.apk";
+  // App download sources: Gitee first (CN-friendly), GitHub as the fallback
+  // link. The Gitee URL is resolved from Gitee's latest-release API at
+  // runtime (server/apk-link.ts, since v1.0.2) — GITEE_APK_DEFAULT above is
+  // only the offline fallback; GitHub's latest/download link is inherently
+  // dynamic. Neither needs a bump when a new APK ships.
   const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
-  const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
+  const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK_DEFAULT;
   const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t: unknown): t is string => typeof t === "string") : undefined;
   const mode = inject.mode === "steer" ? "steer" : "followup";
   return {

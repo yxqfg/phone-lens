@@ -1,7 +1,7 @@
 {
   "name": "phone-lens",
   "description": "Phone camera → dsh session: pairing, MJPEG viewfinder, upload-to-attachment pipeline",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

@@ -10,6 +10,22 @@ import { homedir } from "node:os";
 import { env } from "node:process";
 
 //#region src/config.ts
+/**
+
+* Offline fallback for the Gitee APK download link. Since v1.0.2 the actual
+
+* link is resolved from Gitee's public latest-release API at runtime (see
+
+* server/apk-link.ts), so this constant needs NO per-release bump anymore —
+
+* it only serves when the API is unreachable, and deliberately points at a
+
+* release known to exist (pointing it at a future tag would 404 until that
+
+* release is actually published).
+
+*/
+const GITEE_APK_DEFAULT = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.0.0/app-release.apk";
 /** Coerce an unknown config object (cordis patch row / CLI overrides) into LensConfig. */
 function normalizeConfig(raw) {
 	const r = raw ?? {};
@@ -20,9 +36,8 @@ function normalizeConfig(raw) {
 	const inject = r.inject ?? {};
 	const target = r.target ?? {};
 	const app = r.app ?? {};
-	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.11/app-release.apk";
 	const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
-	const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
+	const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK_DEFAULT;
 	const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t) => typeof t === "string") : void 0;
 	const mode = inject.mode === "steer" ? "steer" : "followup";
 	return {
@@ -424,6 +439,77 @@ async function admitImage(input, attachments, fallbackDir) {
 }
 
 //#endregion
+//#region src/server/apk-link.ts
+const GITEE_LATEST_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest";
+const CACHE_TTL_MS = 10 * 60 * 1e3;
+const REQUEST_TIMEOUT_MS = 6e3;
+let cached = null;
+let inflight = null;
+/** The asset URL comes from an external API response, so re-validate it before
+*  it ever reaches a QR code: https only, and only the expected release host —
+*  never localhost/loopback/private addresses or any other origin. */
+function isTrustedGiteeAsset(raw) {
+	if (typeof raw !== "string" || !raw.startsWith("https://")) return false;
+	try {
+		const u = new URL(raw);
+		return u.protocol === "https:" && u.host === "gitee.com";
+	} catch {
+		return false;
+	}
+}
+async function fetchLatestGiteeApk() {
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+	try {
+		const resp = await fetch(GITEE_LATEST_API, {
+			signal: ctrl.signal,
+			headers: { accept: "application/json" }
+		});
+		if (!resp.ok) return null;
+		const data = await resp.json();
+		const assets = data?.assets;
+		if (!Array.isArray(assets)) return null;
+		for (const asset of assets) {
+			const row = asset;
+			if (row.name === "app-release.apk" && isTrustedGiteeAsset(row.browser_download_url)) return row.browser_download_url;
+		}
+		return null;
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+/** Resolve the latest APK URL (cached 10 min, in-flight deduped).
+*  Resolves null when the API is unreachable or carries no trusted asset. */
+function resolveLatestGiteeApk() {
+	if (cached && Date.now() - cached.at < CACHE_TTL_MS) return Promise.resolve(cached.url);
+	if (inflight) return inflight;
+	inflight = fetchLatestGiteeApk().then((url) => {
+		if (url) cached = {
+			url,
+			at: Date.now()
+		};
+		return url;
+	}).finally(() => {
+		inflight = null;
+	});
+	return inflight;
+}
+/**
+* Refresh config.app download links in place, but only while they still carry
+* the built-in defaults — an explicit user config always wins. Mutating the
+* shared config object lets the QR endpoints keep reading the plain fields.
+*/
+async function refreshAppApkLinks(config$1) {
+	if (config$1.app.giteeUrl !== GITEE_APK_DEFAULT) return;
+	const url = await resolveLatestGiteeApk();
+	if (!url) return;
+	config$1.app.giteeUrl = url;
+	if (config$1.app.downloadUrl === GITEE_APK_DEFAULT) config$1.app.downloadUrl = url;
+}
+
+//#endregion
 //#region src/server/qr.ts
 /** Enumerate LAN IPv4 candidates: private ranges first, virtual/tethering included. */
 function lanAddresses() {
@@ -758,6 +844,16 @@ function queryOf(req) {
 /** Process-lifetime marker: surfaces service rebuilds via /status. */
 const SERVER_BOOT_AT = Date.now();
 /** Boot the receiver: HTTP routes + two websocket endpoints. */
+let ownVersion = null;
+function hostVersion() {
+	if (ownVersion) return ownVersion;
+	try {
+		ownVersion = String(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version ?? "0.0.0");
+	} catch {
+		ownVersion = "0.0.0";
+	}
+	return ownVersion;
+}
 async function startLensServer(deps) {
 	const { config: config$1, pairing: pairing$1, devices: devices$1, hub: hub$1, targets: targets$1, sink: sink$1, log: log$1 } = deps;
 	const pairLimiter = new RateLimiter(6e4, 10);
@@ -828,6 +924,9 @@ async function startLensServer(deps) {
 		server.listen(config$1.server.port, config$1.server.host, () => resolve$1());
 	});
 	log$1("info", `phone-lens listening on ${config$1.server.host}:${config$1.server.port} (paired devices: ${devices$1.count()})`);
+	resolveLatestGiteeApk().then((url) => {
+		if (url) log$1("info", `APK download link resolved from Gitee API: ${url}`);
+	});
 	return {
 		port: config$1.server.port,
 		dispose: async () => {
@@ -853,7 +952,7 @@ async function handle$1(deps, req, res, ctx) {
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
 		name: "PhoneLens 直连取景",
-		version: "0.3.11",
+		version: hostVersion(),
 		requiresPairing: true
 	}, cors);
 	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
@@ -891,6 +990,7 @@ async function handle$1(deps, req, res, ctx) {
 		return;
 	}
 	if (method === "GET" && path === "/app-qr.json") {
+		await refreshAppApkLinks(config$1);
 		const target = config$1.app.downloadUrl || config$1.app.giteeUrl;
 		const pngDataUrl = await QRCode.toDataURL(target, {
 			errorCorrectionLevel: "M",

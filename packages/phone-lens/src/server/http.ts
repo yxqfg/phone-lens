@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
@@ -16,6 +16,7 @@ import type { DeviceStore } from "../store/devices.js";
 import { hashToken, mintDeviceToken, type PairingStore } from "../store/pairing.js";
 import { SAVE_MODES, type AppSettingsStore, type SaveMode } from "../store/settings.js";
 import type { ViewHub } from "./hub.js";
+import { refreshAppApkLinks, resolveLatestGiteeApk } from "./apk-link.js";
 import { buildPairingQr } from "./qr.js";
 import { VIEW_HTML } from "./static-view.js";
 import { clientKey, corsFor, deviceAuth, isLoopback, queryOf, RateLimiter } from "./auth.js";
@@ -47,6 +48,20 @@ export interface LensServerHandle {
 const SERVER_BOOT_AT = Date.now();
 
 /** Boot the receiver: HTTP routes + two websocket endpoints. */
+// Report our own package version without a hardcoded literal (the old literal
+// went stale across releases). Resolved once from ../package.json — the bundle
+// lives in lib/, so that resolves to the package root in every install form.
+let ownVersion: string | null = null;
+function hostVersion(): string {
+  if (ownVersion) return ownVersion;
+  try {
+    ownVersion = String(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version ?? "0.0.0");
+  } catch {
+    ownVersion = "0.0.0";
+  }
+  return ownVersion;
+}
+
 export async function startLensServer(deps: ServerDeps): Promise<LensServerHandle> {
   const { config, pairing, devices, hub, targets, sink, log } = deps;
   const pairLimiter = new RateLimiter(60_000, 10);
@@ -112,6 +127,11 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
     server.listen(config.server.port, config.server.host, () => resolve());
   });
   log("info", `phone-lens listening on ${config.server.host}:${config.server.port} (paired devices: ${devices.count()})`);
+  // Warm the APK-link cache so the first rendered download QR already carries
+  // the dynamically resolved URL (never blocks startup on the network).
+  void resolveLatestGiteeApk().then((url) => {
+    if (url) log("info", `APK download link resolved from Gitee API: ${url}`);
+  });
 
   return {
     port: config.server.port,
@@ -151,7 +171,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.11", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: hostVersion(), requiresPairing: true }, cors);
   }
 
   // ── loopback-only endpoints (preview page, QR, view stream) ──────────────
@@ -179,6 +199,9 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   // App-download QR: encodes the APK URL (Gitee by default) so a phone can
   // scan it straight from the Web UI overlay and start the download.
   if (method === "GET" && path === "/app-qr.json") {
+    // Resolve the Gitee link from the latest-release API (no per-release
+    // constant bump); mutates config.app only while defaults are in use.
+    await refreshAppApkLinks(config);
     const target = config.app.downloadUrl || config.app.giteeUrl;
     const pngDataUrl = await QRCode.toDataURL(target, { errorCorrectionLevel: "M", margin: 2, width: 320 });
     return sendJson(res, 200, { url: target, gitee: config.app.giteeUrl, github: config.app.githubUrl, pngDataUrl }, { ...cors, "cache-control": "no-store" });

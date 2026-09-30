@@ -23,7 +23,7 @@ function normalizeConfig(raw) {
 	const inject = r.inject ?? {};
 	const target = r.target ?? {};
 	const app = r.app ?? {};
-	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.8/app-release.apk";
+	const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.11/app-release.apk";
 	const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
 	const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
 	const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t) => typeof t === "string") : void 0;
@@ -36,7 +36,6 @@ function normalizeConfig(raw) {
 		limits: {
 			maxUploadBytes: positiveInt(limits.maxUploadBytes, 10 * 1024 * 1024),
 			allowedTypes: allowed && allowed.length > 0 ? allowed : ["image/jpeg", "image/png"],
-			uploadsPerMinute: positiveInt(limits.uploadsPerMinute, 10),
 			previewFrameMaxBytes: positiveInt(limits.previewFrameMaxBytes, 512 * 1024),
 			maxStoredUploads: positiveInt(limits.maxStoredUploads, 200)
 		},
@@ -832,13 +831,13 @@ const SERVER_BOOT_AT = Date.now();
 async function startLensServer(deps) {
 	const { config, pairing, devices, hub, targets, sink, log } = deps;
 	const pairLimiter = new RateLimiter(6e4, 10);
-	const uploadLimiter = new RateLimiter(6e4, config.limits.uploadsPerMinute);
+	const uploadReplays = new Map();
 	let currentCameraDeviceId = null;
 	const injectionBox = { last: null };
 	const server = createServer((req, res) => {
 		handle(deps, req, res, {
 			pairLimiter,
-			uploadLimiter,
+			uploadReplays,
 			getCurrentCamera: () => currentCameraDeviceId,
 			noteInjection: (receipt, attachmentId) => {
 				injectionBox.last = {
@@ -924,7 +923,7 @@ async function handle(deps, req, res, ctx) {
 	}
 	if (method === "GET" && path === "/info") return sendJson(res, 200, {
 		name: "PhoneLens 直连取景",
-		version: "0.3.7",
+		version: "0.3.11",
 		requiresPairing: true
 	}, cors);
 	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
@@ -1011,7 +1010,16 @@ async function handle(deps, req, res, ctx) {
 	if (!auth.ok) return sendError(res, 401, ERROR_CODES.AUTH_REQUIRED, "pair this device first");
 	if (method === "POST" && path === "/upload") {
 		const q = queryOf(req);
-		if (!ctx.uploadLimiter.allow(loop ? "loopback" : clientKey(req))) return sendError(res, 429, ERROR_CODES.RATE_LIMITED, "upload rate exceeded");
+		const rawUploadId = q.get("uploadId") ?? "";
+		const uploadId = /^[\w-]{8,64}$/.test(rawUploadId) ? rawUploadId : null;
+		if (uploadId) {
+			const hit = ctx.uploadReplays.get(uploadId);
+			if (hit && hit.expires > Date.now()) {
+				log("info", `idempotent replay for upload ${uploadId.slice(0, 8)}`);
+				return sendJson(res, 200, hit.body);
+			}
+			ctx.uploadReplays.delete(uploadId);
+		}
 		const mediaType = (req.headers["content-type"] ?? "").split(";")[0].trim();
 		if (!config.limits.allowedTypes.includes(mediaType)) return sendError(res, 415, ERROR_CODES.TYPE_NOT_ALLOWED, `allowed: ${config.limits.allowedTypes.join(", ")}`);
 		const declared = Number(req.headers["content-length"] ?? "0");
@@ -1075,6 +1083,25 @@ async function handle(deps, req, res, ctx) {
 			name,
 			dir: savedDir
 		});
+		if (uploadId) {
+			const replayBody = {
+				ok: true,
+				attachmentId: admitted.ref.attachmentId,
+				width: admitted.ref.width,
+				height: admitted.ref.height,
+				bytes: admitted.ref.bytes,
+				storage: admitted.storage,
+				delivered: null,
+				deliverReason: savedDir ? wantComposer ? "saved-and-staged" : "saved-to-folder" : "staged-in-composer"
+			};
+			if (ctx.uploadReplays.size > 400) {
+				for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
+			}
+			ctx.uploadReplays.set(uploadId, {
+				expires: Date.now() + 10 * 6e4,
+				body: replayBody
+			});
+		}
 		return sendJson(res, 200, {
 			ok: true,
 			attachmentId: admitted.ref.attachmentId,

@@ -50,14 +50,16 @@ const SERVER_BOOT_AT = Date.now();
 export async function startLensServer(deps: ServerDeps): Promise<LensServerHandle> {
   const { config, pairing, devices, hub, targets, sink, log } = deps;
   const pairLimiter = new RateLimiter(60_000, 10);
-  const uploadLimiter = new RateLimiter(60_000, config.limits.uploadsPerMinute);
+  // POST /upload idempotency: the phone's upload queue retries with a stable
+  // uploadId, and a retry after a lost response must not store/inject twice.
+  const uploadReplays = new Map<string, { expires: number; body: unknown }>();
   let currentCameraDeviceId: string | null = null;
   const injectionBox: { last: { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null } = { last: null };
 
   const server: HttpServer = createServer((req, res) => {
     handle(deps, req, res, {
       pairLimiter,
-      uploadLimiter,
+      uploadReplays,
       getCurrentCamera: () => currentCameraDeviceId,
       noteInjection: (receipt, attachmentId) => {
         injectionBox.last = { at: Date.now(), sessionId: receipt.sessionId, attachmentId, ok: receipt.ok };
@@ -125,7 +127,8 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
 
 type RouteCtx = {
   pairLimiter: RateLimiter;
-  uploadLimiter: RateLimiter;
+  /** uploadId → cached 200 response, so queued-upload retries are idempotent. */
+  uploadReplays: Map<string, { expires: number; body: unknown }>;
   getCurrentCamera: () => string | null;
   noteInjection: (receipt: DeliveryReceipt, attachmentId: string) => void;
   getLastInjection: () => { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null;
@@ -148,7 +151,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.7", requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: "0.3.11", requiresPairing: true }, cors);
   }
 
   // ── loopback-only endpoints (preview page, QR, view stream) ──────────────
@@ -213,7 +216,22 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   if (method === "POST" && path === "/upload") {
     const q = queryOf(req);
-    if (!ctx.uploadLimiter.allow(loop ? "loopback" : clientKey(req))) return sendError(res, 429, ERROR_CODES.RATE_LIMITED, "upload rate exceeded");
+    // Idempotent replay BEFORE anything else: a queued-upload retry that
+    // already stored once replays the original 200. Key format-bounded:
+    // uploadId is attacker-controllable input and doubles as the map key.
+    const rawUploadId = q.get("uploadId") ?? "";
+    const uploadId = /^[\w-]{8,64}$/.test(rawUploadId) ? rawUploadId : null;
+    if (uploadId) {
+      const hit = ctx.uploadReplays.get(uploadId);
+      if (hit && hit.expires > Date.now()) {
+        log("info", `idempotent replay for upload ${uploadId.slice(0, 8)}`);
+        return sendJson(res, 200, hit.body);
+      }
+      ctx.uploadReplays.delete(uploadId);
+    }
+    // No upload rate limiting by design: the phone's queue uploads serially
+    // and the per-photo size cap plus archive pruning bound the damage any
+    // authenticated (or loopback) client can do.
     const mediaType = (req.headers["content-type"] ?? "").split(";")[0]!.trim();
     if (!config.limits.allowedTypes.includes(mediaType)) {
       return sendError(res, 415, ERROR_CODES.TYPE_NOT_ALLOWED, `allowed: ${config.limits.allowedTypes.join(", ")}`);
@@ -287,6 +305,27 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       // folder-only save: bypass the composer; surface a local UI hint on the
       // view — never a chat message (the tool does not speak for the user).
       hub.broadcastToViews({ type: "upload_saved", name, dir: savedDir });
+    }
+
+    // Idempotency bookkeeping for queued-upload retries. uploadId serves only
+    // as the lookup KEY; the cached receipt is entirely server-generated data
+    // (sha refs, probed dimensions, literal enums) — must stay byte-identical
+    // to the 200 body returned below.
+    if (uploadId) {
+      const replayBody = {
+        ok: true,
+        attachmentId: admitted.ref.attachmentId,
+        width: admitted.ref.width,
+        height: admitted.ref.height,
+        bytes: admitted.ref.bytes,
+        storage: admitted.storage,
+        delivered: null,
+        deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
+      };
+      if (ctx.uploadReplays.size > 400) {
+        for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
+      }
+      ctx.uploadReplays.set(uploadId, { expires: Date.now() + 10 * 60_000, body: replayBody });
     }
 
     return sendJson(res, 200, {

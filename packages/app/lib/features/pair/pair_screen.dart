@@ -83,7 +83,7 @@ class _PairScreenState extends State<PairScreen> {
         'fps': pv.fps,
         'quality': pv.jpegQuality,
       });
-      await widget.store.saveLimits(result.maxUploadBytes, result.uploadsPerMinute);
+      await widget.store.saveLimits(result.maxUploadBytes);
       await widget.store.addServer(result.server);
       widget.onPaired?.call();
       if (!mounted) return;

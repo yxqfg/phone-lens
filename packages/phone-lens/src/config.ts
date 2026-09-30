@@ -14,7 +14,7 @@ export function normalizeConfig(raw: unknown): LensConfig {
   // Points at the Gitee release carrying the newest APK; bump this only when
   // a new APK ships. GitHub assets are always named app-release.apk so the
   // latest/download link keeps working across releases.
-  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.8/app-release.apk";
+  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.11/app-release.apk";
   const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
   const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
   const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t: unknown): t is string => typeof t === "string") : undefined;
@@ -27,7 +27,6 @@ export function normalizeConfig(raw: unknown): LensConfig {
     limits: {
       maxUploadBytes: positiveInt(limits.maxUploadBytes, 10 * 1024 * 1024),
       allowedTypes: allowed && allowed.length > 0 ? allowed : ["image/jpeg", "image/png"],
-      uploadsPerMinute: positiveInt(limits.uploadsPerMinute, 10),
       previewFrameMaxBytes: positiveInt(limits.previewFrameMaxBytes, 512 * 1024),
       // keep the local upload archive bounded: oldest files are pruned past this
       maxStoredUploads: positiveInt(limits.maxStoredUploads, 200),

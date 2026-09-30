@@ -6,7 +6,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
@@ -16,8 +15,10 @@ import '../../core/jpeg.dart';
 import '../../core/preview_encoder.dart';
 import '../../core/routes.dart';
 import '../../core/global_link.dart';
+import '../../core/upload_queue.dart';
 import '../../ui/background_art.dart';
 import '../pair/pair_screen.dart';
+import '../upload/upload_queue_screen.dart';
 import 'crop_screen.dart';
 
 /// Camera-app style viewfinder: full-ratio (never cropped) preview with
@@ -45,6 +46,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   bool _streaming = false;
   /// True while the host has parked this phone's preview (another device owns it).
   bool _hostPaused = false;
+  /// True once the user explicitly stopped the preview. Auto-resume paths
+  /// (crop return, app foreground, ws reconnect handshake) must respect it —
+  /// only an explicit "启动预览" or "设为主机" clears it.
+  bool _userStopped = false;
   // focus interaction (opt-in; pure mode = no focus UI/gestures)
   Offset? _focusLocal;
   bool _focusLocked = false;
@@ -229,8 +234,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         debugPrint('[lens-mate] camera stream mode: yuv420(hand-assembled) — jpeg stream delivers no frames on this device');
         // preview streaming defaults ON — it's a framing aid, not a video
         // upload; users turn it off explicitly when they want to.
-        // A host-paused phone must NOT resume by itself (multi-device rule).
-        if (!_streaming && !_hostPaused) _toggleStream();
+        // A host-paused phone must NOT resume by itself (multi-device rule),
+        // and neither may a user-stopped one: returning from the cropper or
+        // the app foreground used to silently re-open the stream here.
+        if (!_streaming && !_hostPaused && !_userStopped) _toggleStream();
       } catch (e) {
         debugPrint('[lens-mate] camera init failed: $e');
         if (mounted) setState(() => _cameraError = '相机初始化失败,请检查相机权限未被占用后重试');
@@ -275,6 +282,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         _reconnectStreak = 0;
         _authProbeDone = false;
         _authFailed = false;
+        UploadQueue.instance.kick(); // network is back — flush queued shots
       } else if (st == LensLinkState.disconnected) {
         _reconnectStreak++;
         _maybeProbeAuth();
@@ -402,9 +410,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   Future<void> _toggleStream() async {
     if (_streaming) {
+      _userStopped = true; // explicit user intent: preview stays OFF
       await _stopStream();
     } else {
-      await _startStream();
+      await _startStream(); // clears _userStopped on success
     }
   }
 
@@ -417,6 +426,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     final camera = _camera;
     if (camera == null || !camera.value.isInitialized) return;
     if (_streaming) return;
+    _userStopped = false;
     setState(() => _streaming = true);
     try {
       await camera.startImageStream(_onCameraImage);
@@ -454,6 +464,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// (control switched back). Pausing keeps the connection + upload usable.
   Future<void> _onHostPreviewState(bool active) async {
     if (!active) {
+      // NOTE: a host pause must NOT clear _userStopped — "user stopped, then
+      // got parked, then got resumed" still ends OFF, honoring the last
+      // explicit user intent. Only 启动预览/设为主机 clear the flag.
       await _stopStream();
       if (!mounted) return;
       // reconnect handshakes re-send pause — only surface it once
@@ -462,7 +475,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       _longToast('其他设备正在使用电脑端预览;本机仍可正常上传图片');
     } else {
       if (mounted) setState(() => _hostPaused = false);
-      if (cameraReadyCheck) await _startStream(); // resume seamlessly
+      // reconnect handshakes re-send resume — never override an explicit
+      // user stop; only "设为主机" (which cleared the flag) resumes seamlessly
+      if (cameraReadyCheck && !_userStopped) await _startStream();
     }
   }
 
@@ -525,14 +540,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   Future<void> _shoot({String? captureId, String? note}) async {
     final camera = _camera;
-    final s = _server;
-    // disconnected → meaningful warning, not "camera failed"
-    if (_link != LensLinkState.connected) {
-      _toast('未连接电脑');
-      if (captureId != null) _socket?.reportCapture(captureId, 'failed', 'not connected');
-      return;
-    }
-    if (camera == null || s == null || !cameraReadyCheck) {
+    // NOTE: no link check here — a flaky/offline network is exactly when the
+    // queue matters; the shot lands on disk and uploads when we reconnect.
+    if (camera == null || !cameraReadyCheck) {
       // report so the PC-side shutter shows an error instead of silence
       if (captureId != null) _socket?.reportCapture(captureId, 'failed', 'camera unavailable');
       return;
@@ -546,10 +556,17 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       }
       return;
     }
+    // The _sending lock now only covers CAPTURE (takePicture → bake → crop):
+    // the upload happens in the background queue, so the next shot is ready
+    // as soon as this one is safely on disk.
     setState(() => _sending = true);
     try {
       final file = await camera.takePicture();
       var bytes = await File(file.path).readAsBytes();
+      // the plugin's temp copy is no longer needed once we hold the bytes
+      try {
+        await File(file.path).delete();
+      } catch (_) {}
       // WYSIWYG: bake the photo to what the viewfinder showed at shutter
       // time. takePicture pixels are always portrait-upright (CameraX bakes
       // the display rotation and this app is portrait-locked), so the extra
@@ -560,6 +577,8 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       if (extra != 0) {
         bytes = await compute(_rotateJpeg, _RotateArgs(bytes, extra));
       }
+      // pre-shrink oversized captures before the crop screen (decode cost
+      // there is O(pixels)); the quality preset is applied on the FINAL bytes
       final maxBytes = widget.store.maxUploadBytes;
       if (bytes.length > maxBytes) {
         bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
@@ -583,7 +602,17 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         }
         bytes = cropped;
       }
-      await _send(s, bytes: bytes, name: _shotName(), captureId: captureId, note: note);
+      bytes = await _applyUploadQuality(bytes);
+      await UploadQueue.instance.enqueue(
+        bytes: bytes,
+        name: _shotName(),
+        note: note,
+        captureId: captureId,
+      );
+      // taken = shot captured and safely queued; the queue owns the rest
+      if (captureId != null) _socket?.reportCapture(captureId, 'taken');
+      final pending = UploadQueue.instance.pendingCount;
+      _toast(pending > 1 ? '已加入上传队列,待传 $pending 张' : '已加入上传队列');
     } catch (e) {
       _toast('拍摄失败');
       if (captureId != null) _socket?.reportCapture(captureId, 'failed', e.toString());
@@ -593,26 +622,37 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     }
   }
 
+  /// Enforce the user's upload-quality preset on the FINAL upload bytes
+  /// (after rotation and cropping). Runs on the UI isolate but delegates the
+  /// heavy decode/encode to worker isolates via compute.
+  Future<Uint8List> _applyUploadQuality(Uint8List bytes) async {
+    final maxBytes = widget.store.maxUploadBytes;
+    switch (widget.store.uploadQuality) {
+      case LensStore.qualityMedium:
+        return compute(_normalize, _NormArgs(bytes, maxBytes, 2560, 80));
+      case LensStore.qualityLow:
+        return compute(_normalize, _NormArgs(bytes, maxBytes, 1600, 65));
+      default: // high: original bytes unless they exceed the receiver's ceiling
+        return bytes.length > maxBytes ? compute(_fit, _FitArgs(bytes, maxBytes, 4096)) : bytes;
+    }
+  }
+
   String _shotName() {
     final t = DateTime.now();
     String two(int n) => n.toString().padLeft(2, '0');
     return 'shot_${t.year}${two(t.month)}${two(t.day)}_${two(t.hour)}${two(t.minute)}${two(t.second)}.jpg';
   }
 
-  /// Pick one or more images from the gallery and upload them.
+  /// Pick one or more images from the gallery and queue them for upload.
   ///
-  /// - Crop mode ON: a single continuous session — each image is cropped, then
-  ///   uploaded behind a blocking overlay, then the next one is loaded
-  ///   in-place (never bouncing back to the viewfinder). The ✕ discards all
-  ///   remaining images.
-  /// - Crop mode OFF: all images are sent directly as a batch.
+  /// - Crop mode ON: a single continuous session — each image is cropped,
+  ///   then queued, then the next one is loaded in-place (never bouncing
+  ///   back to the viewfinder). The ✕ discards all remaining images.
+  /// - Crop mode OFF: all images are queued as a batch.
+  ///
+  /// Queueing (not sending) keeps the UI responsive and gives every picture
+  /// the queue's retry/backoff behaviour for free.
   Future<void> _pickFromGallery() async {
-    final s = _server;
-    if (s == null) return;
-    if (_link == LensLinkState.disconnected) {
-      _toast('未连接电脑');
-      return;
-    }
     final files = await ImagePicker().pickMultiImage(limit: 12);
     if (files.isEmpty || !mounted) return;
     final maxBytes = widget.store.maxUploadBytes;
@@ -629,47 +669,39 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         batchNames.add(_galleryName(f.name));
       }
       if (!mounted) return;
-      final uploaded = await Navigator.of(context).push<int>(
+      await Navigator.of(context).push<int>(
         MaterialPageRoute(
           builder: (_) => CropScreen(
             bytes: batchBytes.first,
             batch: batchBytes,
             batchNames: batchNames,
             // silent: per-item toasts would fight the crop screen's overlay;
-            // the final pop returns the success count
-            onBatchUpload: (b, name) => _send(s, bytes: b, name: name, captureId: null, note: null, silent: true),
+            // enqueueing is fast, so the overlay barely shows
+            onBatchUpload: (b, name) async {
+              final finalBytes = await _applyUploadQuality(b);
+              await UploadQueue.instance.enqueue(bytes: finalBytes, name: name);
+            },
             defaultCropRatio: widget.store.defaultCropRatio,
             handleSize: widget.store.handleSize,
           ),
         ),
       );
-      if (uploaded != null && uploaded > 0) _toast('已批量上传 $uploaded 张');
+      if (!mounted) return;
+      final pending = UploadQueue.instance.pendingCount;
+      if (pending > 0) _toast(pending > 1 ? '已加入上传队列,待传 $pending 张' : '已加入上传队列');
       return;
     }
 
-    // Crop OFF: plain batch upload. Serial, per-item failures counted (not
-    // silently swelling the total); a RATE_LIMITED item waits out the
-    // receiver's per-minute window once, then retries.
-    var okCount = 0;
+    // Crop OFF: queue the whole batch; the worker uploads serially in order.
     for (final f in files) {
       if (!mounted) return;
       var bytes = await f.readAsBytes();
-      if (bytes.length > maxBytes) bytes = await compute(_fit, _FitArgs(bytes, maxBytes, 4096));
-      var receipt = await _sendOne(s, bytes: bytes, name: _galleryName(f.name), captureId: null, note: null);
-      if (!receipt.ok && receipt.errorCode == 'RATE_LIMITED') {
-        _longToast('达到电脑端每分钟上传上限,稍候自动续传…');
-        await Future<void>.delayed(const Duration(seconds: 61));
-        if (!mounted) return;
-        receipt = await _sendOne(s, bytes: bytes, name: _galleryName(f.name), captureId: null, note: null);
-      }
-      if (receipt.ok) okCount++;
+      bytes = await _applyUploadQuality(bytes);
+      await UploadQueue.instance.enqueue(bytes: bytes, name: _galleryName(f.name));
     }
     if (!mounted) return;
-    if (okCount == files.length) {
-      _toast('已批量上传 $okCount 张');
-    } else {
-      _longToast('已上传 $okCount/${files.length} 张,失败 ${files.length - okCount} 张(详见历史)');
-    }
+    final pending = UploadQueue.instance.pendingCount;
+    _toast('已加入上传队列 $pending 张');
   }
 
   String _galleryName(String name) {
@@ -680,109 +712,6 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     var base = clean.isEmpty ? 'photo' : clean;
     base = base.replaceFirst(RegExp(r'\.[A-Za-z0-9]+$'), '');
     return '${base}_${DateTime.now().millisecondsSinceEpoch % 100000}.${isPng ? 'png' : 'jpg'}';
-  }
-
-  /// Declare the format from magic bytes, not the file extension — the
-  /// receiver validates the declared content-type against the actual byte
-  /// header, so a PNG gallery shot declared as jpeg fails 415 every time.
-  String _sniffMediaType(Uint8List bytes) {
-    if (bytes.length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) return 'image/jpeg';
-    if (bytes.length >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) {
-      return 'image/png';
-    }
-    return 'image/jpeg'; // unknown formats: let the receiver's check reject them
-  }
-
-  /// Core upload + history bookkeeping; NEVER throws (network-level errors
-  /// become a failed receipt so history rows and capture receipts still land).
-  Future<UploadReceipt> _sendOne(PairedServer s,
-      {required Uint8List bytes, required String name, String? captureId, String? note}) async {
-    UploadReceipt receipt;
-    try {
-      receipt = await _api.upload(
-        s,
-        bytes: bytes,
-        mediaType: _sniffMediaType(bytes),
-        name: name,
-        note: note,
-        captureId: captureId,
-      );
-    } catch (e) {
-      debugPrint('[lens-mate] upload error: $e');
-      receipt = UploadReceipt(ok: false, errorCode: 'NETWORK_ERROR');
-    }
-    // history per user mode: noTrace skips the record entirely
-    final mode = widget.store.historyMode;
-    if (mode != LensStore.historyNoTrace) {
-      String? imagePath;
-      if (mode == LensStore.historyKeepImage) {
-        try {
-          final dir = await getApplicationDocumentsDirectory();
-          final file = File('${dir.path}/history/${DateTime.now().millisecondsSinceEpoch}_$name');
-          await file.create(recursive: true);
-          await file.writeAsBytes(bytes);
-          imagePath = file.path;
-        } catch (_) {
-          imagePath = null; // archive failure must not lose the history row
-        }
-      }
-      await widget.store.addHistory({
-        'at': DateTime.now().toIso8601String(),
-        'name': name,
-        'bytes': bytes.length,
-        'ok': receipt.ok,
-        'attachmentId': receipt.attachmentId,
-        'reason': receipt.reason,
-        'errorCode': receipt.errorCode,
-        'captureId': captureId,
-        'server': s.name,
-        'imagePath': imagePath,
-      });
-    }
-    // report the TRUTH: a failed upload is 'failed', never 'taken'
-    if (captureId != null) {
-      _socket?.reportCapture(captureId, receipt.ok ? 'taken' : 'failed', receipt.ok ? null : receipt.errorCode);
-    }
-    return receipt;
-  }
-
-  Future<void> _send(PairedServer s,
-      {required Uint8List bytes, required String name, String? captureId, String? note, bool silent = false}) async {
-    final receipt = await _sendOne(s, bytes: bytes, name: name, captureId: captureId, note: note);
-    if (!mounted || silent) return;
-    // The toast must match the receiver's actual capture mode (v0.3.7):
-    // composer-only / composer+folder / folder-only say different things.
-    _toast(_sendToastText(receipt));
-  }
-
-  String _sendToastText(UploadReceipt r) {
-    if (!r.ok) return '发送失败(${_uploadErrorText(r.errorCode)})';
-    switch (r.reason) {
-      case 'saved-to-folder':
-        return '已保存到电脑文件夹';
-      case 'saved-and-staged':
-        return '已放入电脑输入框,并存到电脑文件夹';
-      default: // 'staged-in-composer' / unknown → the classic promise
-        return '已放入电脑输入框';
-    }
-  }
-
-  String _uploadErrorText(String code) {
-    switch (code) {
-      case 'RATE_LIMITED':
-        return '发送过于频繁';
-      case 'TOO_LARGE':
-        return '图片过大';
-      case 'BAD_MAGIC':
-      case 'TYPE_NOT_ALLOWED':
-        return '图片格式不支持';
-      case 'AUTH_REQUIRED':
-        return '配对已失效,请重新扫码';
-      case 'NETWORK_ERROR':
-        return '网络异常';
-      default:
-        return code.isEmpty ? '未知错误' : code;
-    }
   }
 
   void _toast(String msg) => _showToast(msg, const Duration(milliseconds: 1500));
@@ -809,6 +738,70 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   }
 
   bool get cameraReadyCheck => _cameraReady && (_camera?.value.isInitialized ?? false);
+
+  void _openUploadQueue() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => UploadQueueScreen(store: widget.store)),
+    );
+  }
+
+  /// Floating badge over the viewfinder's top-right: pending upload count,
+  /// red when something hard-failed, pulsing border while actively sending.
+  /// Tap → queue management screen. Hidden when the queue is empty.
+  Widget _queueBadge() {
+    return Positioned(
+      top: 12,
+      right: 12,
+      child: ValueListenableBuilder<List<UploadItem>>(
+        valueListenable: UploadQueue.instance.items,
+        builder: (_, items, __) {
+          if (items.isEmpty) return const SizedBox.shrink();
+          final failed = items.where((i) => i.status == UploadStatus.failed).length;
+          final uploading = items.any((i) => i.status == UploadStatus.uploading);
+          return Material(
+            color: Colors.transparent,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(16),
+              onTap: _openUploadQueue,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: failed > 0 ? const Color(0xE6B3261E) : Colors.black54,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: uploading ? Colors.lightBlueAccent : Colors.white24,
+                    width: 1,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (uploading)
+                      const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                      )
+                    else
+                      Icon(
+                        failed > 0 ? Icons.error_outline : Icons.cloud_upload_outlined,
+                        size: 14,
+                        color: Colors.white,
+                      ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '${items.length}',
+                      style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
 
   @override
   void dispose() {
@@ -927,7 +920,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// friendly "not connected" empty state with the dimmed illustration.
   Widget _previewOrEmpty() {
     if (_link != LensLinkState.connected) {
-      return _disconnectedEmpty();
+      // the badge floats over the empty state too — offline shots are exactly
+      // when "what's waiting to upload" matters most
+      return Stack(children: [_disconnectedEmpty(), _queueBadge()]);
     }
     if (cameraReadyCheck && _camera != null) {
       return _previewArea(_camera!);
@@ -1203,6 +1198,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           ),
         _focusIndicator(),
         if (_focusLocked && _showFocus) _focusLockBanner(),
+        _queueBadge(),
         // shutter chrome stays on the bottom; when held sideways only the
         // individual controls rotate 90° (labels stay readable toward the grip)
         Align(
@@ -1239,6 +1235,17 @@ class _FitArgs {
   final int maxBytes;
   final int maxDim;
   _FitArgs(this.bytes, this.maxBytes, this.maxDim);
+}
+
+Uint8List _normalize(_NormArgs args) =>
+    normalizeJpegBytes(args.bytes, args.maxBytes, args.maxDim, args.startQuality);
+
+class _NormArgs {
+  final Uint8List bytes;
+  final int maxBytes;
+  final int maxDim;
+  final int startQuality;
+  const _NormArgs(this.bytes, this.maxBytes, this.maxDim, this.startQuality);
 }
 
 /// Bake a photo to the orientation the viewfinder showed. [clockwise] is the

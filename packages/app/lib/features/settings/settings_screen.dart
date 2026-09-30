@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../core/api.dart';
 import '../../core/camera_socket.dart';
 import '../../core/global_link.dart';
+import '../../core/update_check.dart';
 import '../../ui/background_art.dart';
 import '../pair/pair_screen.dart';
 import 'about_screen.dart';
@@ -18,6 +20,37 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  String _currentVersion = '';
+  bool _checkingUpdate = false;
+
+  @override
+  void initState() {
+    super.initState();
+    PackageInfo.fromPlatform().then((info) {
+      if (mounted) setState(() => _currentVersion = info.version);
+    }).catchError((_) {});
+  }
+
+  /// Manual check from Settings: unlike the throttled startup check this
+  /// always queries the feeds and always reports the outcome.
+  Future<void> _manualCheckUpdate() async {
+    if (_checkingUpdate) return;
+    setState(() => _checkingUpdate = true);
+    final info = await checkForUpdate();
+    if (!mounted) return;
+    setState(() => _checkingUpdate = false);
+    if (info == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('检查失败,请确认网络后重试')),
+      );
+    } else if (!info.isNewer) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已是最新版本 v${info.latestVersion}')),
+      );
+    } else {
+      await showUpdateDialog(context, info);
+    }
+  }
 
   Future<void> _serverActions(PairedServer s) async {
     final active = widget.store.server?.id == s.id;
@@ -164,6 +197,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SectionHeader('裁剪'),
           _buildCropRatioTile(),
           _buildHandleSizeTile(),
+          const SectionHeader('上传画质'),
+          for (final entry in const [
+            (LensStore.qualityHigh, '高(原图直传)', '保持相机原始画质,仅超出电脑端大小限制时压缩;文件最大'),
+            (LensStore.qualityMedium, '中(推荐)', '重编码至长边 2560px,画质几乎无损,体积约为原图的 1/3'),
+            (LensStore.qualityLow, '低(省流量)', '重编码至长边 1600px,弱网环境下上传更快'),
+          ])
+            RadioListTile<String>(
+              value: entry.$1,
+              // ignore: deprecated_member_use
+              groupValue: widget.store.uploadQuality,
+              title: Text(entry.$2),
+              subtitle: Text(entry.$3),
+              // ignore: deprecated_member_use
+              onChanged: (v) async {
+                if (v == null) return;
+                await widget.store.setUploadQuality(v);
+                if (mounted) setState(() {});
+              },
+            ),
           const SectionHeader('发送历史'),
           for (final entry in const [
             (LensStore.historyUploadOnly, '仅上传', '仅保留发送记录,不在本机存储图片'),
@@ -186,6 +238,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 8),
           const Divider(color: Colors.white12, height: 1),
           const SectionHeader('关于和帮助'),
+          ListTile(
+            leading: _checkingUpdate
+                ? const SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.system_update_alt),
+            title: const Text('检查更新'),
+            subtitle: Text(_currentVersion.isEmpty ? '查询应用最新版本' : '当前版本 v$_currentVersion'),
+            trailing: const Icon(Icons.chevron_right, color: Colors.white54),
+            onTap: _manualCheckUpdate,
+          ),
           ListTile(
             leading: const Icon(Icons.info_outline),
             title: const Text('关于和帮助'),

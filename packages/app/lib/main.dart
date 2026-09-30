@@ -4,6 +4,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/api.dart';
 import 'core/routes.dart';
+import 'core/update_check.dart';
+import 'core/upload_queue.dart';
 import 'features/camera/viewfinder_screen.dart';
 import 'features/history/history_screen.dart';
 import 'features/pair/pair_screen.dart';
@@ -19,6 +21,9 @@ Future<void> main() async {
   ]);
   final prefs = await SharedPreferences.getInstance();
   final store = LensStore(prefs);
+  // restore the on-disk upload queue and resume any shots a previous session
+  // left behind — before the first frame, so the badge is correct immediately
+  await UploadQueue.instance.init(store);
   runApp(LensApp(store: store));
 }
 
@@ -52,6 +57,27 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   int _tab = 0;
+  bool _updateDialogShown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _maybeAutoCheckUpdate();
+  }
+
+  /// Startup update check: once a day at most, fully silent unless a newer
+  /// release is actually available (failed feeds never surface to the user;
+  /// manual checks live in Settings → 检查更新).
+  Future<void> _maybeAutoCheckUpdate() async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - widget.store.lastUpdateCheckAt < const Duration(hours: 24).inMilliseconds) return;
+    await widget.store.setLastUpdateCheckAt(now);
+    final info = await checkForUpdate();
+    if (info == null || !info.isNewer || !mounted || _updateDialogShown) return;
+    _updateDialogShown = true;
+    await showUpdateDialog(context, info);
+    _updateDialogShown = false;
+  }
 
   void _refresh() => setState(() {});
 

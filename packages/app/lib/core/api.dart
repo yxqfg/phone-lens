@@ -71,8 +71,7 @@ class PairResult {
   final PairedServer server;
   final PreviewParams preview;
   final int maxUploadBytes;
-  final int uploadsPerMinute;
-  PairResult(this.server, this.preview, this.maxUploadBytes, this.uploadsPerMinute);
+  PairResult(this.server, this.preview, this.maxUploadBytes);
 }
 
 class PreviewParams {
@@ -153,7 +152,6 @@ class LensApi {
         (preview['jpegQuality'] as num?)?.toInt() ?? 70,
       ),
       (limits['maxUploadBytes'] as num?)?.toInt() ?? 10 * 1024 * 1024,
-      (limits['uploadsPerMinute'] as num?)?.toInt() ?? 10,
     );
   }
 
@@ -165,12 +163,16 @@ class LensApi {
     required String name,
     String? note,
     String? captureId,
+    /// Idempotency key: the receiver replays the original receipt for a
+    /// repeated [uploadId], so queue retries never double-store.
+    String? uploadId,
     http.Client? client,
   }) async {
     final uri = Uri.parse('${server.baseUrl}/upload').replace(queryParameters: {
       'name': name,
       if (note?.isNotEmpty == true) 'note': note!,
       if (captureId != null) 'captureId': captureId,
+      if (uploadId != null) 'uploadId': uploadId,
     });
     final resp = await (client ?? _http)
         .post(
@@ -255,6 +257,27 @@ class LensStore {
   static const _kDeviceId = 'lens.deviceId';
   static const _kDeviceName = 'lens.deviceName';
   static const _kLimits = 'lens.limits';
+  static const _kUploadQuality = 'lens.uploadQuality';
+
+  // Upload quality presets (Settings → 上传). "high" keeps the original
+  // camera bytes; medium/low always re-encode to a bounded width.
+  static const qualityHigh = 'high';
+  static const qualityMedium = 'medium';
+  static const qualityLow = 'low';
+
+  String get uploadQuality {
+    final v = _prefs.getString(_kUploadQuality);
+    if (v != null && (v == qualityMedium || v == qualityLow)) return v;
+    return qualityHigh;
+  }
+
+  Future<void> setUploadQuality(String v) => _prefs.setString(_kUploadQuality, v);
+
+  /// Last automatic update-check epoch ms (24h throttle for the startup check;
+  /// manual checks from Settings bypass it).
+  static const _kLastUpdateCheck = 'lens.lastUpdateCheckAt';
+  int get lastUpdateCheckAt => _prefs.getInt(_kLastUpdateCheck) ?? 0;
+  Future<void> setLastUpdateCheckAt(int v) => _prefs.setInt(_kLastUpdateCheck, v);
 
   /// Stable device identity: REUSED across pairings so re-pairing the same
   /// PC refreshes the token on the SAME host-side device record instead of
@@ -265,23 +288,19 @@ class LensStore {
   String get deviceName => _prefs.getString(_kDeviceName) ?? 'phone';
   Future<void> setDeviceName(String v) => _prefs.setString(_kDeviceName, v);
 
-  /// Upload limits last advertised by the active receiver (serverInfo).
+  /// Upload limit last advertised by the active receiver (serverInfo).
   int get maxUploadBytes => _limits()?['maxUploadBytes'] ?? 10 * 1024 * 1024;
-  int get uploadsPerMinute => _limits()?['uploadsPerMinute'] ?? 10;
 
   Map<String, int>? _limits() {
     final raw = decode(_prefs.getString(_kLimits));
     if (raw == null) return null;
     return {
       if (raw['maxUploadBytes'] != null) 'maxUploadBytes': (raw['maxUploadBytes'] as num).toInt(),
-      if (raw['uploadsPerMinute'] != null) 'uploadsPerMinute': (raw['uploadsPerMinute'] as num).toInt(),
     };
   }
 
-  Future<void> saveLimits(int maxUploadBytes, int uploadsPerMinute) =>
-      _prefs.setString(_kLimits, jsonEncode({
+  Future<void> saveLimits(int maxUploadBytes) => _prefs.setString(_kLimits, jsonEncode({
         'maxUploadBytes': maxUploadBytes,
-        'uploadsPerMinute': uploadsPerMinute,
       }));
 
   /// Tap-to-focus + long-press lock on the viewfinder. Off by default (pure

@@ -197,6 +197,29 @@ Uint8List fitJpegBytes(Uint8List bytes, int maxBytes, int maxDimension) {
   return out;
 }
 
+/// Normalize a captured still to a user-chosen upload-quality preset:
+/// bounded width + starting JPEG quality, then the same shrink loop as
+/// [fitJpegBytes] if the result still exceeds [maxBytes]. Always re-encodes —
+/// the "high" preset (original bytes unless oversized) does NOT go through
+/// here, it keeps using [fitJpegBytes].
+Uint8List normalizeJpegBytes(Uint8List bytes, int maxBytes, int maxDimension, int startQuality) {
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) return bytes;
+  var image = decoded;
+  if (image.width > maxDimension) {
+    image = img.copyResize(image, width: maxDimension);
+  }
+  var quality = startQuality;
+  var out = Uint8List.fromList(img.encodeJpg(image, quality: quality));
+  for (var round = 0; round < 6 && out.length > maxBytes; round++) {
+    final targetWidth = (image.width * 0.8).round();
+    image = img.copyResize(image, width: targetWidth);
+    out = Uint8List.fromList(img.encodeJpg(image, quality: quality));
+    quality = (quality - 10).clamp(40, startQuality);
+  }
+  return out;
+}
+
 double _min3(double a, double b, double c) {
   var m = a < b ? a : b;
   return m < c ? m : c;

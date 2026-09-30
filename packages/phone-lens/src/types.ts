@@ -6,7 +6,6 @@ export interface LensConfig {
   limits: {
     maxUploadBytes: number;
     allowedTypes: string[];
-    uploadsPerMinute: number;
     previewFrameMaxBytes: number;
     maxStoredUploads: number;
   };

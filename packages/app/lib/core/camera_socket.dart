@@ -54,7 +54,7 @@ class CameraSocket {
       // close() raced us while we were awaiting the handshake — this fresh
       // connection belongs to nobody, drop it instead of leaking it
       if (_closedByUser) {
-        await ws.sink.close();
+        unawaited(ws.sink.close());
         return;
       }
       _ws = ws;
@@ -83,9 +83,13 @@ class CameraSocket {
         cancelOnError: true,
       );
     } catch (_) {
-      // handshake timeout/failure: kill the half-open channel too
+      // Abandon the half-open channel WITHOUT awaiting its close: sink.close()
+      // waits on the underlying handshake, which hangs forever when the
+      // receiver is unreachable (LAN SYN black hole) — awaiting it stalled the
+      // reconnect loop at "connecting" indefinitely (seen live: phone app
+      // started before the desktop could never auto-reconnect).
       try {
-        await ws?.sink.close();
+        unawaited(ws?.sink.close());
       } catch (_) {}
       _scheduleReconnect();
     }

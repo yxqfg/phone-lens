@@ -11,10 +11,13 @@ export function normalizeConfig(raw: unknown): LensConfig {
   const target = (r.target ?? {}) as Record<string, any>;
   const app = (r.app ?? {}) as Record<string, any>;
   // App download sources: Gitee first (CN-friendly), GitHub as the fallback link.
-  // Points at the Gitee release carrying the newest APK; bump this only when
-  // a new APK ships. GitHub assets are always named app-release.apk so the
-  // latest/download link keeps working across releases.
-  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.3.11/app-release.apk";
+  // ⚠️ RELEASE CHECKLIST: Gitee has NO GitHub-style `releases/latest/download/`
+  // short link (it 302s to /repository/archive/ and 404s), so this constant
+  // MUST be bumped to the new tag every time a new APK ships — shipping a
+  // stale link makes every scanned QR download the OLD APK (v1.0.0 shipped
+  // with a v0.3.11 link this way). GitHub needs no bump: assets are always
+  // named app-release.apk, so latest/download keeps working.
+  const GITEE_APK = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.0.0/app-release.apk";
   const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
   const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK;
   const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t: unknown): t is string => typeof t === "string") : undefined;

@@ -15,6 +15,11 @@ class BackgroundArt extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final v = MediaQuery.of(context).size.width * widthFactor;
+    // Decode at display size, not the 1279×1737 source (~9 MB texture for a
+    // half-screen watermark): cacheWidth cuts GPU memory ~4x and keeps the
+    // push/pop transitions on this screen smooth on low-end GPUs.
+    final dpr = MediaQuery.of(context).devicePixelRatio;
+    final cacheWidth = (v * dpr).round().clamp(1, 1279);
     // Dim the ART only — a 5x4 color matrix scales RGB down and leaves alpha
     // untouched, so transparent PNG regions stay transparent (BlendMode.multiply
     // with a black paint would fill transparent pixels with translucent black
@@ -27,9 +32,10 @@ class BackgroundArt extends StatelessWidget {
         0, 0, 0, 1, 0,
       ]),
       child: Image.asset(
-        'assets/about_bg.png',
+        'assets/about_bg.webp',
         fit: BoxFit.contain,
         alignment: Alignment.bottomRight,
+        cacheWidth: cacheWidth,
         errorBuilder: (_, __, ___) => const SizedBox.shrink(),
       ),
     );

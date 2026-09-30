@@ -328,6 +328,64 @@ class LensStore {
   double get handleSize => (_prefs.getDouble(_kHandleSize) ?? 14).clamp(10, 22);
   Future<void> setHandleSize(double v) => _prefs.setDouble(_kHandleSize, v.clamp(10, 22));
 
+  // ── camera idle auto-off (heat management) ────────────────────────────────
+  // Minutes without a capture before the viewfinder shuts the camera (and the
+  // preview stream) down. 0 = never; the viewfinder re-opens on the next
+  // shutter / 启动预览 tap.
+  static const _kCameraIdleMin = 'lens.cameraIdleTimeoutMin';
+  int get cameraIdleTimeoutMin => _prefs.getInt(_kCameraIdleMin) ?? 5;
+  Future<void> setCameraIdleTimeoutMin(int v) => _prefs.setInt(_kCameraIdleMin, v);
+
+  // ── update availability (startup check result → Settings amber badge) ────
+  static const _kUpdateAvailable = 'lens.updateAvailable';
+  bool get updateAvailable => _prefs.getBool(_kUpdateAvailable) ?? false;
+  Future<void> setUpdateAvailable(bool v) => _prefs.setBool(_kUpdateAvailable, v);
+
+  // ── history auto-clean ────────────────────────────────────────────────────
+  // Periodic wipe of send history (records + archived images). Pairing and
+  // connection memories are NEVER touched — only the lens.history blob.
+  static const _kHistoryAutoClean = 'lens.historyAutoClean';
+  static const _kHistoryLastCleanAt = 'lens.historyLastCleanAt';
+  static const historyCleanOff = 'off';
+  static const historyCleanStartup = 'startup';
+  static const historyCleanDaily = 'daily';
+  static const historyCleanWeekly = 'weekly';
+  static const historyCleanMonthly = 'monthly';
+  String get historyAutoClean => _prefs.getString(_kHistoryAutoClean) ?? historyCleanOff;
+
+  /// Persist the mode; periodic modes start counting from NOW so the first
+  /// wipe lands one full period later (not instantly).
+  Future<void> setHistoryAutoClean(String v) async {
+    await _prefs.setString(_kHistoryAutoClean, v);
+    if (v != historyCleanOff) {
+      await _prefs.setInt(_kHistoryLastCleanAt, DateTime.now().millisecondsSinceEpoch);
+    }
+  }
+
+  int get historyLastCleanAt => _prefs.getInt(_kHistoryLastCleanAt) ?? 0;
+  Future<void> setHistoryLastCleanAt(int v) => _prefs.setInt(_kHistoryLastCleanAt, v);
+
+  /// Run at app start: wipe send history when the selected period is due.
+  Future<void> maybeAutoCleanHistory() async {
+    final mode = historyAutoClean;
+    if (mode == historyCleanOff) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var due = mode == historyCleanStartup;
+    if (!due) {
+      const day = 24 * 60 * 60 * 1000;
+      final interval = switch (mode) {
+        historyCleanDaily => day,
+        historyCleanWeekly => 7 * day,
+        historyCleanMonthly => 30 * day,
+        _ => 0,
+      };
+      due = interval > 0 && now - historyLastCleanAt >= interval;
+    }
+    if (!due) return;
+    await clearHistory();
+    await setHistoryLastCleanAt(now);
+  }
+
   final SharedPreferences _prefs;
   LensStore(this._prefs) {
     _migrateLegacy();

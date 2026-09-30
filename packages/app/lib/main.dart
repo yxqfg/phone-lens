@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/api.dart';
+import 'core/global_link.dart';
 import 'core/routes.dart';
 import 'core/update_check.dart';
 import 'core/upload_queue.dart';
@@ -24,6 +25,8 @@ Future<void> main() async {
   // restore the on-disk upload queue and resume any shots a previous session
   // left behind — before the first frame, so the badge is correct immediately
   await UploadQueue.instance.init(store);
+  // periodic send-history wipe selected by the user (startup / daily / …)
+  await store.maybeAutoCleanHistory();
   runApp(LensApp(store: store));
 }
 
@@ -65,14 +68,15 @@ class _HomeScreenState extends State<HomeScreen> {
     _maybeAutoCheckUpdate();
   }
 
-  /// Startup update check: once a day at most, fully silent unless a newer
-  /// release is actually available (failed feeds never surface to the user;
-  /// manual checks live in Settings → 检查更新).
+  /// Startup update check: EVERY launch (user request — no daily throttle).
+  /// Silent on failure; a newer release pops the dialog AND lights the amber
+  /// "有更新!" badge next to Settings → 检查更新.
   Future<void> _maybeAutoCheckUpdate() async {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - widget.store.lastUpdateCheckAt < const Duration(hours: 24).inMilliseconds) return;
-    await widget.store.setLastUpdateCheckAt(now);
     final info = await checkForUpdate();
+    if (!mounted) return;
+    final newer = info?.isNewer ?? false;
+    await widget.store.setUpdateAvailable(newer);
+    globalUpdateAvailable.value = newer;
     if (info == null || !info.isNewer || !mounted || _updateDialogShown) return;
     _updateDialogShown = true;
     await showUpdateDialog(context, info);

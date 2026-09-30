@@ -34,6 +34,18 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // Ship ARM64 + legacy 32-bit ARM, drop x86_64 (Intel tablets /
+            // emulators — not a target audience). The universal release packed
+            // three copies of the Flutter engine + ML Kit native libs
+            // (~74 MB APK). Requires disable-abi-filtering=true in
+            // gradle.properties, or the Flutter Gradle plugin resets these
+            // filters back to all platforms. Debug builds keep all ABIs so
+            // emulator debugging still works.
+            ndk {
+                abiFilters.clear()
+                abiFilters.add("arm64-v8a")
+                abiFilters.add("armeabi-v7a")
+            }
             // ML Kit registrars are reflectively instantiated; keep rules in
             // proguard-rules.pro stop R8 from stripping them in release builds.
             proguardFiles(

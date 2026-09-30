@@ -49,3 +49,4 @@ local-*/
 #     source (dshmarket / dsh plugin add <repo>) need no build step;
 #     regenerate with `pnpm build`. Only source maps stay out. ─────────
 packages/phone-lens/lib/*.map
+.mimosa/

@@ -80,6 +80,15 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   int _snapNulls = 0; // copyYuv420 returned null
   int _gapDrops = 0; // frames dropped by the fps throttle
 
+  // ── idle auto camera-off (heat management) ────────────────────────────────
+  // After store.cameraIdleTimeoutMin without a capture the camera AND the
+  // preview stream are shut down. Every passive re-open path (didPopNext /
+  // app resume / crop-screen return) must honour the shutdown — only an
+  // explicit shutter / 启动预览 / 设为主机 tap re-opens the camera.
+  Timer? _idleTimer;
+  DateTime _lastCamActivity = DateTime.now();
+  bool _autoClosed = false;
+
   PairedServer? get _server => widget.store.server;
 
   @override
@@ -89,6 +98,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _initCamera();
     _connectSocket();
     _initOrientation();
+    _idleTimer = Timer.periodic(const Duration(seconds: 10), (_) => _idleCheck());
   }
 
   /// Track physical device orientation via the accelerometer, so the rotation
@@ -186,6 +196,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   bool _jpegStreamMode = false;
 
   Future<void> _initCamera() async {
+    // Idle auto-off fired earlier: every PASSIVE path lands here (crop-screen
+    // return, app foreground, tab return) and must NOT re-open the camera.
+    // Only the explicit user taps clear _autoClosed first.
+    if (_autoClosed) return;
     if (_cameraInitBusy) {
       _cameraInitPending = true; // re-run after the in-flight one settles
       return;
@@ -232,6 +246,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           _jpegStreamMode = jpeg;
         });
         debugPrint('[lens-mate] camera stream mode: yuv420(hand-assembled) — jpeg stream delivers no frames on this device');
+        _touchCamera(); // camera (re)opened = idle clock restarts
         // preview streaming defaults ON — it's a framing aid, not a video
         // upload; users turn it off explicitly when they want to.
         // A host-paused phone must NOT resume by itself (multi-device rule),
@@ -261,6 +276,42 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     final f = cam?.dispose();
     if (f != null) _cameraDisposing = f;
     await f;
+  }
+
+  // ── idle auto-off ──────────────────────────────────────────────────────────
+
+  void _touchCamera() => _lastCamActivity = DateTime.now();
+
+  /// Every 10s: shut the camera down after N idle minutes (no capture).
+  Future<void> _idleCheck() async {
+    if (!mounted || _autoClosed || !cameraReadyCheck) return;
+    final min = widget.store.cameraIdleTimeoutMin;
+    if (min <= 0) return; // 不自动关闭
+    if (DateTime.now().difference(_lastCamActivity).inMinutes < min) return;
+    await _autoCloseCamera();
+  }
+
+  /// Heat/Power valve: kill the camera AND the preview stream, black out the
+  /// viewfinder with a notice. `_userStopped` is set too so the existing
+  /// auto-stream gate in [_initCamera] also stays shut for passive paths.
+  Future<void> _autoCloseCamera() async {
+    _autoClosed = true;
+    _userStopped = true;
+    await _stopStream();
+    await _releaseCamera();
+    debugPrint('[lens-mate] idle ${widget.store.cameraIdleTimeoutMin}min → camera auto-closed');
+    if (mounted) setState(() {});
+  }
+
+  /// Explicit user intent (shutter / 启动预览 / 设为主机): the ONLY way out of
+  /// the idle shutdown. Re-opens the camera, then the caller proceeds.
+  Future<bool> _reviveFromAutoClose() async {
+    if (!_autoClosed) return true;
+    _autoClosed = false;
+    if (mounted) setState(() {});
+    await _initCamera(); // _userStopped still true → no auto stream here
+    _touchCamera();
+    return cameraReadyCheck;
   }
 
   bool _authProbeDone = false; // one 401 probe per link lifetime
@@ -386,12 +437,61 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       _socket?.reportCapture(cmd.captureId, 'declined', 'busy');
       return;
     }
+    // A remote shutter is still a user action: it must wake the camera from
+    // the idle shutdown exactly like the on-screen shutter does.
+    if (_autoClosed) {
+      _reviveFromAutoClose().then((ok) {
+        if (!ok) {
+          _socket?.reportCapture(cmd.captureId, 'failed', 'camera unavailable');
+          return;
+        }
+        _shoot(captureId: cmd.captureId, note: cmd.note);
+      });
+      return;
+    }
     _shoot(captureId: cmd.captureId, note: cmd.note);
   }
 
   /// Make THIS phone the active preview/shutter device: tell the host to
   /// switch the PC preview to us (it pauses every other phone), and make sure
   /// our own preview stream is running.
+  /// Shutter tap, including from the idle-shutdown black screen. The FIRST
+  /// tap after an idle shutdown only wakes the camera (user asked for this:
+  /// a blind shot right after revive is a surprise) — the second tap shoots
+  /// with the live preview already up. From the normal ready state it shoots
+  /// immediately as before.
+  Future<void> _shutterTap() async {
+    if (_sending) return;
+    if (!cameraReadyCheck) {
+      _toast(_autoClosed ? '已唤醒摄像头,再点一次拍摄' : '正在打开摄像头…');
+      // revive failed → _initCamera already surfaced _cameraError
+      if (!await _reviveFromAutoClose()) return;
+      return; // this tap woke the camera; the next one shoots
+    }
+    await _shoot();
+  }
+
+  /// 启动预览 tap, including from the idle shutdown: revive the camera, then
+  /// run the normal toggle (host-paused gets its usual toast; a successful
+  /// start clears _userStopped).
+  Future<void> _previewTap() async {
+    if (!cameraReadyCheck) {
+      _toast('正在打开摄像头…');
+      if (!await _reviveFromAutoClose()) return;
+    }
+    await _toggleStream();
+    _touchCamera();
+  }
+
+  /// 设为主机 tap, including from the idle shutdown.
+  Future<void> _makeMainTap() async {
+    if (!cameraReadyCheck) {
+      _toast('正在打开摄像头…');
+      if (!await _reviveFromAutoClose()) return;
+    }
+    await _makeMain();
+  }
+
   Future<void> _makeMain() async {
     if (_socket == null) return;
     // claim_active is only delivered on a live socket — a dead link would
@@ -560,6 +660,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     // the upload happens in the background queue, so the next shot is ready
     // as soon as this one is safely on disk.
     setState(() => _sending = true);
+    _touchCamera(); // a capture — local or remote — is the idle-reset event
     try {
       final file = await camera.takePicture();
       var bytes = await File(file.path).readAsBytes();
@@ -810,6 +911,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _accelSub?.cancel();
     _cmdSub?.cancel();
     _fpsTimer?.cancel();
+    _idleTimer?.cancel();
     _focusHideTimer?.cancel();
     // a toast mid-flight would otherwise linger on the next screen forever
     _toastEntry?.remove();
@@ -832,35 +934,52 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           // thin status strip (outside the video, always readable)
           _topStrip(context),
           Expanded(
-            child: _cameraError != null
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(_cameraError!, style: const TextStyle(color: Colors.white70), textAlign: TextAlign.center),
-                          const SizedBox(height: 14),
-                          Row(
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                _cameraError != null
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              TextButton.icon(
-                                icon: const Icon(Icons.refresh, size: 18),
-                                label: const Text('重试'),
-                                onPressed: _initCamera,
-                              ),
-                              TextButton.icon(
-                                icon: const Icon(Icons.settings, size: 18),
-                                label: const Text('应用设置'),
-                                onPressed: openAppSettings,
+                              Text(_cameraError!, style: const TextStyle(color: Colors.white70), textAlign: TextAlign.center),
+                              const SizedBox(height: 14),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  TextButton.icon(
+                                    icon: const Icon(Icons.refresh, size: 18),
+                                    label: const Text('重试'),
+                                    onPressed: _initCamera,
+                                  ),
+                                  TextButton.icon(
+                                    icon: const Icon(Icons.settings, size: 18),
+                                    label: const Text('应用设置'),
+                                    onPressed: openAppSettings,
+                                  ),
+                                ],
                               ),
                             ],
                           ),
-                        ],
-                      ),
-                    ),
-                  )
-                : _previewOrEmpty(),
+                        ),
+                      )
+                    : _previewOrEmpty(),
+                // idle-shutdown notice: full black veil OVER the (dead) preview
+                // area, UNDER the shutter chrome so the user can revive without
+                // hunting for a hidden control.
+                if (_autoClosed) _autoClosedOverlay(),
+                // chrome lives here (not inside the camera stack) so the
+                // shutter stays reachable in EVERY state — including the idle
+                // shutdown, where reviving the camera is the whole point.
+                if (_cameraError == null)
+                  Align(
+                    alignment: Alignment.bottomCenter,
+                    child: _chromeBar(),
+                  ),
+              ],
+            ),
           ),
         ],
       ),
@@ -1094,11 +1213,6 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     );
   }
 
-  /// Full-ratio preview (contain — never cropped, WYSIWYG). The preview frame
-  /// stays PORTRAIT regardless of how the phone is held (it doesn't rotate with
-  /// the device); only the shutter bar flips 90° to the side the phone is held
-  /// toward, so the controls are natural when griped sideways. The PC rotation
-  /// is driven by the sensor, so it's independent of system auto-rotate.
   Widget _previewArea(CameraController c) {
     final ps = c.value.previewSize;
     final w = (ps?.width ?? 360).toDouble();
@@ -1106,9 +1220,63 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     final shortSide = w < hh ? w : hh;
     final longSide = w < hh ? hh : w;
     final aspect = shortSide / longSide; // preview always portrait (not rotated)
-    final shutter = _physLandscape ? 54.0 : 78.0;
 
-    final chrome = Container(
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // black letterbox bars come from the scaffold background
+        Center(
+          child: AspectRatio(
+            aspectRatio: aspect,
+            child: CameraPreview(c),
+          ),
+        ),
+        if (widget.store.focusEnabled)
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTapUp: (d) => _onFocusTap(c, d.localPosition),
+              onLongPress: () => _onFocusLock(c),
+            ),
+          ),
+        _focusIndicator(),
+        if (_focusLocked && _showFocus) _focusLockBanner(),
+        _queueBadge(),
+      ],
+    );
+  }
+
+  /// Black veil for the idle shutdown, per spec: 主屏黑屏 + 提示文字.
+  Widget _autoClosedOverlay() {
+    return const Positioned.fill(
+      child: ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.videocam_off_outlined, color: Colors.white38, size: 42),
+              SizedBox(height: 12),
+              Text('长时间无操作,已关闭摄像头', style: TextStyle(color: Colors.white, fontSize: 16)),
+              SizedBox(height: 10),
+              Text(
+                '点拍摄键或「启动预览」立即重新打开',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.6),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Shutter bar (相册/裁剪/快门/启动预览/设为主机). Rendered OUTSIDE the camera
+  /// stack, at the bottom of the viewfinder in every non-error state, so the
+  /// camera can always be (re)started from where the user already is.
+  Widget _chromeBar() {
+    final shutter = _physLandscape ? 54.0 : 78.0;
+    return Container(
       padding: EdgeInsets.symmetric(
         vertical: _physLandscape ? 6 : 14,
         horizontal: _physLandscape ? 12 : 18,
@@ -1139,7 +1307,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             onTap: () => setState(() => _cropBeforeSend = !_cropBeforeSend),
           ),
           GestureDetector(
-            onTap: cameraReadyCheck && !_sending ? () => _shoot() : null,
+            onTap: !_sending ? _shutterTap : null,
             child: Container(
               width: shutter,
               height: shutter,
@@ -1165,47 +1333,17 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             rotate: _physLandscape,
             icon: _streaming ? Icons.videocam : Icons.videocam_off_outlined,
             label: _streaming ? '停止预览' : '启动预览',
-            onTap: cameraReadyCheck ? _toggleStream : null,
+            onTap: _previewTap,
           ),
           _chromeButton(
             compact: _physLandscape,
             rotate: _physLandscape,
             icon: Icons.cast_connected,
             label: '设为主机',
-            onTap: _socket != null && cameraReadyCheck ? _makeMain : null,
+            onTap: _socket != null ? _makeMainTap : null,
           ),
         ],
       ),
-    );
-
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        // black letterbox bars come from the scaffold background
-        Center(
-          child: AspectRatio(
-            aspectRatio: aspect,
-            child: CameraPreview(c),
-          ),
-        ),
-        if (widget.store.focusEnabled)
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onTapUp: (d) => _onFocusTap(c, d.localPosition),
-              onLongPress: () => _onFocusLock(c),
-            ),
-          ),
-        _focusIndicator(),
-        if (_focusLocked && _showFocus) _focusLockBanner(),
-        _queueBadge(),
-        // shutter chrome stays on the bottom; when held sideways only the
-        // individual controls rotate 90° (labels stay readable toward the grip)
-        Align(
-          alignment: Alignment.bottomCenter,
-          child: chrome,
-        ),
-      ],
     );
   }
 

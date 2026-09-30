@@ -1,7 +1,7 @@
 name: lens_mate
 description: "PhoneLens — phone camera → dsh session over LAN/USB."
 publish_to: 'none'
-version: 0.3.11+4
+version: 1.0.0+5
 
 environment:
   sdk: ^3.13.0
@@ -14,7 +14,6 @@ dependencies:
   web_socket_channel: ^3.0.1
   mobile_scanner: ^5.2.3
   image: ^4.3.0
-  image_cropper: ^8.0.2
   shared_preferences: ^2.3.2
   permission_handler: ^11.3.1
   http: ^1.2.2
@@ -36,4 +35,4 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/about_bg.png
+    - assets/about_bg.webp

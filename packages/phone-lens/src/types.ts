@@ -72,6 +72,11 @@ export type CameraControl =
   | { type: "capture_result"; captureId: string; status: "taken" | "declined" | "failed"; detail?: string }
   // phone→host: make THIS phone the active preview/shutter device
   | { type: "claim_active" }
+  // app-level keepalive (both directions): the phone pings every 10s and the
+  // host answers pong — a half-open TCP (wifi switch, host reboot) would
+  // otherwise stay "connected" for OS-internal timeouts on both sides
+  | { type: "ping" }
+  | { type: "pong" }
   // host→phone: another device owns the PC preview; stop/start streaming
   | { type: "pause_preview" }
   | { type: "resume_preview" };

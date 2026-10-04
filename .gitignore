@@ -50,3 +50,6 @@ local-*/
 #     regenerate with `pnpm build`. Only source maps stay out. ─────────
 packages/phone-lens/lib/*.map
 .mimosa/
+
+# ── local AI tooling ──────────────────────────────────────────
+.zcodeignore

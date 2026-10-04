@@ -214,15 +214,6 @@ class _CaptureSettingsPageState extends State<CaptureSettingsPage> {
           ),
           const SectionHeader('画面'),
           SwitchListTile(
-            title: const Text('颜色校正(红蓝互换)'),
-            subtitle: const Text('当预览画面出现红/蓝色通道颠倒或肤色失真时启用；不同设备色度通道布局可能不同'),
-            value: widget.store.chromaSwap,
-            onChanged: (v) async {
-              await widget.store.setChromaSwap(v);
-              if (mounted) setState(() {});
-            },
-          ),
-          SwitchListTile(
             title: const Text('取景对焦'),
             subtitle: const Text('开启后可在取景画面点击对焦、长按锁定对焦；关闭则使用相机自动对焦'),
             value: widget.store.focusEnabled,

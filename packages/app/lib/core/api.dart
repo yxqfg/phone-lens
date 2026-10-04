@@ -249,7 +249,6 @@ class LensStore {
   static const _kPreview = 'lens.preview';
   static const _kPreviewParams = 'lens.previewParams';
   static const _kHistoryMode = 'lens.historyMode';
-  static const _kChromaSwap = 'lens.chromaSwap';
   static const _kCropRatio = 'lens.cropRatio';
   static const _kHandleSize = 'lens.handleSize';
   static const _kFocusEnabled = 'lens.focusEnabled';
@@ -265,10 +264,13 @@ class LensStore {
   static const qualityMedium = 'medium';
   static const qualityLow = 'low';
 
+  /// Fresh installs default to medium (volume ≈ 1/3 of the original at
+  /// near-lossless quality). An EXPLICIT choice — including high — is
+  /// honoured forever once written to prefs.
   String get uploadQuality {
     final v = _prefs.getString(_kUploadQuality);
-    if (v != null && (v == qualityMedium || v == qualityLow)) return v;
-    return qualityHigh;
+    if (v != null && (v == qualityHigh || v == qualityMedium || v == qualityLow)) return v;
+    return qualityMedium;
   }
 
   Future<void> setUploadQuality(String v) => _prefs.setString(_kUploadQuality, v);
@@ -312,12 +314,6 @@ class LensStore {
   /// unreachable. Off by default; the user opts in from Settings.
   bool get autoSelect => _prefs.getBool(_kAutoSelect) ?? false;
   Future<void> setAutoSelect(bool v) => _prefs.setBool(_kAutoSelect, v);
-
-  /// Manual chroma correction: swaps U/V when a device's plane layout makes
-  /// preview colors flip (red↔blue). Persisted per-phone; changes apply to
-  /// the very next preview frame.
-  bool get chromaSwap => _prefs.getBool(_kChromaSwap) ?? false;
-  Future<void> setChromaSwap(bool v) => _prefs.setBool(_kChromaSwap, v);
 
   /// Default crop frame = a box of this fraction of the image, centered
   /// (0.5 → the middle half). Configurable from Settings.
@@ -389,6 +385,9 @@ class LensStore {
   final SharedPreferences _prefs;
   LensStore(this._prefs) {
     _migrateLegacy();
+    // the chroma-swap toggle was removed with the color-correction feature;
+    // clear the stale key so prefs don't carry dead state forever
+    _prefs.remove('lens.chromaSwap');
   }
 
   // ── paired receivers ────────────────────────────────────────────────────

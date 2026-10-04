@@ -68,14 +68,12 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
   // POST /upload idempotency: the phone's upload queue retries with a stable
   // uploadId, and a retry after a lost response must not store/inject twice.
   const uploadReplays = new Map<string, { expires: number; body: unknown }>();
-  let currentCameraDeviceId: string | null = null;
   const injectionBox: { last: { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null } = { last: null };
 
   const server: HttpServer = createServer((req, res) => {
     handle(deps, req, res, {
       pairLimiter,
       uploadReplays,
-      getCurrentCamera: () => currentCameraDeviceId,
       noteInjection: (receipt, attachmentId) => {
         injectionBox.last = { at: Date.now(), sessionId: receipt.sessionId, attachmentId, ok: receipt.ok };
       },
@@ -101,7 +99,6 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
       const record = devices.authenticate(deviceId, token);
       if (!record) return done(401, "Unauthorized");
       wss.handleUpgrade(req, socket, head, (ws) => {
-        currentCameraDeviceId = record.deviceId;
         hub.attachCamera(record.deviceId, ws, record.name);
       });
       return;
@@ -149,7 +146,6 @@ type RouteCtx = {
   pairLimiter: RateLimiter;
   /** uploadId → cached 200 response, so queued-upload retries are idempotent. */
   uploadReplays: Map<string, { expires: number; body: unknown }>;
-  getCurrentCamera: () => string | null;
   noteInjection: (receipt: DeliveryReceipt, attachmentId: string) => void;
   getLastInjection: () => { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null;
 };
@@ -379,10 +375,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   }
 
   if (method === "GET" && path === "/status") {
-    const cameraDeviceId = ctx.getCurrentCamera();
+    // online/streaming reflect the hub's LIVE uplinks — the phone's
+    // auto-switch and auth probes read this, so a detached device must not
+    // linger as "online" off a stale attach-time marker
+    const online = hub.onlineDeviceIds();
     return sendJson(res, 200, {
       bootAt: SERVER_BOOT_AT,
-      devices: devices.list().map((d) => ({ id: d.deviceId, name: d.name, model: d.model, online: d.deviceId === cameraDeviceId, streaming: d.deviceId === cameraDeviceId, lastSeenAt: d.lastSeenAt })),
+      devices: devices.list().map((d) => ({ id: d.deviceId, name: d.name, model: d.model, online: online.has(d.deviceId), streaming: online.has(d.deviceId), lastSeenAt: d.lastSeenAt })),
       camera: hub.stats(),
       preview: config.preview,
       target: { mode: targets.mode(), sessionId: targets.resolve()?.sessionId ?? null },

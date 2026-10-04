@@ -77,8 +77,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final active = widget.store.server;
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
-      body: ListView(
+      // The illustration is a FIXED watermark pinned to the viewport's
+      // bottom-right (below the scroll layer, tap-transparent) — as an inline
+      // list footer it sat wherever the content happened to end, leaving a
+      // large gap to the screen bottom whenever the list was shorter than
+      // one viewport.
+      body: Stack(
         children: [
+          const BackgroundArt(positioned: true, widthFactor: 0.45),
+          ListView(
+            children: [
           ListTile(
             leading: const Icon(Icons.computer_outlined),
             title: const Text('连接与配对'),
@@ -148,9 +156,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               MaterialPageRoute(builder: (_) => const AboutScreen()),
             ),
           ),
-          const Padding(
-            padding: EdgeInsets.only(top: 8),
-            child: BackgroundArt(positioned: false, widthFactor: 0.45),
+            ],
           ),
         ],
       ),

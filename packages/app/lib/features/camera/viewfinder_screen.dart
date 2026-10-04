@@ -99,6 +99,19 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _connectSocket();
     _initOrientation();
     _idleTimer = Timer.periodic(const Duration(seconds: 10), (_) => _idleCheck());
+    // camera re-open gating is tab-aware: coming back from another tab must
+    // restore the camera (a covering route may have released it), but the
+    // re-open itself is deferred to exactly that moment
+    homeTab.addListener(_onHomeTabChanged);
+  }
+
+  /// IndexedStack fires no route/lifecycle events on tab switches, so this
+  /// listener is the only "viewfinder became visible again" signal. Reopens
+  /// the camera only if it isn't already up; `_autoClosed` (idle shutdown)
+  /// still requires an explicit shutter/preview tap.
+  void _onHomeTabChanged() {
+    if (!mounted || homeTab.value != 0 || cameraReadyCheck) return;
+    _initCamera();
   }
 
   /// Track physical device orientation via the accelerometer, so the rotation
@@ -123,18 +136,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             _physLeanLeft = leanLeft;
           });
           // re-announce rotation so the PC-side canvas follows the sensor
-          if (_streaming) {
-            final camera = _camera;
-            if (camera != null && camera.value.isInitialized) {
-              final ps = camera.value.previewSize;
-              _socket?.sendHello(
-                ps?.width.round() ?? 1280,
-                ps?.height.round() ?? 720,
-                widget.store.previewParams['fps'] ?? 10,
-                _streamRotation(),
-              );
-            }
-          }
+          if (_streaming) _announceStream();
         }
       });
     } catch (_) {
@@ -153,7 +155,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   void didPushNext() => _releaseCamera();
 
   @override
-  void didPopNext() => _initCamera();
+  void didPopNext() {
+    // back from a covering route (pair scanner, cropper, …): nudge the socket
+    // right away (it may have gone stale behind our back), but reopen the
+    // camera ONLY when the viewfinder is the visible tab — spinning up
+    // CameraX + the preview stream while the user pops back into the
+    // SETTINGS tab is invisible work that stuttered the pop transition
+    // (the "ghost frame" jank), on fast phones too.
+    _socket?.kick();
+    if (homeTab.value == 0) _initCamera();
+  }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
@@ -161,7 +172,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     if (state == AppLifecycleState.inactive) {
       _releaseCamera();
     } else if (state == AppLifecycleState.resumed) {
-      _initCamera();
+      // OS-frozen timers may have stalled the retry loop or left a half-open
+      // link undetected while we were away — nudge the socket right away
+      // instead of waiting out the backoff. The camera only comes back when
+      // the viewfinder is actually the visible tab (same gating as
+      // didPopNext); returning to the tab later reopens it.
+      _socket?.kick();
+      if (homeTab.value == 0) _initCamera();
     }
   }
 
@@ -172,16 +189,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     // handshake is the only channel that reports orientation).
     if (!mounted) return;
     setState(() {});
-    final camera = _camera;
-    if (_streaming && camera != null && camera.value.isInitialized) {
-      final ps = camera.value.previewSize;
-      _socket?.sendHello(
-        ps?.width.round() ?? 1280,
-        ps?.height.round() ?? 720,
-        widget.store.previewParams['fps'] ?? 10,
-        _streamRotation(),
-      );
-    }
+    if (_streaming) _announceStream();
   }
 
   bool _cameraInitBusy = false;
@@ -304,9 +312,18 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   }
 
   /// Explicit user intent (shutter / 启动预览 / 设为主机): the ONLY way out of
-  /// the idle shutdown. Re-opens the camera, then the caller proceeds.
+  /// the idle shutdown, and the generic "camera is down, bring it back" path
+  /// (e.g. released under a covering route while another tab was showing —
+  /// a remote shutter must self-heal that). Re-opens the camera, then the
+  /// caller proceeds.
   Future<bool> _reviveFromAutoClose() async {
-    if (!_autoClosed) return true;
+    if (!_autoClosed) {
+      if (!cameraReadyCheck) {
+        await _initCamera();
+        _touchCamera();
+      }
+      return cameraReadyCheck;
+    }
     _autoClosed = false;
     if (mounted) setState(() {});
     await _initCamera(); // _userStopped still true → no auto stream here
@@ -334,6 +351,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         _authProbeDone = false;
         _authFailed = false;
         UploadQueue.instance.kick(); // network is back — flush queued shots
+        // The stream survived the outage as DESIRED state; the new uplink has
+        // no meta yet. Re-announce so the PC-side canvas gets size + rotation
+        // immediately (resume_preview alone doesn't carry them).
+        if (_streaming && cameraReadyCheck) _announceStream();
       } else if (st == LensLinkState.disconnected) {
         _reconnectStreak++;
         _maybeProbeAuth();
@@ -438,8 +459,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       return;
     }
     // A remote shutter is still a user action: it must wake the camera from
-    // the idle shutdown exactly like the on-screen shutter does.
-    if (_autoClosed) {
+    // ANY down state — the idle auto-off, or released-under-a-covering-route
+    // while the user sits on another tab — exactly like the on-screen shutter.
+    if (!cameraReadyCheck) {
       _reviveFromAutoClose().then((ok) {
         if (!ok) {
           _socket?.reportCapture(cmd.captureId, 'failed', 'camera unavailable');
@@ -450,6 +472,21 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       return;
     }
     _shoot(captureId: cmd.captureId, note: cmd.note);
+  }
+
+  /// Re-announce the SENSOR frame shape + rotation to the host (the hello
+  /// handshake). Every "the PC needs to know our geometry" moment funnels
+  /// here: stream start, orientation change, and ws reconnect.
+  void _announceStream() {
+    final camera = _camera;
+    if (camera == null || !camera.value.isInitialized) return;
+    final ps = camera.value.previewSize;
+    _socket?.sendHello(
+      ps?.width.round() ?? 1280,
+      ps?.height.round() ?? 720,
+      widget.store.previewParams['fps'] ?? 10,
+      _streamRotation(),
+    );
   }
 
   /// Make THIS phone the active preview/shutter device: tell the host to
@@ -505,6 +542,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     // disagrees); this unblocks _startStream below
     if (mounted) setState(() => _hostPaused = false);
     if (cameraReadyCheck && !_streaming) await _startStream();
+    _touchCamera(); // explicit user action on the camera — idle clock restarts
     _toast('已设为主机,电脑端预览已切换为本机');
   }
 
@@ -538,13 +576,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     }
     // announce the SENSOR frame shape + rotation so PC-side canvases can
     // draw it upright (rotation is a display-side concern now)
-    final ps = camera.value.previewSize;
-    _socket?.sendHello(
-      ps?.width.round() ?? 1280,
-      ps?.height.round() ?? 720,
-      widget.store.previewParams['fps'] ?? 10,
-      _streamRotation(),
-    );
+    _announceStream();
   }
 
   Future<void> _stopStream() async {
@@ -624,7 +656,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       _busyDrops++;
       return;
     }
-    final snap = copyYuv420(image, swapChroma: widget.store.chromaSwap);
+    final snap = copyYuv420(image);
     if (snap == null) {
       _snapNulls++;
       return;
@@ -908,6 +940,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     routeObserver.unsubscribe(this);
+    homeTab.removeListener(_onHomeTabChanged);
     _accelSub?.cancel();
     _cmdSub?.cancel();
     _fpsTimer?.cancel();

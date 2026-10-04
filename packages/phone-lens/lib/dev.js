@@ -858,13 +858,11 @@ async function startLensServer(deps) {
 	const { config: config$1, pairing: pairing$1, devices: devices$1, hub: hub$1, targets: targets$1, sink: sink$1, log: log$1 } = deps;
 	const pairLimiter = new RateLimiter(6e4, 10);
 	const uploadReplays = new Map();
-	let currentCameraDeviceId = null;
 	const injectionBox = { last: null };
 	const server = createServer((req, res) => {
 		handle$1(deps, req, res, {
 			pairLimiter,
 			uploadReplays,
-			getCurrentCamera: () => currentCameraDeviceId,
 			noteInjection: (receipt, attachmentId) => {
 				injectionBox.last = {
 					at: Date.now(),
@@ -900,7 +898,6 @@ async function startLensServer(deps) {
 			const record = devices$1.authenticate(deviceId, token);
 			if (!record) return done(401, "Unauthorized");
 			wss.handleUpgrade(req, socket, head, (ws) => {
-				currentCameraDeviceId = record.deviceId;
 				hub$1.attachCamera(record.deviceId, ws, record.name);
 			});
 			return;
@@ -1161,15 +1158,15 @@ async function handle$1(deps, req, res, ctx) {
 		}
 	}
 	if (method === "GET" && path === "/status") {
-		const cameraDeviceId = ctx.getCurrentCamera();
+		const online = hub$1.onlineDeviceIds();
 		return sendJson(res, 200, {
 			bootAt: SERVER_BOOT_AT,
 			devices: devices$1.list().map((d) => ({
 				id: d.deviceId,
 				name: d.name,
 				model: d.model,
-				online: d.deviceId === cameraDeviceId,
-				streaming: d.deviceId === cameraDeviceId,
+				online: online.has(d.deviceId),
+				streaming: online.has(d.deviceId),
 				lastSeenAt: d.lastSeenAt
 			})),
 			camera: hub$1.stats(),
@@ -1216,6 +1213,7 @@ async function handle$1(deps, req, res, ctx) {
 	return sendError(res, 404, ERROR_CODES.BAD_REQUEST, `no route ${method} ${path}`);
 }
 /** Strip path separators / reserved characters so a phone-supplied upload
+
 *  name can never escape the target directory or hide as a dotfile. */
 function sanitizeFileName(input) {
 	const base = basename(input).replace(/[<>:"|?*\u0000-\u001F]/g, "_").replace(/^[\s.]+/, "").trim();
@@ -1233,13 +1231,17 @@ function nextAvailableName(dir, name) {
 	}
 }
 /** Pending-staging filename for an attachment id. Ids may be URN-ish
+
 *  ("file:<digest>" without the dsh attachment service) and Windows forbids
+
 *  ":" in filenames — flatten to a portable name, write and read alike. */
 function pendingFileName(attachmentId) {
 	return `${attachmentId.replace(/[^A-Za-z0-9._-]/g, "_")}.jpg`;
 }
 /** Resolve `name` under `baseDir` and refuse anything that escapes it
+
 *  (defense in depth on top of sanitizeFileName — e.g. a crafted name that
+
 *  survives sanitization but still resolves outside the base). */
 function resolveUnder(baseDir, name) {
 	const base = resolve(baseDir);
@@ -1321,6 +1323,18 @@ async function pruneUploads(dir, max) {
 //#region src/server/hub.ts
 /**
 
+* A camera uplink with NO inbound traffic for this long is presumed half-open
+
+* (phone switched wifi / laptop slept mid-link): the OS keeps the socket
+
+* "open" without a FIN, so we evict it ourselves. Generous vs the phone's own
+
+* 30s app-level silence limit so the phone normally tears down first.
+
+*/
+const CAM_SILENCE_MS = 6e4;
+/**
+
 * How long the ACTIVE device's stream may go silent before views are told the
 
 * preview was turned off. The phone app never announces "preview off" — it
@@ -1353,6 +1367,22 @@ const PREVIEW_STALL_MS = 3e3;
 var ViewHub = class {
 	cameras = new Map();
 	activeDeviceId = null;
+	/**
+	
+	* The device the flow last settled on EXPLICITLY: picked in the view,
+	
+	* claimed from a phone, or simply the first to come online. When that
+	
+	* device drops and a fallback takes over, detach does NOT clear this — so
+	
+	* the preferred phone reconnecting (network blip, host reboot, delayed
+	
+	* wifi join) takes its hot seat back instead of being parked as "another
+	
+	* device is using the preview". Any explicit switch updates it.
+	
+	*/
+	preferredDeviceId = null;
 	views = new Set();
 	/** captureId → { note, requestedAt } until the matching upload lands or timeout. */
 	pendingCaptures = new Map();
@@ -1385,12 +1415,16 @@ var ViewHub = class {
 			meta: {},
 			lastFrame: null,
 			lastFrameAt: 0,
+			lastSeenAt: Date.now(),
 			frameCount: 0,
 			windowStart: Date.now(),
 			measuredFps: 0
 		};
 		this.cameras.set(deviceId, cam);
-		if (this.activeDeviceId === null) this.activeDeviceId = deviceId;
+		if (this.activeDeviceId === null) {
+			this.activeDeviceId = deviceId;
+			this.preferredDeviceId = deviceId;
+		} else if (this.preferredDeviceId === deviceId && this.activeDeviceId !== deviceId) this.selectDevice(deviceId);
 		if (this.activeDeviceId === deviceId) this.sendControl(deviceId, { type: "resume_preview" });
 		else this.sendControl(deviceId, { type: "pause_preview" });
 		this.log("info", `camera uplink: ${name} (${deviceId.slice(0, 8)})`);
@@ -1398,7 +1432,13 @@ var ViewHub = class {
 			this.log("warn", `camera ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (${name} ${deviceId.slice(0, 8)})`);
 			if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
 		});
+		ws.on("pong", () => {
+			const c = this.cameras.get(deviceId);
+			if (c) c.lastSeenAt = Date.now();
+		});
 		ws.on("message", (data, isBinary) => {
+			const c = this.cameras.get(deviceId);
+			if (c) c.lastSeenAt = Date.now();
 			if (isBinary) {
 				this.ingestFrame(deviceId, data);
 				return;
@@ -1428,7 +1468,22 @@ var ViewHub = class {
 		this.broadcastDevices();
 	}
 	pingAll() {
-		for (const cam of this.cameras.values()) if (cam.ws.readyState === cam.ws.OPEN) cam.ws.ping();
+		const now = Date.now();
+		for (const [deviceId, cam] of this.cameras) {
+			if (cam.ws.readyState !== cam.ws.OPEN) continue;
+			if (now - cam.lastSeenAt > CAM_SILENCE_MS) {
+				this.log("warn", `camera uplink silent >${CAM_SILENCE_MS}ms — terminating ${deviceId.slice(0, 8)}`);
+				cam.ws.terminate();
+				continue;
+			}
+			cam.ws.ping();
+		}
+	}
+	/** Device ids with a live camera uplink right now (for /status truth). */
+	onlineDeviceIds() {
+		const ids = new Set();
+		for (const [deviceId, cam] of this.cameras) if (cam.ws.readyState === cam.ws.OPEN) ids.add(deviceId);
+		return ids;
 	}
 	onCameraControl(deviceId, msg) {
 		if (!msg) return;
@@ -1458,6 +1513,9 @@ var ViewHub = class {
 				break;
 			case "claim_active":
 				this.selectDevice(deviceId);
+				break;
+			case "ping":
+				this.sendControl(deviceId, { type: "pong" });
 				break;
 			case "capture_result":
 				if (msg.status !== "taken") {
@@ -1581,6 +1639,7 @@ var ViewHub = class {
 		const prevActive = this.activeDeviceId;
 		if (prevActive === deviceId) return;
 		this.activeDeviceId = deviceId;
+		this.preferredDeviceId = deviceId;
 		if (prevActive) this.sendControl(prevActive, { type: "pause_preview" });
 		this.sendControl(deviceId, { type: "resume_preview" });
 		this.broadcastDevices();

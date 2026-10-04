@@ -70,7 +70,7 @@ void _logPlaneCensus(CameraImage image) {
 /// Semi-planar devices interleave chroma in ONE buffer (plane[1]); this
 /// device delivers it in NV21 order — V first (yellow decoded greenish
 /// until we swapped). U/V both come from plane[1]; plane[2] is not trusted.
-YuvSnapshot? copyYuv420(CameraImage image, {bool swapChroma = false}) {
+YuvSnapshot? copyYuv420(CameraImage image) {
   try {
     _logPlaneCensus(image);
     Uint8List compactStride(Plane p, int w, int h, int offset) {
@@ -100,15 +100,8 @@ YuvSnapshot? copyYuv420(CameraImage image, {bool swapChroma = false}) {
     // So each plane's OWN offset-0 walk by pixelStride yields one pure
     // component: plane[1] → U, plane[2] → V. Reading both components out of
     // a single plane (the guess before the census) mixed them.
-    var uPlane = compactStride(image.planes[1], uvW, uvH, 0);
-    var vPlane = compactStride(image.planes[2], uvW, uvH, 0);
-    if (swapChroma) {
-      // manual color correction for devices whose layout differs; applies to
-      // both the native and the Dart encode paths (swap happens at the source)
-      final t = uPlane;
-      uPlane = vPlane;
-      vPlane = t;
-    }
+    final uPlane = compactStride(image.planes[1], uvW, uvH, 0);
+    final vPlane = compactStride(image.planes[2], uvW, uvH, 0);
     return YuvSnapshot(
       w,
       h,

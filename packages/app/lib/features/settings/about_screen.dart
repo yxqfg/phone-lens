@@ -1,13 +1,31 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../ui/background_art.dart';
 
 /// About & Help page: lens-mate info, a short onboarding flow, and connection
 /// troubleshooting. Content is scrollable; the illustration sits at the very
 /// bottom-right, dimmed, so it never fights the text.
-class AboutScreen extends StatelessWidget {
+class AboutScreen extends StatefulWidget {
   const AboutScreen({super.key});
+
+  @override
+  State<AboutScreen> createState() => _AboutScreenState();
+}
+
+class _AboutScreenState extends State<AboutScreen> {
+  // read from the built package (pubspec version) so this page never drifts
+  // from the real release again — it used to carry a stale hardcoded literal
+  String _version = '';
+
+  @override
+  void initState() {
+    super.initState();
+    PackageInfo.fromPlatform().then((info) {
+      if (mounted) setState(() => _version = info.version);
+    }).catchError((_) {});
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -41,18 +59,23 @@ class AboutScreen extends StatelessWidget {
             const _Step('拍摄模式', '电脑端小窗可选「自动注入对话 / 注入并存文件夹 / 仅存文件夹」;手机端发送成功的提示会随之变化。'),
             const _Step('多设备', '多个手机可同时配对;电脑端小窗可选看某台,双击设备名可重命名;未选中的手机会暂停预览但仍可上传。'),
             const _Step('设为主机', '取景页点「设为主机」自动开启本机预览,并把电脑端预览切换到本机,其他设备随即暂停。'),
+            const _Step('上传队列', '断网或电脑端未启动时,拍摄与相册发送的照片自动进入上传队列(取景页右上角角标);连接恢复后自动续传,失败可重试。'),
+            const _Step('上传画质', '设置 → 拍摄与上传:高(原图直传)/中(默认,体积约原图 1/3)/低(省流量)。'),
+            const _Step('空闲关相机', '长时间无拍摄自动关闭摄像头降温省电(默认 5 分钟);点拍摄键或「启动预览」立即恢复。'),
             const _Step('对焦', '设置 → 画面 → 「取景对焦」:开启后点击对焦、长按锁定对焦。'),
             const _Step('裁剪', '设置 → 裁剪:默认框选范围、手柄大小可调;裁剪页点 ✕ 丢弃、点「完成」输出。'),
             const _Step('批量上传', '相册多选直接批量发送;开启裁剪后逐张裁切并自动上传,中途点 ✕ 丢弃剩余全部。'),
+            const _Step('发送历史', '设置 → 发送历史:保留方式(仅记录/图片留档/不留痕迹)与定期自动清除可配;不影响配对记忆。'),
             const _Step('自动切换', '设置 → 配对与设备 → 「自动选择可用连接」:当前电脑不可达时自动切到可用的已配对电脑(默认关)。'),
+            const _Step('检查更新', '设置 → 检查更新;APP 启动时也会每日自动检查一次,有新版时在设置页提示。'),
             _section('连接与异常处理'),
             const _Step('配对失败', '确认手机与电脑在同一局域网;重新扫码(配对码15分钟有效,过期可点「刷新」)。'),
             const _Step('预览无画面', '检查手机取景页「启动预览」是否打开、电脑端接收服务(默认端口 8791)是否在运行;多设备时点「设为主机」或到电脑端选中本机。'),
-            const _Step('颜色异常', '设置 → 画面 → 打开「颜色校正(红蓝互换)」。'),
-            const _Step('连不上 / 频繁断开', '确认防火墙放行了接收服务端口(默认 8791,仅私有网段);手机与电脑用同一Wi-Fi或USB网络共享。'),
+            const _Step('连不上 / 频繁断开', '确认防火墙放行了接收服务端口(默认 8791,仅私有网段);手机与电脑用同一Wi-Fi或USB网络共享;网络切换后回到 App 会自动重连,也可上滑杀掉 App 后重开。'),
             const _Step('找不到配对入口', '设置 → 配对与设备 → 扫码新增配对。'),
             const _Step('本机提示“预览暂停”', '另一台手机正在使用电脑端预览;本机仍可上传图片,点「设为主机」即切回本机。'),
             const _Step('换网络后连不上', '开启「自动选择可用连接」,或在设置里点选另一台已配对电脑,选择「设为活动连接」。'),
+            const _Step('安装/更新 APP', '电脑端悬浮窗里的 APP 二维码可扫码直接下载最新安装包;或到 Gitee/GitHub 发行版页下载。'),
             const SizedBox(height: 8),
             const Padding(
               padding: EdgeInsets.fromLTRB(20, 6, 20, 6),
@@ -61,9 +84,12 @@ class AboutScreen extends StatelessWidget {
             const _Contact('Bilibili', '云下千风过'),
             const _Contact('GitHub', 'github.com/yxqfg/phone-lens'),
             const _Contact('插件市场', 'awesome-dsh-plugin/awesome-dsh-plugin'),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 16, 20, 8),
-              child: Text('v0.3.8 · PhoneLens 直连取景', style: TextStyle(color: Colors.white38, fontSize: 12)),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Text(
+                _version.isEmpty ? 'PhoneLens 直连取景' : 'v$_version · PhoneLens 直连取景',
+                style: const TextStyle(color: Colors.white38, fontSize: 12),
+              ),
             ),
             // illustration pinned at the very bottom-right of the scroll
             const Padding(

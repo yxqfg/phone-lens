@@ -102,7 +102,12 @@ class _HomeScreenState extends State<HomeScreen> {
       body: IndexedStack(index: _tab, children: pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
+        onDestinationSelected: (i) {
+          // publish FIRST so tab-aware listeners (viewfinder camera gating)
+          // see the new tab before this frame's rebuild
+          homeTab.value = i;
+          setState(() => _tab = i);
+        },
         destinations: const [
           NavigationDestination(icon: Icon(Icons.photo_camera), label: '取景'),
           NavigationDestination(icon: Icon(Icons.history), label: '历史'),

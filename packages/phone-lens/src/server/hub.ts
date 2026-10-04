@@ -9,10 +9,20 @@ interface CamState {
   meta: { width?: number; height?: number; fps?: number; rotation?: number };
   lastFrame: Buffer | null;
   lastFrameAt: number;
+  /** Any inbound traffic (frame, control, ws-pong) — drives the dead-link watchdog. */
+  lastSeenAt: number;
   frameCount: number;
   windowStart: number;
   measuredFps: number;
 }
+
+/**
+ * A camera uplink with NO inbound traffic for this long is presumed half-open
+ * (phone switched wifi / laptop slept mid-link): the OS keeps the socket
+ * "open" without a FIN, so we evict it ourselves. Generous vs the phone's own
+ * 30s app-level silence limit so the phone normally tears down first.
+ */
+const CAM_SILENCE_MS = 60_000;
 
 /**
  * How long the ACTIVE device's stream may go silent before views are told the
@@ -35,6 +45,15 @@ const PREVIEW_STALL_MS = 3_000;
 export class ViewHub {
   private cameras = new Map<string, CamState>();
   private activeDeviceId: string | null = null;
+  /**
+   * The device the flow last settled on EXPLICITLY: picked in the view,
+   * claimed from a phone, or simply the first to come online. When that
+   * device drops and a fallback takes over, detach does NOT clear this — so
+   * the preferred phone reconnecting (network blip, host reboot, delayed
+   * wifi join) takes its hot seat back instead of being parked as "another
+   * device is using the preview". Any explicit switch updates it.
+   */
+  private preferredDeviceId: string | null = null;
   private views = new Set<WebSocket>();
   /** captureId → { note, requestedAt } until the matching upload lands or timeout. */
   private pendingCaptures = new Map<string, { note?: string; requestedAt: number }>();
@@ -67,9 +86,16 @@ export class ViewHub {
       } catch {}
       this.cameras.delete(deviceId);
     }
-    const cam: CamState = { ws, name, meta: {}, lastFrame: null, lastFrameAt: 0, frameCount: 0, windowStart: Date.now(), measuredFps: 0 };
+    const cam: CamState = { ws, name, meta: {}, lastFrame: null, lastFrameAt: 0, lastSeenAt: Date.now(), frameCount: 0, windowStart: Date.now(), measuredFps: 0 };
     this.cameras.set(deviceId, cam);
-    if (this.activeDeviceId === null) this.activeDeviceId = deviceId;
+    if (this.activeDeviceId === null) {
+      this.activeDeviceId = deviceId;
+      this.preferredDeviceId = deviceId;
+    } else if (this.preferredDeviceId === deviceId && this.activeDeviceId !== deviceId) {
+      // the preferred phone is back and a fallback currently holds the hot
+      // seat it only got because the preferred one dropped — hand it back
+      this.selectDevice(deviceId);
+    }
     // only the ACTIVE device streams to the PC; others pause immediately
     if (this.activeDeviceId === deviceId) this.sendControl(deviceId, { type: "resume_preview" });
     else this.sendControl(deviceId, { type: "pause_preview" });
@@ -79,7 +105,13 @@ export class ViewHub {
       this.log("warn", `camera ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (${name} ${deviceId.slice(0, 8)})`);
       if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
     });
+    ws.on("pong", () => {
+      const c = this.cameras.get(deviceId);
+      if (c) c.lastSeenAt = Date.now();
+    });
     ws.on("message", (data, isBinary) => {
+      const c = this.cameras.get(deviceId);
+      if (c) c.lastSeenAt = Date.now();
       if (isBinary) {
         this.ingestFrame(deviceId, data as Buffer);
         return;
@@ -115,9 +147,29 @@ export class ViewHub {
   }
 
   pingAll(): void {
-    for (const cam of this.cameras.values()) {
-      if (cam.ws.readyState === cam.ws.OPEN) cam.ws.ping();
+    const now = Date.now();
+    for (const [deviceId, cam] of this.cameras) {
+      if (cam.ws.readyState !== cam.ws.OPEN) continue;
+      if (now - cam.lastSeenAt > CAM_SILENCE_MS) {
+        // No frames, no controls, no ws-pong: the phone is gone without a
+        // FIN (wifi hop). Terminate — the close handler detaches and the
+        // devices list tells the truth again. The phone's own 30s app-level
+        // watchdog normally tears its side down first.
+        this.log("warn", `camera uplink silent >${CAM_SILENCE_MS}ms — terminating ${deviceId.slice(0, 8)}`);
+        cam.ws.terminate();
+        continue;
+      }
+      cam.ws.ping();
     }
+  }
+
+  /** Device ids with a live camera uplink right now (for /status truth). */
+  onlineDeviceIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const [deviceId, cam] of this.cameras) {
+      if (cam.ws.readyState === cam.ws.OPEN) ids.add(deviceId);
+    }
+    return ids;
   }
 
   private onCameraControl(deviceId: string, msg: CameraControl | null): void {
@@ -141,6 +193,11 @@ export class ViewHub {
       case "claim_active":
         // phone asked to become the active device → switch the view to it.
         this.selectDevice(deviceId);
+        break;
+      case "ping":
+        // app-level keepalive echo (see types.ts); lets the phone detect a
+        // half-open link its OS would keep "connected" for minutes
+        this.sendControl(deviceId, { type: "pong" });
         break;
       case "capture_result":
         if (msg.status !== "taken") {
@@ -262,6 +319,7 @@ export class ViewHub {
     const prevActive = this.activeDeviceId;
     if (prevActive === deviceId) return;
     this.activeDeviceId = deviceId;
+    this.preferredDeviceId = deviceId;
     if (prevActive) this.sendControl(prevActive, { type: "pause_preview" });
     this.sendControl(deviceId, { type: "resume_preview" });
     this.broadcastDevices();

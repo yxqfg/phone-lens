@@ -24,23 +24,35 @@ class BackgroundArt extends StatelessWidget {
     // untouched, so transparent PNG regions stay transparent (BlendMode.multiply
     // with a black paint would fill transparent pixels with translucent black
     // and darken the whole canvas, which is the "screen goes dark" bug).
-    final art = ColorFiltered(
-      colorFilter: const ColorFilter.matrix(<double>[
-        0.55, 0, 0, 0, 0,
-        0, 0.55, 0, 0, 0,
-        0, 0, 0.55, 0, 0,
-        0, 0, 0, 1, 0,
-      ]),
-      child: Image.asset(
-        'assets/about_bg.webp',
-        fit: BoxFit.contain,
-        alignment: Alignment.bottomRight,
-        cacheWidth: cacheWidth,
-        errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+    final art = RepaintBoundary(
+      // isolate the (static) watermark's repaint from the surrounding page —
+      // without a boundary, every animation frame over this screen (page
+      // transitions, list scrolls) re-composited the ColorFiltered image too
+      child: ColorFiltered(
+        colorFilter: const ColorFilter.matrix(<double>[
+          0.55, 0, 0, 0, 0,
+          0, 0.55, 0, 0, 0,
+          0, 0, 0.55, 0, 0,
+          0, 0, 0, 1, 0,
+        ]),
+        child: Image.asset(
+          'assets/about_bg.webp',
+          fit: BoxFit.contain,
+          alignment: Alignment.bottomRight,
+          cacheWidth: cacheWidth,
+          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+        ),
       ),
     );
     if (positioned) {
-      return Positioned(right: 0, bottom: 0, width: v, child: art);
+      // IgnorePointer: as a Stack layer the art must never swallow taps meant
+      // for widgets underneath (settings tiles under the watermark).
+      return Positioned(
+        right: 0,
+        bottom: 0,
+        width: v,
+        child: IgnorePointer(child: art),
+      );
     }
     return Align(
       alignment: Alignment.bottomRight,

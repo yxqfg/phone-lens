@@ -1,4 +1,5 @@
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 import type { AdmittedImage, DeliveryReceipt, LensConfig } from "../types.js";
 import type { DeliverySink } from "./deliver.js";
 
@@ -71,13 +72,16 @@ export class HostDeliverySink implements DeliverySink {
       return { ok: false, sessionId: null, mode: "none", reason: "no active session" };
     }
     try {
-      const content: unknown[] = [
+      const content: ContentBlock[] = [
         { type: "text", text: note ?? this.config.inject.notePrefix },
         { type: "image", attachment: admitted.ref },
       ];
       const message = createUserMessage({
         content,
-        source: { kind: "plugin", plugin: "phone-lens" },
+        // v4 producer-owned source kind (see index.ts — the retired
+        // {kind:"plugin",plugin:...} wrapper is rejected by the session layer);
+        // `as never`: pinned 0.1.5 types predate the widened 0.2.0 kind union
+        source: { kind: "plugin:phone-lens" } as never,
       });
       this.log("info", `delivering image (${admitted.ref.attachmentId}) to session ${agent.session.id} via ${mode}`);
       if (mode === "steer") agent.steer(message);

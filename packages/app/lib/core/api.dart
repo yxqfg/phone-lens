@@ -252,6 +252,8 @@ class LensStore {
   static const _kCropRatio = 'lens.cropRatio';
   static const _kHandleSize = 'lens.handleSize';
   static const _kFocusEnabled = 'lens.focusEnabled';
+  static const _kRemoteCaptureAlert = 'lens.remoteCaptureAlert';
+  static const _kWakeFocusDelayMs = 'lens.wakeFocusDelayMs';
   static const _kAutoSelect = 'lens.autoSelect';
   static const _kDeviceId = 'lens.deviceId';
   static const _kDeviceName = 'lens.deviceName';
@@ -309,6 +311,26 @@ class LensStore {
   /// mode: no focus interaction, plain auto-focus).
   bool get focusEnabled => _prefs.getBool(_kFocusEnabled) ?? false;
   Future<void> setFocusEnabled(bool v) => _prefs.setBool(_kFocusEnabled, v);
+
+  /// Buzz + banner when the PC side asks THIS phone to shoot and upload
+  /// (remote shutter — user-fired from the web UI or model-initiated via the
+  /// camera tools). ON by default: the phone must speak up when someone else
+  /// drives its camera; this toggle is the opt-OUT.
+  bool get remoteCaptureAlert => _prefs.getBool(_kRemoteCaptureAlert) ?? true;
+  Future<void> setRemoteCaptureAlert(bool v) => _prefs.setBool(_kRemoteCaptureAlert, v);
+
+  /// Pause after the camera is WOKEN by a remote shutter before taking the
+  /// shot: a freshly-initialized camera hasn't converged auto-focus yet, so
+  /// an instant capture comes out blurry (0 = shoot immediately). Applies to
+  /// every PC-initiated capture — the web-UI shutter and the model's
+  /// phone_take_photo alike. Whitelisted steps only (Settings UI).
+  static const wakeFocusSteps = [0, 800, 1500, 3000];
+  int get wakeFocusDelayMs {
+    final v = _prefs.getInt(_kWakeFocusDelayMs) ?? 1500;
+    return wakeFocusSteps.contains(v) ? v : 1500;
+  }
+
+  Future<void> setWakeFocusDelayMs(int v) => _prefs.setInt(_kWakeFocusDelayMs, wakeFocusSteps.contains(v) ? v : 1500);
 
   /// Auto-select an available paired receiver when the current one becomes
   /// unreachable. Off by default; the user opts in from Settings.

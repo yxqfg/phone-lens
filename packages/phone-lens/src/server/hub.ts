@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
-import type { CameraControl, LensConfig, ViewClientMessage, ViewServerMessage } from "../types.js";
+import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, ViewClientMessage, ViewServerMessage } from "../types.js";
 
 /** Per-device camera uplink state; multiple phones coexist without kicking. */
 interface CamState {
   ws: WebSocket;
   name: string;
-  meta: { width?: number; height?: number; fps?: number; rotation?: number };
+  meta: { width?: number; height?: number; fps?: number; rotation?: number; appVersion?: string };
   lastFrame: Buffer | null;
   lastFrameAt: number;
   /** Any inbound traffic (frame, control, ws-pong) — drives the dead-link watchdog. */
@@ -14,6 +14,21 @@ interface CamState {
   frameCount: number;
   windowStart: number;
   measuredFps: number;
+}
+
+/**
+ * One in-flight capture request. Normal requests only track the note; model-
+ * initiated (direct) ones also carry the settle callbacks the tool awaits.
+ */
+interface PendingCapture {
+  note?: string;
+  requestedAt: number;
+  /** true = model-initiated (phone_take_photo): photo goes to the model, not the capture mode. */
+  direct?: boolean;
+  /** direct only: called once the uploaded photo is admitted. */
+  onImage?: (admitted: AdmittedImage) => void;
+  /** direct only: called when the phone declines/fails or the request times out. */
+  onFail?: (reason: string) => void;
 }
 
 /**
@@ -56,8 +71,10 @@ export class ViewHub {
   private preferredDeviceId: string | null = null;
   private views = new Set<WebSocket>();
   /** captureId → { note, requestedAt } until the matching upload lands or timeout. */
-  private pendingCaptures = new Map<string, { note?: string; requestedAt: number }>();
+  private pendingCaptures = new Map<string, PendingCapture>();
   private readonly captureTimeoutMs = 60_000;
+  /** reqId → settle callback for in-flight camera_idle/camera_resume requests. */
+  private cameraStateWaiters = new Map<string, { deviceId: string; settle: (r: CameraStateOutcome) => void }>();
   /** Whether the active device is confirmed to be streaming (hello/frame seen). */
   private previewOn = false;
   private stallTimer: ReturnType<typeof setInterval> | null = null;
@@ -73,6 +90,15 @@ export class ViewHub {
   dispose(): void {
     if (this.stallTimer) clearInterval(this.stallTimer);
     this.stallTimer = null;
+    // settle any in-flight model-tool requests so their promises don't dangle
+    for (const [id, waiter] of this.cameraStateWaiters) {
+      waiter.settle({ ok: false, reason: "接收端服务已停止" });
+      this.cameraStateWaiters.delete(id);
+    }
+    for (const [id, p] of this.pendingCaptures) {
+      p.onFail?.("接收端服务已停止");
+      this.pendingCaptures.delete(id);
+    }
   }
 
   // ── camera side ───────────────────────────────────────────────────────────
@@ -126,6 +152,14 @@ export class ViewHub {
     const cam = this.cameras.get(deviceId);
     this.log("warn", `detachCamera(${deviceId.slice(0, 8)}) had-camera=${!!cam}`);
     if (cam) this.cameras.delete(deviceId);
+    // the phone is GONE: any camera_idle/resume waiter aimed at it can never
+    // get a receipt — settle now with the real cause instead of the 8s timer
+    for (const [id, waiter] of this.cameraStateWaiters) {
+      if (waiter.deviceId === deviceId) {
+        waiter.settle({ ok: false, reason: "手机已断开连接" });
+        this.cameraStateWaiters.delete(id);
+      }
+    }
     if (this.activeDeviceId === deviceId) {
       const next = [...this.cameras.keys()].at(-1) ?? null;
       this.activeDeviceId = next;
@@ -178,7 +212,7 @@ export class ViewHub {
     if (!cam) return;
     switch (msg.type) {
       case "hello":
-        cam.meta = { width: msg.width, height: msg.height, fps: msg.fps, ...(msg.rotation !== void 0 ? { rotation: msg.rotation } : {}) };
+        cam.meta = { width: msg.width, height: msg.height, fps: msg.fps, ...(msg.rotation !== void 0 ? { rotation: msg.rotation } : {}), ...(msg.appVersion !== void 0 ? { appVersion: msg.appVersion } : {}) };
         if (this.activeDeviceId === deviceId) {
           // hello is the phone's "stream starting" announcement (sent on every
           // _startStream) — treat it as preview-on for the view side.
@@ -201,10 +235,27 @@ export class ViewHub {
         break;
       case "capture_result":
         if (msg.status !== "taken") {
+          const failed = this.pendingCaptures.get(msg.captureId);
+          failed?.onFail?.(`手机拒绝了拍摄(${msg.status}${msg.detail ? `: ${msg.detail}` : ""})`);
           this.pendingCaptures.delete(msg.captureId);
-          this.broadcastToViews({ type: "error", code: "CAPTURE_DECLINED", message: `phone reported ${msg.status}${msg.detail ? `: ${msg.detail}` : ""}` });
+          // a MODEL-initiated capture declining is already handled by the
+          // tool's own failure path — flashing the panel too would be noise
+          if (!failed?.direct) {
+            this.broadcastToViews({ type: "error", code: "CAPTURE_DECLINED", message: `phone reported ${msg.status}${msg.detail ? `: ${msg.detail}` : ""}` });
+          }
         }
         break;
+      case "camera_state": {
+        // receipt for the model tools' camera_idle/camera_resume requests
+        if (msg.reqId) {
+          const waiter = this.cameraStateWaiters.get(msg.reqId);
+          if (waiter) {
+            this.cameraStateWaiters.delete(msg.reqId);
+            waiter.settle(msg.state === "failed" ? { ok: false, reason: "手机报告执行失败(相机不可用或权限被拒)" } : { ok: true, state: msg.state });
+          }
+        }
+        break;
+      }
       default:
         break;
     }
@@ -363,7 +414,7 @@ export class ViewHub {
         type: "devices",
         devices: [...this.cameras.values()].map((c, i) => {
           const id = [...this.cameras.keys()][i]!;
-          return { id, name: c.name, active: id === this.activeDeviceId };
+          return { id, name: c.name, active: id === this.activeDeviceId, ...(c.meta.appVersion !== void 0 ? { appVersion: c.meta.appVersion } : {}) };
         }),
       } satisfies ViewServerMessage),
     );
@@ -372,21 +423,21 @@ export class ViewHub {
   // ── capture correlation ───────────────────────────────────────────────────
 
   /** Ask the ACTIVE phone to shoot. Returns the captureId, or null when none. */
-  requestCapture(captureId: string, note?: string): string | null {
+  requestCapture(captureId: string, note?: string, opts: { direct?: boolean; onImage?: (admitted: AdmittedImage) => void; onFail?: (reason: string) => void } = {}): string | null {
     const active = this.activeCam();
     if (!active || active.ws.readyState !== active.ws.OPEN) return null;
-    this.pendingCaptures.set(captureId, { note, requestedAt: Date.now() });
-    active.ws.send(JSON.stringify({ type: "capture", captureId, ...(note ? { note } : {}) } satisfies CameraControl));
+    this.pendingCaptures.set(captureId, { note, requestedAt: Date.now(), direct: opts.direct, onImage: opts.onImage, onFail: opts.onFail });
+    active.ws.send(JSON.stringify({ type: "capture", captureId, ...(note ? { note } : {}), ...(opts.direct ? { direct: true } : {}) } satisfies CameraControl));
     this.broadcastToViews({ type: "capture_pending", captureId, ...(note ? { note } : {}) });
     this.gcCaptures();
     return captureId;
   }
 
-  consumeCapture(captureId: string): { note?: string } | null {
+  consumeCapture(captureId: string): PendingCapture | null {
     const pending = this.pendingCaptures.get(captureId);
     if (!pending) return null;
     this.pendingCaptures.delete(captureId);
-    return { note: pending.note };
+    return pending;
   }
 
   noteFor(captureId: string): string | undefined {
@@ -396,8 +447,75 @@ export class ViewHub {
   private gcCaptures(): void {
     const cutoff = Date.now() - this.captureTimeoutMs;
     for (const [id, p] of this.pendingCaptures) {
-      if (p.requestedAt < cutoff) this.pendingCaptures.delete(id);
+      if (p.requestedAt < cutoff) {
+        p.onFail?.("拍摄请求已超时");
+        this.pendingCaptures.delete(id);
+      }
     }
+  }
+
+  /**
+   * Model tool: ask the ACTIVE phone to shoot and settle with the uploaded
+   * photo. The photo bypasses the user-selected capture mode entirely — the
+   * /upload handler calls onImage instead of routing to composer/folder.
+   */
+  requestCaptureDirect(note: string | undefined, timeoutMs: number): Promise<{ ok: true; admitted: AdmittedImage } | { ok: false; reason: string }> {
+    return new Promise((resolve) => {
+      const active = this.activeCam();
+      if (!active || active.ws.readyState !== active.ws.OPEN) {
+        resolve({ ok: false, reason: "没有已连接的手机" });
+        return;
+      }
+      const captureId = randomUUID();
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, reason: `拍照超时(手机未在 ${Math.round(timeoutMs / 1000)} 秒内上传照片)` }), timeoutMs);
+      const finish = (r: { ok: true; admitted: AdmittedImage } | { ok: false; reason: string }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.pendingCaptures.delete(captureId);
+        resolve(r);
+      };
+      this.requestCapture(captureId, note, { direct: true, onImage: (admitted) => finish({ ok: true, admitted }), onFail: (reason) => finish({ ok: false, reason }) });
+      if (!this.pendingCaptures.has(captureId)) {
+        // requestCapture bailed (device dropped between the two checks)
+        clearTimeout(timer);
+        resolve({ ok: false, reason: "没有已连接的手机" });
+      }
+    });
+  }
+
+  /**
+   * Model tool: park the active phone's camera into the idle state, or wake
+   * it back up. Settles with the phone's camera_state receipt (or a timeout).
+   * Old App builds (no appVersion in hello) never answer camera_idle/resume —
+   * fail fast with an actionable reason instead of burning the 8s timeout.
+   */
+  requestCameraState(action: "camera_idle" | "camera_resume", timeoutMs: number): Promise<CameraStateOutcome> {
+    return new Promise((resolve) => {
+      const active = this.activeCam();
+      if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+        resolve({ ok: false, reason: "没有已连接的手机" });
+        return;
+      }
+      if (active.meta.appVersion === undefined) {
+        resolve({ ok: false, reason: "手机 App 版本过旧(需 ≥ 1.0.4),请先更新手机端" });
+        return;
+      }
+      const reqId = randomUUID();
+      const deviceId = this.activeDeviceId;
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, reason: "手机未在时限内回执(可能不在前台或已断连)" }), timeoutMs);
+      const finish = (r: CameraStateOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.cameraStateWaiters.delete(reqId);
+        resolve(r);
+      };
+      this.cameraStateWaiters.set(reqId, { deviceId, settle: finish });
+      this.sendControl(deviceId, { type: action, reqId } satisfies CameraControl);
+    });
   }
 
   broadcastToViews(msg: ViewServerMessage): void {

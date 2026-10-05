@@ -2,12 +2,14 @@ import { basename, join, resolve, sep } from "node:path";
 import { Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { defineTool } from "@deepseek-ai/dsh-tools";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { WebSocketServer } from "ws";
 import QRCode from "qrcode";
+import { fileURLToPath } from "node:url";
 import * as os from "node:os";
 import { homedir } from "node:os";
 import { env } from "node:process";
@@ -28,7 +30,7 @@ import { env } from "node:process";
 * release is actually published).
 
 */
-const GITEE_APK_DEFAULT = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.0.0/app-release.apk";
+const GITEE_APK_DEFAULT = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.1.0/app-release.apk";
 /** Coerce an unknown config object (cordis patch row / CLI overrides) into LensConfig. */
 function normalizeConfig(raw) {
 	const r = raw ?? {};
@@ -151,10 +153,7 @@ var HostDeliverySink = class {
 			}];
 			const message = createUserMessage({
 				content,
-				source: {
-					kind: "plugin",
-					plugin: "phone-lens"
-				}
+				source: { kind: "plugin:phone-lens" }
 			});
 			this.log("info", `delivering image (${admitted.ref.attachmentId}) to session ${agent.session.id} via ${mode}`);
 			if (mode === "steer") agent.steer(message);
@@ -404,7 +403,9 @@ var AppSettingsStore = class {
 		this.defaultSaveDir = defaultSaveDir;
 		this.data = {
 			saveMode: "composer",
-			saveDir: ""
+			saveDir: "",
+			modelToolsEnabled: true,
+			modelToolsConfirmFree: false
 		};
 		this.load();
 	}
@@ -414,6 +415,8 @@ var AppSettingsStore = class {
 			const raw = JSON.parse(readFileSync(this.file, "utf8"));
 			if (SAVE_MODES.includes(raw.saveMode)) this.data.saveMode = raw.saveMode;
 			if (typeof raw.saveDir === "string") this.data.saveDir = raw.saveDir;
+			if (typeof raw.modelToolsEnabled === "boolean") this.data.modelToolsEnabled = raw.modelToolsEnabled;
+			if (typeof raw.modelToolsConfirmFree === "boolean") this.data.modelToolsConfirmFree = raw.modelToolsConfirmFree;
 		} catch {}
 	}
 	get() {
@@ -426,6 +429,8 @@ var AppSettingsStore = class {
 	set(patch) {
 		if (patch.saveMode && SAVE_MODES.includes(patch.saveMode)) this.data.saveMode = patch.saveMode;
 		if (typeof patch.saveDir === "string") this.data.saveDir = patch.saveDir.replace(/^["']|["']$/g, "").trim();
+		if (typeof patch.modelToolsEnabled === "boolean") this.data.modelToolsEnabled = patch.modelToolsEnabled;
+		if (typeof patch.modelToolsConfirmFree === "boolean") this.data.modelToolsConfirmFree = patch.modelToolsConfirmFree;
 		this.persist();
 		return this.get();
 	}
@@ -457,6 +462,81 @@ const ERROR_CODES = {
 	BAD_REQUEST: "BAD_REQUEST",
 	INTERNAL: "INTERNAL"
 };
+
+//#endregion
+//#region src/server/update-check.ts
+const GITEE_LATEST_API$1 = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest";
+/** A fresh result suppresses further API calls for 12h (host sits open all day). */
+const OK_TTL_MS = 12 * 60 * 60 * 1e3;
+/** A failed check retries after 30min instead of hammering the API per panel-open. */
+const FAIL_TTL_MS = 30 * 60 * 1e3;
+const TIMEOUT_MS = 6e3;
+let cached$1 = null;
+let inflight$1 = null;
+/** Running plugin version. `../package.json` matches http.ts's hostVersion():
+* tsdown flattens every entry into lib/*.js, so ONE level up is the package
+* root in BOTH bundle shapes (lib/index.js, lib/dev.js). A failed read (or
+* "0.0.0") makes the caller report null — never a bogus "update available". */
+function ownVersion$1() {
+	try {
+		const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
+		return typeof pkg.version === "string" && pkg.version ? pkg.version : "0.0.0";
+	} catch {
+		return "0.0.0";
+	}
+}
+/** Three-segment x.y.z compare, tolerant of a leading "v" (missing segments = 0). */
+function compareVersions(a, b) {
+	const parse = (v) => v.trim().replace(/^v/, "").split(".").map((seg) => Number.parseInt(seg, 10) || 0);
+	const pa = parse(a);
+	const pb = parse(b);
+	for (let i = 0; i < 3; i++) {
+		const av = pa[i] ?? 0;
+		const bv = pb[i] ?? 0;
+		if (av !== bv) return av < bv ? -1 : 1;
+	}
+	return 0;
+}
+/** Latest release tag from the trusted Gitee feed, or null on any failure. */
+async function fetchLatestGiteeTag() {
+	try {
+		const url = new URL(GITEE_LATEST_API$1);
+		if (url.protocol !== "https:" || url.host !== "gitee.com") return null;
+		const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+		if (!res.ok) return null;
+		const data = await res.json();
+		return typeof data.tag_name === "string" && data.tag_name.trim() ? data.tag_name.trim() : null;
+	} catch {
+		return null;
+	}
+}
+/**
+* Check for a host-side plugin update (cached; called per panel-open).
+* Returns null when the feed is unreachable — the UI then shows nothing.
+*/
+async function checkHostUpdate() {
+	if (cached$1 && Date.now() - cached$1.at < (cached$1.info ? OK_TTL_MS : FAIL_TTL_MS)) return cached$1.info;
+	if (inflight$1) return inflight$1;
+	inflight$1 = (async () => {
+		const current = ownVersion$1();
+		let info = null;
+		const latest = current === "0.0.0" ? null : await fetchLatestGiteeTag();
+		if (latest && current !== "0.0.0") info = {
+			current,
+			latest,
+			updateAvailable: compareVersions(latest, current) > 0,
+			checkedAt: Date.now()
+		};
+		cached$1 = {
+			info,
+			at: Date.now()
+		};
+		return info;
+	})().finally(() => {
+		inflight$1 = null;
+	});
+	return inflight$1;
+}
 
 //#endregion
 //#region src/inject/admit.ts
@@ -987,8 +1067,13 @@ async function startLensServer(deps) {
 	});
 	const heartbeat = setInterval(() => hub.pingAll(), 2e4);
 	await new Promise((resolve$1, reject) => {
-		server.once("error", reject);
-		server.listen(config.server.port, config.server.host, () => resolve$1());
+		const onError = reject;
+		server.once("error", onError);
+		server.listen(config.server.port, config.server.host, () => {
+			server.removeListener("error", onError);
+			server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
+			resolve$1();
+		});
 	});
 	log("info", `phone-lens listening on ${config.server.host}:${config.server.port} (paired devices: ${devices.count()})`);
 	resolveLatestGiteeApk().then((url) => {
@@ -1022,6 +1107,10 @@ async function handle(deps, req, res, ctx) {
 		version: hostVersion(),
 		requiresPairing: true
 	}, cors);
+	if (method === "GET" && path === "/update-check") {
+		if (!loop) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "update check is loopback-only");
+		return sendJson(res, 200, await checkHostUpdate(), cors);
+	}
 	if (!loop && (path === "/" || path === "/view.html" || path === "/qr.json" || path === "/qr.png" || path === "/app-qr.json" || path === "/app-settings")) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "preview surface is loopback-only");
 	if (method === "GET" && (path === "/" || path === "/view.html")) {
 		res.writeHead(200, {
@@ -1125,8 +1214,8 @@ async function handle(deps, req, res, ctx) {
 		if (truncated) return sendError(res, 413, ERROR_CODES.TOO_LARGE, `> ${config.limits.maxUploadBytes} bytes`);
 		if (!magicMatches(mediaType, buf)) return sendError(res, 415, ERROR_CODES.BAD_MAGIC, "bytes do not match the declared type");
 		const captureId = q.get("captureId");
-		const note = q.get("note") ?? (captureId ? hub.noteFor(captureId) : void 0);
-		if (captureId) hub.consumeCapture(captureId);
+		const pending = captureId ? hub.consumeCapture(captureId) : null;
+		const note = q.get("note") ?? pending?.note;
 		const rawName = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
 		const name = sanitizeFileName(rawName);
 		let admitted;
@@ -1142,6 +1231,30 @@ async function handle(deps, req, res, ctx) {
 		}
 		log("info", `stored ${name} (${buf.byteLength}B) → ${admitted.storage}:${admitted.ref.attachmentId}`);
 		if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
+		if (pending?.direct && pending.onImage) {
+			pending.onImage(admitted);
+			log("info", `direct-to-model photo: ${name} (${admitted.ref.attachmentId})`);
+			const directBody = {
+				ok: true,
+				attachmentId: admitted.ref.attachmentId,
+				width: admitted.ref.width,
+				height: admitted.ref.height,
+				bytes: admitted.ref.bytes,
+				storage: admitted.storage,
+				delivered: null,
+				deliverReason: "delivered-to-model"
+			};
+			if (uploadId) {
+				if (ctx.uploadReplays.size > 400) {
+					for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
+				}
+				ctx.uploadReplays.set(uploadId, {
+					expires: Date.now() + 10 * 6e4,
+					body: directBody
+				});
+			}
+			return sendJson(res, 200, directBody);
+		}
 		const st = deps.appSettings.get();
 		const wantFolder = st.saveMode !== "composer";
 		const wantComposer = st.saveMode !== "folder";
@@ -1231,6 +1344,7 @@ async function handle(deps, req, res, ctx) {
 		const online = hub.onlineDeviceIds();
 		return sendJson(res, 200, {
 			bootAt: SERVER_BOOT_AT,
+			version: hostVersion(),
 			devices: devices.list().map((d) => ({
 				id: d.deviceId,
 				name: d.name,
@@ -1257,7 +1371,9 @@ async function handle(deps, req, res, ctx) {
 		return sendJson(res, 200, {
 			saveMode: st.saveMode,
 			saveDir: st.saveDir,
-			effectiveSaveDir: deps.appSettings.effectiveSaveDir()
+			effectiveSaveDir: deps.appSettings.effectiveSaveDir(),
+			modelToolsEnabled: st.modelToolsEnabled,
+			modelToolsConfirmFree: st.modelToolsConfirmFree
 		}, cors);
 	}
 	if (method === "POST" && path === "/app-settings") {
@@ -1266,12 +1382,16 @@ async function handle(deps, req, res, ctx) {
 		const patch = {};
 		if (typeof body.saveMode === "string" && SAVE_MODES.includes(body.saveMode)) patch.saveMode = body.saveMode;
 		if (typeof body.saveDir === "string") patch.saveDir = body.saveDir;
+		if (typeof body.modelToolsEnabled === "boolean") patch.modelToolsEnabled = body.modelToolsEnabled;
+		if (typeof body.modelToolsConfirmFree === "boolean") patch.modelToolsConfirmFree = body.modelToolsConfirmFree;
 		const st = deps.appSettings.set(patch);
-		log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"}`);
+		log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"} modelTools=${st.modelToolsEnabled}/${st.modelToolsConfirmFree}`);
 		return sendJson(res, 200, {
 			saveMode: st.saveMode,
 			saveDir: st.saveDir,
-			effectiveSaveDir: deps.appSettings.effectiveSaveDir()
+			effectiveSaveDir: deps.appSettings.effectiveSaveDir(),
+			modelToolsEnabled: st.modelToolsEnabled,
+			modelToolsConfirmFree: st.modelToolsConfirmFree
 		}, cors);
 	}
 	if (method === "POST" && path === "/capture" && loop) {
@@ -1457,6 +1577,8 @@ var ViewHub = class {
 	/** captureId → { note, requestedAt } until the matching upload lands or timeout. */
 	pendingCaptures = new Map();
 	captureTimeoutMs = 6e4;
+	/** reqId → settle callback for in-flight camera_idle/camera_resume requests. */
+	cameraStateWaiters = new Map();
 	/** Whether the active device is confirmed to be streaming (hello/frame seen). */
 	previewOn = false;
 	stallTimer = null;
@@ -1469,6 +1591,17 @@ var ViewHub = class {
 	dispose() {
 		if (this.stallTimer) clearInterval(this.stallTimer);
 		this.stallTimer = null;
+		for (const [id, waiter] of this.cameraStateWaiters) {
+			waiter.settle({
+				ok: false,
+				reason: "接收端服务已停止"
+			});
+			this.cameraStateWaiters.delete(id);
+		}
+		for (const [id, p] of this.pendingCaptures) {
+			p.onFail?.("接收端服务已停止");
+			this.pendingCaptures.delete(id);
+		}
 	}
 	attachCamera(deviceId, ws, name) {
 		const prev = this.cameras.get(deviceId);
@@ -1521,6 +1654,13 @@ var ViewHub = class {
 		const cam = this.cameras.get(deviceId);
 		this.log("warn", `detachCamera(${deviceId.slice(0, 8)}) had-camera=${!!cam}`);
 		if (cam) this.cameras.delete(deviceId);
+		for (const [id, waiter] of this.cameraStateWaiters) if (waiter.deviceId === deviceId) {
+			waiter.settle({
+				ok: false,
+				reason: "手机已断开连接"
+			});
+			this.cameraStateWaiters.delete(id);
+		}
 		if (this.activeDeviceId === deviceId) {
 			const next = [...this.cameras.keys()].at(-1) ?? null;
 			this.activeDeviceId = next;
@@ -1565,7 +1705,8 @@ var ViewHub = class {
 					width: msg.width,
 					height: msg.height,
 					fps: msg.fps,
-					...msg.rotation !== void 0 ? { rotation: msg.rotation } : {}
+					...msg.rotation !== void 0 ? { rotation: msg.rotation } : {},
+					...msg.appVersion !== void 0 ? { appVersion: msg.appVersion } : {}
 				};
 				if (this.activeDeviceId === deviceId) {
 					this.markPreviewActive();
@@ -1589,14 +1730,32 @@ var ViewHub = class {
 				break;
 			case "capture_result":
 				if (msg.status !== "taken") {
+					const failed = this.pendingCaptures.get(msg.captureId);
+					failed?.onFail?.(`手机拒绝了拍摄(${msg.status}${msg.detail ? `: ${msg.detail}` : ""})`);
 					this.pendingCaptures.delete(msg.captureId);
-					this.broadcastToViews({
+					if (!failed?.direct) this.broadcastToViews({
 						type: "error",
 						code: "CAPTURE_DECLINED",
 						message: `phone reported ${msg.status}${msg.detail ? `: ${msg.detail}` : ""}`
 					});
 				}
 				break;
+			case "camera_state": {
+				if (msg.reqId) {
+					const waiter = this.cameraStateWaiters.get(msg.reqId);
+					if (waiter) {
+						this.cameraStateWaiters.delete(msg.reqId);
+						waiter.settle(msg.state === "failed" ? {
+							ok: false,
+							reason: "手机报告执行失败(相机不可用或权限被拒)"
+						} : {
+							ok: true,
+							state: msg.state
+						});
+					}
+				}
+				break;
+			}
 			default: break;
 		}
 	}
@@ -1747,23 +1906,28 @@ var ViewHub = class {
 				return {
 					id,
 					name: c.name,
-					active: id === this.activeDeviceId
+					active: id === this.activeDeviceId,
+					...c.meta.appVersion !== void 0 ? { appVersion: c.meta.appVersion } : {}
 				};
 			})
 		}));
 	}
 	/** Ask the ACTIVE phone to shoot. Returns the captureId, or null when none. */
-	requestCapture(captureId, note) {
+	requestCapture(captureId, note, opts = {}) {
 		const active = this.activeCam();
 		if (!active || active.ws.readyState !== active.ws.OPEN) return null;
 		this.pendingCaptures.set(captureId, {
 			note,
-			requestedAt: Date.now()
+			requestedAt: Date.now(),
+			direct: opts.direct,
+			onImage: opts.onImage,
+			onFail: opts.onFail
 		});
 		active.ws.send(JSON.stringify({
 			type: "capture",
 			captureId,
-			...note ? { note } : {}
+			...note ? { note } : {},
+			...opts.direct ? { direct: true } : {}
 		}));
 		this.broadcastToViews({
 			type: "capture_pending",
@@ -1777,14 +1941,121 @@ var ViewHub = class {
 		const pending = this.pendingCaptures.get(captureId);
 		if (!pending) return null;
 		this.pendingCaptures.delete(captureId);
-		return { note: pending.note };
+		return pending;
 	}
 	noteFor(captureId) {
 		return this.pendingCaptures.get(captureId)?.note;
 	}
 	gcCaptures() {
 		const cutoff = Date.now() - this.captureTimeoutMs;
-		for (const [id, p] of this.pendingCaptures) if (p.requestedAt < cutoff) this.pendingCaptures.delete(id);
+		for (const [id, p] of this.pendingCaptures) if (p.requestedAt < cutoff) {
+			p.onFail?.("拍摄请求已超时");
+			this.pendingCaptures.delete(id);
+		}
+	}
+	/**
+	
+	* Model tool: ask the ACTIVE phone to shoot and settle with the uploaded
+	
+	* photo. The photo bypasses the user-selected capture mode entirely — the
+	
+	* /upload handler calls onImage instead of routing to composer/folder.
+	
+	*/
+	requestCaptureDirect(note, timeoutMs) {
+		return new Promise((resolve$1) => {
+			const active = this.activeCam();
+			if (!active || active.ws.readyState !== active.ws.OPEN) {
+				resolve$1({
+					ok: false,
+					reason: "没有已连接的手机"
+				});
+				return;
+			}
+			const captureId = randomUUID();
+			let settled = false;
+			const timer = setTimeout(() => finish({
+				ok: false,
+				reason: `拍照超时(手机未在 ${Math.round(timeoutMs / 1e3)} 秒内上传照片)`
+			}), timeoutMs);
+			const finish = (r) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				this.pendingCaptures.delete(captureId);
+				resolve$1(r);
+			};
+			this.requestCapture(captureId, note, {
+				direct: true,
+				onImage: (admitted) => finish({
+					ok: true,
+					admitted
+				}),
+				onFail: (reason) => finish({
+					ok: false,
+					reason
+				})
+			});
+			if (!this.pendingCaptures.has(captureId)) {
+				clearTimeout(timer);
+				resolve$1({
+					ok: false,
+					reason: "没有已连接的手机"
+				});
+			}
+		});
+	}
+	/**
+	
+	* Model tool: park the active phone's camera into the idle state, or wake
+	
+	* it back up. Settles with the phone's camera_state receipt (or a timeout).
+	
+	* Old App builds (no appVersion in hello) never answer camera_idle/resume —
+	
+	* fail fast with an actionable reason instead of burning the 8s timeout.
+	
+	*/
+	requestCameraState(action, timeoutMs) {
+		return new Promise((resolve$1) => {
+			const active = this.activeCam();
+			if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+				resolve$1({
+					ok: false,
+					reason: "没有已连接的手机"
+				});
+				return;
+			}
+			if (active.meta.appVersion === void 0) {
+				resolve$1({
+					ok: false,
+					reason: "手机 App 版本过旧(需 ≥ 1.0.4),请先更新手机端"
+				});
+				return;
+			}
+			const reqId = randomUUID();
+			const deviceId = this.activeDeviceId;
+			let settled = false;
+			const timer = setTimeout(() => finish({
+				ok: false,
+				reason: "手机未在时限内回执(可能不在前台或已断连)"
+			}), timeoutMs);
+			const finish = (r) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				this.cameraStateWaiters.delete(reqId);
+				resolve$1(r);
+			};
+			this.cameraStateWaiters.set(reqId, {
+				deviceId,
+				settle: finish
+			});
+			this.sendControl(deviceId, {
+				type: action,
+				reqId
+			});
+		});
 	}
 	broadcastToViews(msg) {
 		const text = JSON.stringify(msg);
@@ -1840,7 +2111,7 @@ function lensDataDir() {
 
 */
 var PhoneLens = class extends Service {
-	static inject = [];
+	static inject = ["tools"];
 	static Config = z.any();
 	constructor(ctx, rawConfig) {
 		super(ctx, "phoneLens");
@@ -1865,6 +2136,126 @@ var PhoneLens = class extends Service {
 			if (payload.status === "running") onAgent(payload.agent);
 		});
 		ctx.on?.("agent/disposed", (payload) => offAgent(payload.agent));
+		try {
+			const PHONE_TOOLS = new Set([
+				"phone_take_photo",
+				"phone_camera_pause",
+				"phone_camera_resume"
+			]);
+			const toolsSvc = ctx.tools;
+			const disposers = [];
+			const guardDisposers = disposers;
+			if (toolsSvc && typeof toolsSvc.guard === "function") {
+				const unguard = toolsSvc.guard((exec) => {
+					if (!PHONE_TOOLS.has(exec?.name ?? "")) return void 0;
+					if (!appSettings.get().modelToolsEnabled) return "PhoneLens 模型相机工具已在设置中关闭(电脑端 PhoneLens 设置页可重新开启)";
+					return void 0;
+				});
+				guardDisposers.push(unguard);
+			}
+			ctx.on?.("tools/pre-execute", async (exec, next) => {
+				if (!PHONE_TOOLS.has(exec?.name ?? "")) return next();
+				const st = appSettings.get();
+				if (!st.modelToolsEnabled) return {
+					kind: "deny",
+					reason: "PhoneLens 模型相机工具已在设置中关闭(电脑端 PhoneLens 设置页可重新开启)"
+				};
+				if (st.modelToolsConfirmFree) return { kind: "allow" };
+				return {
+					kind: "ask",
+					reason: "PhoneLens 模型相机工具调用(模型免确认调用未开启)",
+					displayReason: {
+						en: "PhoneLens wants to use the phone camera (confirm-free mode is off)",
+						"zh-CN": "PhoneLens 请求调用手机相机(模型免确认调用未开启)"
+					}
+				};
+			});
+			if (toolsSvc && typeof toolsSvc.register === "function") {
+				const disposers$1 = [];
+				const textOutput = {
+					schema: { type: "string" },
+					render: (_args, value) => [{
+						type: "text",
+						text: String(value)
+					}]
+				};
+				const asText = (args, key) => {
+					const v = args?.[key];
+					return typeof v === "string" && v.trim() ? v.trim().slice(0, 60) : void 0;
+				};
+				disposers$1.push(toolsSvc.register(defineTool({
+					name: "phone_take_photo",
+					description: "通过用户配对的手机(PhoneLens)立即拍摄一张照片,照片会直接作为图片提供给你。照片不进入用户输入框、不保存到用户文件夹(与用户的拍照注入模式设置无关)。没有手机连接、手机拒绝拍摄或超时会返回失败原因。仅在对话需要查看手机相机画面时使用(例如用户让你拍摄桌上的文件、白板、实物)。",
+					parameters: { note: {
+						type: "string",
+						description: "可选的照片备注,会出现在文件名里(如'白板'、'发票')"
+					} },
+					output: textOutput,
+					async execute(args, exec) {
+						const capture = hub.requestCaptureDirect(asText(args, "note"), 45e3);
+						const result = await new Promise((resolve$1) => {
+							let done = false;
+							const settle = (v) => {
+								if (done) return;
+								done = true;
+								resolve$1(v);
+							};
+							capture.then((r) => settle(r));
+							const sig = exec?.signal;
+							if (sig?.aborted) settle({
+								ok: false,
+								reason: "调用已被取消"
+							});
+							else if (sig?.addEventListener) sig.addEventListener("abort", () => settle({
+								ok: false,
+								reason: "调用已被取消"
+							}), { once: true });
+						});
+						if (!result.ok) return `拍照失败: ${result.reason}`;
+						if (result.admitted.storage === "attachments" && typeof exec?.deferContext === "function") {
+							exec.deferContext(createUserMessage({
+								content: [{
+									type: "image",
+									attachment: result.admitted.ref
+								}],
+								source: { kind: "plugin:phone-lens" }
+							}));
+							const dim = result.admitted.ref.width ? `, ${result.admitted.ref.width}x${result.admitted.ref.height}` : "";
+							return `照片已拍摄并作为图片直接提供给你(附件 ${result.admitted.ref.attachmentId}${dim}),请结合画面内容回应。`;
+						}
+						return `照片已拍摄并保存到 ${result.admitted.filePath ?? result.admitted.ref.attachmentId}(当前环境无法直接展示图片)。`;
+					}
+				})));
+				disposers$1.push(toolsSvc.register(defineTool({
+					name: "phone_camera_pause",
+					description: "让用户配对的手机摄像头立即进入空闲状态(关闭相机与预览流,省电散热)。适用于用户明确要求关闭手机摄像头、或一段时间内不再需要取景时。手机会回执执行结果。",
+					parameters: {},
+					output: textOutput,
+					async execute() {
+						const r = await hub.requestCameraState("camera_idle", 8e3);
+						return r.ok ? `手机摄像头已进入空闲状态。` : `操作失败: ${r.reason}`;
+					}
+				})));
+				disposers$1.push(toolsSvc.register(defineTool({
+					name: "phone_camera_resume",
+					description: "立即恢复用户配对手机的拍摄状态(打开相机并恢复预览流)。适用于用户要求重新打开手机摄像头、或接下来需要拍照/取景时。手机会回执执行结果。",
+					parameters: {},
+					output: textOutput,
+					async execute() {
+						const r = await hub.requestCameraState("camera_resume", 8e3);
+						return r.ok ? `手机摄像头已恢复拍摄状态。` : `操作失败: ${r.reason}`;
+					}
+				})));
+				ctx.effect?.(() => () => {
+					for (const d of disposers$1) try {
+						d();
+					} catch {}
+				}, "phone-lens.modelTools()");
+				log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume)");
+			} else log("info", "no tools service on this ctx — model camera tools skipped (standalone/dev)");
+		} catch (error) {
+			log("warn", `model camera tools not wired (receiver unaffected): ${String(error)}`);
+		}
 		let handle$1 = null;
 		startLensServer({
 			config,
@@ -1885,6 +2276,7 @@ var PhoneLens = class extends Service {
 			process.stdout.write(`\n[phone-lens] 手机扫码配对(或浏览器打开 http://127.0.0.1:${h.port}/view.html):\n${qr.ascii}\n[phone-lens] 备用地址: ${qr.urls.join("  ")}\n\n`);
 		}).catch((error) => {
 			log("error", `receiver failed to start: ${String(error)} (check port ${config.server.port})`);
+			hub.dispose();
 		});
 		ctx.effect(() => () => {
 			handle$1?.dispose();

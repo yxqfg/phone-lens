@@ -26,8 +26,8 @@ window.__ModuleLoader__.load({
 			{ id: "folder", title: "仅保存到文件夹", desc: "不放入输入框,只保存到指定电脑文件夹", flash: "已切换:仅保存到文件夹" },
 		];
 		// App download fallbacks (used when /app-qr.json is unavailable on an older host).
-		// Gitee release carrying the newest APK (App unchanged since v0.2.0).
-		const APP_GITEE = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v0.2.0/app-release.apk";
+		// Gitee release carrying the newest APK.
+		const APP_GITEE = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.1.0/app-release.apk";
 		const APP_GITHUB = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
 		const h = react.createElement;
 
@@ -104,6 +104,31 @@ window.__ModuleLoader__.load({
 .lm-fab.connecting { color: #ffffff; background: #6cc0ff; animation: lm-blast .5s ease-in-out 3; }
 .lm-fab.disconnected { background: #23303c; color: #8fa1b5; }
 .lm-status .warn-big { color: #d9a441; font-weight: 600; font-size: 11px; line-height: 1.4; white-space: normal; }
+.lm-updwarn { font-size: 11px; line-height: 1.5; color: #d9a441; }
+.lm-appver { font-size: 10px; line-height: 1.5; color: #7d8da0; }
+.lm-appver.mismatch { color: #d9a441; }
+.lm-setsec { display: flex; flex-direction: column; gap: 12px; max-width: 760px; }
+.lm-setsec-head { display: flex; align-items: center; gap: 10px; }
+.lm-setsec-headtitle { font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #e6edf5); }
+.lm-setsec-badge { font-size: 11px; line-height: 18px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.14)); color: var(--dsw-alias-label-secondary, #9fb0c0); }
+.lm-setsec-intro { font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-tertiary, #7d8da0); }
+.lm-setsec-card { border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.10)); border-radius: 16px; background: var(--dsw-alias-bg-layer-3, rgba(255,255,255,.03)); overflow: hidden; }
+.lm-setsec-cardhead { padding: 12px 16px 10px; font-size: 14px; font-weight: 600; color: var(--dsw-alias-label-primary, #e6edf5); }
+.lm-setsec-rows { display: flex; flex-direction: column; }
+.lm-set-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; border-top: 1px solid var(--dsw-alias-border-l1, rgba(255,255,255,.06)); }
+.lm-set-rowtext { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.lm-set-rowtitle { font-size: 14px; line-height: 22px; color: var(--dsw-alias-label-primary, #e6edf5); }
+.lm-set-rowdesc { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #7d8da0); }
+.lm-set-control { flex: none; display: inline-flex; align-items: center; }
+.lm-set-switch { position: relative; display: inline-flex; flex: none; cursor: pointer; }
+.lm-set-switch input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; }
+.lm-set-track { display: inline-flex; align-items: center; width: 36px; height: 20px; padding: 2px; box-sizing: border-box; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.14)); background: var(--dsw-alias-bg-layer-2, rgba(255,255,255,.05)); transition: background .15s ease, border-color .15s ease; }
+.lm-set-thumb { display: block; width: 14px; height: 14px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #8fa1b5); transition: transform .15s ease, background .15s ease; }
+.lm-set-switch:hover .lm-set-track { border-color: var(--dsw-alias-label-dimmed, #5c6b7a); }
+.lm-set-switch input:checked + .lm-set-track { border-color: var(--dsw-alias-button-primary-fill, #3b82f6); background: var(--dsw-alias-button-primary-fill, #3b82f6); }
+.lm-set-switch input:checked + .lm-set-track .lm-set-thumb { transform: translateX(16px); background: var(--dsw-alias-bg-layer-3, #0f141a); }
+.lm-set-switch input:focus-visible + .lm-set-track { outline: 2px solid var(--dsw-alias-button-primary-fill, #3b82f6); outline-offset: 2px; }
+.lm-setsec-note { font-size: 12px; line-height: 20px; color: var(--dsw-alias-label-tertiary, #7d8da0); }
 `;
 		// The factory runs at materialization (first import), so the document
 		// head is guaranteed to exist; remove-then-add keeps HMR idempotent.
@@ -235,7 +260,11 @@ window.__ModuleLoader__.load({
 			const [, setTick] = useState(0); // 1s heartbeat: re-renders the QR countdown while pairing is visible
 			const [flash, setFlash] = useState("");
 			const [pending, setPending] = useState([]); // [{id, name}] waiting to be staged
-			const [devices, setDevices] = useState([]); // [{id,name,active}]
+			const [devices, setDevices] = useState([]); // [{id,name,active,appVersion?}]
+			// Host plugin-update check (update-check.ts): null = unchecked/failed —
+			// the hint line simply doesn't render. Fetched once per panel-open; the
+			// host caches the Gitee lookup for 12h so this costs no API call.
+			const [upd, setUpd] = useState(null);
 				const [rename, setRename] = useState(null); // {id, name} — self-drawn rename dialog
 				const [appQr, setAppQr] = useState(null); // app-download QR dialog payload (or {loading}/{fallback:true})
 				const [previewOff, setPreviewOff] = useState(false); // host says the phone's stream stopped (preview off on the phone)
@@ -250,6 +279,26 @@ window.__ModuleLoader__.load({
 
 			const baseUrl = `http://127.0.0.1:${port}`;
 			const wsUrl = `ws://127.0.0.1:${port}/ws/view`;
+
+			// plugin-update check, once per panel-open (host caches the Gitee
+			// lookup 12h / failures 30min — this fetch never hits the API itself)
+			useEffect(() => {
+				if (!open) return;
+				let alive = true;
+				void (async () => {
+					try {
+						const r = await fetch(`${baseUrl}/update-check`, { cache: "no-store" });
+						if (!r.ok) throw new Error(String(r.status));
+						const data = await r.json();
+						if (alive) setUpd(data && data.current ? data : null);
+					} catch {
+						if (alive) setUpd(null);
+					}
+				})();
+				return () => {
+					alive = false;
+				};
+			}, [open, port]);
 
 			// view websocket: ALWAYS connected (independent of panel open state),
 			// so the connection status and pending-photo events refresh even when
@@ -313,12 +362,13 @@ window.__ModuleLoader__.load({
 								})
 								.catch((e) => setFlashErr("自动放入失败: " + String(e && e.message || e).slice(0, 90)));
 						} else if (m.type === "devices") {
-							setDevices((prev) => {
-								// a NEW device came online → the one-time pairing code was
-								// consumed; rotate the QR so the next scan sees a fresh code
-								if ((m.devices || []).length > (prev ? prev.length : 0)) void refreshQr(true);
-								return m.devices || [];
-							});
+							// side effects OUT of the updater (updaters must stay pure —
+							// StrictMode double-invokes them); compare here, setState below
+							const grew = (m.devices || []).length > (devices ? devices.length : 0);
+							setDevices(m.devices || []);
+							// a NEW device came online → the one-time pairing code was
+							// consumed; rotate the QR so the next scan sees a fresh code
+							if (grew) void refreshQr(true);
 							// an active device present == camera linked; derive both the
 							// canvas visibility and the header/FAB link state from the
 							// device list (host no longer emits `device`)
@@ -547,6 +597,21 @@ window.__ModuleLoader__.load({
 												: "预览中",
 									),
 								),
+								// ── version hints (plain colored lines, never dialogs) ──
+								upd && upd.updateAvailable
+									? h("div", { className: "lm-updwarn", key: "upd" }, `⬆ 电脑端有新版本 v${upd.latest} — 请在 设置 → 插件市场 更新`)
+									: null,
+								(() => {
+									// cross-end consistency: the phone reports its App version
+									// in hello; a mismatch (both ends known) warms the line
+									const app = (devices || []).find((d) => d.active)?.appVersion;
+									if (!app) return null;
+									const host = upd && upd.current;
+									if (host && app !== host) {
+										return h("div", { className: "lm-appver mismatch", key: "appver" }, `手机 App v${app} 与电脑端 v${host} 版本不一致,建议两端同时更新`);
+									}
+									return h("div", { className: "lm-appver", key: "appver" }, `手机 App v${app}`);
+								})(),
 								devices && devices.length > 1
 									? h(
 											"div",
@@ -711,6 +776,223 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		// ── settings.section — the official settings-page panel ───────────────
+		// Privacy-bearing switches live here with an honest description of what
+		// the model can do and where photos go. The high-frequency capture-mode
+		// settings stay in the overlay ⚙ panel on purpose (switched constantly).
+		function currentLensPort() {
+			try {
+				return window.localStorage.getItem(PORT_KEY) || "8791";
+			} catch {
+				return "8791";
+			}
+		}
+
+		// Custom switch per the DSH settings-row recipe: a real checkbox (native
+		// semantics + focus) driving a styled track/thumb — 36×20 track, 14px
+		// thumb, primary fill when checked. Sizes/tokens mirror dsh-better-sidebar.
+		function LensSwitch({ checked, onChange }) {
+			return h(
+				"label",
+				{ className: "lm-set-switch" },
+				h("input", {
+					type: "checkbox",
+					checked: !!checked,
+					onChange: (e) => onChange(e.target.checked),
+				}),
+				h("span", { className: "lm-set-track", "aria-hidden": "true" }, h("span", { className: "lm-set-thumb" })),
+			);
+		}
+
+		// One settings row: title/desc on the left, control on the right.
+		function LensSetRow({ title, desc, children }) {
+			return h(
+				"div",
+				{ className: "lm-set-row" },
+				h(
+					"span",
+					{ className: "lm-set-rowtext" },
+					h("span", { className: "lm-set-rowtitle" }, title),
+					desc ? h("span", { className: "lm-set-rowdesc" }, desc) : null,
+				),
+				h("span", { className: "lm-set-control" }, children),
+			);
+		}
+
+		function LensSettingsSection() {
+			const [st, setSt] = useState(undefined); // undefined=loading, false=unavailable, object=live
+			const [flash, setFlash] = useState("");
+
+			useEffect(() => {
+				let alive = true;
+				void (async () => {
+					try {
+						const r = await fetch(`http://127.0.0.1:${currentLensPort()}/app-settings`, { cache: "no-store" });
+						if (!r.ok) throw new Error(String(r.status));
+						const data = await r.json();
+						if (alive) setSt(data);
+					} catch {
+						if (alive) setSt(false);
+					}
+				})();
+				return () => {
+					alive = false;
+				};
+			}, []);
+
+			async function patch(p) {
+				try {
+					const r = await fetch(`http://127.0.0.1:${currentLensPort()}/app-settings`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(p),
+					});
+					if (!r.ok) throw new Error("HTTP " + r.status);
+					setSt(await r.json());
+					setFlash("已保存");
+					setTimeout(() => setFlash(""), 1800);
+				} catch (e) {
+					setFlash("保存失败: " + String((e && e.message) || e).slice(0, 60));
+				}
+			}
+
+			const infoRow = (title, desc, key) =>
+				h(
+					"div",
+					{ className: "lm-set-row", key },
+					h(
+						"span",
+						{ className: "lm-set-rowtext" },
+						h("span", { className: "lm-set-rowtitle" }, title),
+						h("span", { className: "lm-set-rowdesc" }, desc),
+					),
+				);
+
+			return h(
+				"div",
+				{ className: "lm-setsec" },
+				h(
+					"div",
+					{ className: "lm-setsec-head" },
+					h("span", { className: "lm-setsec-headtitle" }, "PhoneLens 手机相机"),
+					h("span", { className: "lm-setsec-badge" }, "phone-lens"),
+				),
+				h("div", { className: "lm-setsec-intro" }, "管理对话中模型对本机手机相机的调用能力与隐私行为。"),
+				st === undefined
+					? h("div", { className: "lm-setsec-note" }, "加载中…")
+					: st === false
+						? h("div", { className: "lm-setsec-note" }, "设置服务不可用(需电脑端 phone-lens ≥ 1.0.4)")
+						: [
+								h(
+									"div",
+									{ className: "lm-setsec-card", key: "privacy" },
+									h("div", { className: "lm-setsec-cardhead" }, "隐私开关"),
+									h(
+										"div",
+										{ className: "lm-setsec-rows" },
+										h(LensSetRow, {
+											key: "t1",
+											title: "启用模型相机工具",
+											desc: "关闭后模型调用会被拒绝,手机摄像头完全由你自己控制",
+										}, h(LensSwitch, { checked: st.modelToolsEnabled, onChange: (v) => void patch({ modelToolsEnabled: v }) })),
+										h(LensSetRow, {
+											key: "t2",
+											title: "模型免确认调用",
+											desc: "开启时模型调用不弹确认框;关闭后每次调用需你在弹窗中确认(若宿主不支持审批弹窗,则视为拒绝)",
+										}, h(LensSwitch, { checked: st.modelToolsConfirmFree, onChange: (v) => void patch({ modelToolsConfirmFree: v }) })),
+										// pointer to the high-frequency settings, parked INSIDE
+										// the toggles card (user-requested placement)
+										h(
+											"div",
+											{ className: "lm-set-row", key: "ft" },
+											h("span", { className: "lm-set-rowtext" }, h("span", { className: "lm-set-rowdesc" }, "高频的「拍照注入模式 / 保存目录」设置仍在右下角悬浮窗 ⚙ 面板")),
+										),
+									),
+								),
+								h(
+									"div",
+									{ className: "lm-setsec-card", key: "what" },
+									h("div", { className: "lm-setsec-cardhead" }, "打开上述开关后,对话内模型将被允许:"),
+									h(
+										"div",
+										{ className: "lm-setsec-rows" },
+										// tool names in the open (user-requested): what the
+										// model will actually see in its tool list
+										infoRow("拍摄照片(phone_take_photo)", "手机立即拍照,照片直接进入模型视野——不放入输入框、不保存到电脑文件夹,与拍照注入模式设置无关。", "w1"),
+										infoRow("关闭手机摄像头(phone_camera_pause)", "让手机相机提前进入空闲省电状态。", "w2"),
+										infoRow("恢复手机摄像头(phone_camera_resume)", "立即打开相机并恢复预览拍摄。", "w3"),
+									),
+								),
+								flash ? h("div", { className: "lm-setsec-note", key: "f" }, flash) : null,
+							],
+			);
+		}
+
+		// ── settings nav icon ─────────────────────────────────────────────────
+		// settings.section alone yields the nav row; this paints a camera icon
+		// onto it with the same CSS-mask trick dshmarket uses (mark the row
+		// whose text matches our label, inject a ::before mask).
+		const LENS_NAV_SVG =
+			'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3.5"/></svg>';
+
+		function installSettingsNavIcon(ctx, resolveLabel) {
+			if (typeof document === "undefined") return;
+			const MARKER = "data-phone-lens-nav-icon";
+			const SELECTOR = '[role="dialog"] nav button';
+			const maskUrl = `data:image/svg+xml,${encodeURIComponent(LENS_NAV_SVG)}`;
+			ctx.effect(() => {
+				const tag = document.createElement("style");
+				tag.dataset.plugin = "phone-lens";
+				tag.textContent = [
+					`[${MARKER}] > svg { display: none; }`,
+					`[${MARKER}]::before {`,
+					`  content: '';`,
+					`  flex: none;`,
+					`  width: 16px;`,
+					`  height: 16px;`,
+					`  background-color: currentColor;`,
+					`  -webkit-mask-image: url("${maskUrl}");`,
+					`  mask-image: url("${maskUrl}");`,
+					`  -webkit-mask-repeat: no-repeat;`,
+					`  mask-repeat: no-repeat;`,
+					`  -webkit-mask-position: center;`,
+					`  mask-position: center;`,
+					`  -webkit-mask-size: 16px 16px;`,
+					`  mask-size: 16px 16px;`,
+					`}`,
+				].join("\n");
+				document.head.appendChild(tag);
+				let disposed = false;
+				let scheduled = false;
+				const sync = () => {
+					scheduled = false;
+					if (disposed) return;
+					// cheap early-out: the settings dialog isn't even mounted — skip
+					// the querySelectorAll sweep while chat tokens stream in
+					if (!document.querySelector('[role="dialog"] nav')) return;
+					const wanted = resolveLabel();
+					for (const row of document.querySelectorAll(SELECTOR)) {
+						if ((row.textContent || "").trim() === wanted) row.setAttribute(MARKER, "");
+						else row.removeAttribute(MARKER);
+					}
+				};
+				const schedule = () => {
+					if (scheduled || disposed) return;
+					scheduled = true;
+					queueMicrotask(sync);
+				};
+				sync();
+				const observer = new MutationObserver(schedule);
+				observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+				return () => {
+					disposed = true;
+					observer.disconnect();
+					for (const row of document.querySelectorAll(`[${MARKER}]`)) row.removeAttribute(MARKER);
+					tag.remove();
+				};
+			}, "phone-lens: settings nav icon");
+		}
+
 		// ── plugin face ───────────────────────────────────────────────────────
 		const inject = ["slots"];
 		function apply(ctx) {
@@ -721,6 +1003,15 @@ window.__ModuleLoader__.load({
 					LensOverlay,
 				),
 			);
+			// official settings page: additive section — the host renders it as a
+			// dedicated entry in the settings dialog's left nav (same as dshmarket)
+			ctx.slots.inject("settings.section", () =>
+				ctx.slots.register(
+					{ name: "settings.section", id: "phone-lens", order: 50, label: () => "PhoneLens" },
+					() => h(LensSettingsSection),
+				),
+			);
+			installSettingsNavIcon(ctx, () => "PhoneLens");
 		}
 
 		exports.apply = apply;

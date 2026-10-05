@@ -6,8 +6,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:vibration/vibration.dart';
 
 import '../../core/api.dart';
 import '../../core/camera_socket.dart';
@@ -55,6 +57,20 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   bool _focusLocked = false;
   bool _showFocus = false;
   Timer? _focusHideTimer;
+  // ── pinch zoom ────────────────────────────────────────────────────────────
+  // Camera2 zoom ratio (what setZoomLevel speaks): the OS transparently does
+  // the multi-camera switch, so within the optical range of a multi-lens
+  // phone this IS the optical magnification — the pill just reports it. The
+  // ValueNotifier keeps pinch updates off the whole-screen rebuild path.
+  final ValueNotifier<double> _zoom = ValueNotifier(1.0);
+  double? _zoomMin; // null = this device has no zoom control
+  double? _zoomMax;
+  double? _scaleStartZoom;
+  // ── flash (off → auto → torch cycle) ─────────────────────────────────────
+  // torch = always-on light (preview AND photos); auto = the OS fires the
+  // flash at capture time when the scene is dark. Torch dies with the idle
+  // auto-off (camera release) and comes back on revive via _applyFlash.
+  FlashMode _flash = FlashMode.off;
   bool _sending = false;
   bool _cropBeforeSend = false;
   int _lastSendAt = 0;
@@ -88,6 +104,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   Timer? _idleTimer;
   DateTime _lastCamActivity = DateTime.now();
   bool _autoClosed = false;
+  /// Who parked the camera: the idle timer (default) or the host's
+  /// camera_idle request — the black veil says the right thing.
+  bool _closedByHost = false;
 
   PairedServer? get _server => widget.store.server;
 
@@ -95,6 +114,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // cache the App version once for the hello handshake (cross-end hint);
+    // the socket field is mutable so late resolution still reaches the NEXT
+    // announce — the very first hello on a cold start may miss it
+    () async {
+      try {
+        final p = await PackageInfo.fromPlatform();
+        _appVersion = p.version;
+        _socket?.appVersion = p.version;
+      } catch (_) {}
+    }();
     _initCamera();
     _connectSocket();
     _initOrientation();
@@ -194,6 +223,8 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   bool _cameraInitBusy = false;
   bool _cameraInitPending = false;
+  /// Re-arms on every successful open; consumed by the one-shot init retry.
+  bool _cameraInitRetry = true;
   // Camera epoch: bumped by every release; an init whose epoch is superseded
   // must dispose its controller instead of assigning it (covers "release ran
   // while initialize() was in flight" — camera under a covering route).
@@ -246,15 +277,28 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           try {
             await controller.startImageStream(_onCameraImage);
           } catch (_) {}
+          // the stream start is a real async gap — re-check that neither a
+          // release (gen bump) nor an idle shutdown happened meanwhile, or a
+          // backgrounded/host-parked phone would end up "ready" with a live
+          // stream under the black veil
+          if (!mounted || gen != _cameraGen || _autoClosed) {
+            await controller.dispose();
+            return;
+          }
         }
         setState(() {
           _camera = controller;
           _cameraReady = true;
           _cameraError = null;
           _jpegStreamMode = jpeg;
+          _cameraInitRetry = true; // a successful open re-arms the one-shot heal
         });
         debugPrint('[lens-mate] camera stream mode: yuv420(hand-assembled) — jpeg stream delivers no frames on this device');
         _touchCamera(); // camera (re)opened = idle clock restarts
+        // zoom range is per-device AND per-session: re-read after every open
+        // (re-applies the remembered ratio so release/init cycles keep zoom)
+        await _applyZoomAfterInit(controller);
+        await _applyFlash(controller);
         // preview streaming defaults ON — it's a framing aid, not a video
         // upload; users turn it off explicitly when they want to.
         // A host-paused phone must NOT resume by itself (multi-device rule),
@@ -264,6 +308,25 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       } catch (e) {
         debugPrint('[lens-mate] camera init failed: $e');
         if (mounted) setState(() => _cameraError = '相机初始化失败,请检查相机权限未被占用后重试');
+        // One-shot self-heal for the pairing→viewfinder hand-off: the QR
+        // scanner's CameraX unbind races our re-open for the same back camera
+        // (first launch pairs, then swaps to this screen). One delayed retry;
+        // a second consecutive failure is a real problem worth the error UI.
+        if (mounted && _cameraInitRetry && !_autoClosed && !_userStopped) {
+          _cameraInitRetry = false;
+          Future.delayed(const Duration(milliseconds: 1500), () {
+            // skip while backgrounded: Android forbids background camera opens,
+            // the attempt would just burn the one-shot retry and flash a
+            // misleading error (the resumed-path init recovers on return)
+            if (mounted &&
+                !cameraReadyCheck &&
+                !_autoClosed &&
+                homeTab.value == 0 &&
+                WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+              _initCamera();
+            }
+          });
+        }
       }
     } finally {
       _cameraInitBusy = false;
@@ -302,12 +365,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// Heat/Power valve: kill the camera AND the preview stream, black out the
   /// viewfinder with a notice. `_userStopped` is set too so the existing
   /// auto-stream gate in [_initCamera] also stays shut for passive paths.
-  Future<void> _autoCloseCamera() async {
+  Future<void> _autoCloseCamera({bool byHost = false}) async {
     _autoClosed = true;
+    _closedByHost = byHost;
     _userStopped = true;
     await _stopStream();
     await _releaseCamera();
-    debugPrint('[lens-mate] idle ${widget.store.cameraIdleTimeoutMin}min → camera auto-closed');
+    debugPrint('[lens-mate] idle ${widget.store.cameraIdleTimeoutMin}min → camera auto-closed${byHost ? ' (host requested)' : ''}');
     if (mounted) setState(() {});
   }
 
@@ -325,6 +389,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       return cameraReadyCheck;
     }
     _autoClosed = false;
+    _closedByHost = false;
     if (mounted) setState(() {});
     await _initCamera(); // _userStopped still true → no auto stream here
     _touchCamera();
@@ -333,6 +398,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   bool _authProbeDone = false; // one 401 probe per link lifetime
   bool _authFailed = false; // receiver no longer knows our token
+  /// Announced in every hello (cross-end version hint). Resolved async at
+  /// startup — an early hello may go out without it; the next announce carries it.
+  String? _appVersion;
 
   void _connectSocket() {
     final s = _server;
@@ -341,6 +409,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _authFailed = false;
     final socket = CameraSocket(
       'ws://${s.host}:${s.port}/ws/camera?deviceId=${s.deviceId}&token=${s.token}',
+      appVersion: _appVersion,
     );
     _socket = socket;
     socket.states.listen((st) {
@@ -363,6 +432,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       }
     });
     socket.onPreviewState = (active) => _onHostPreviewState(active);
+    socket.onCameraControl = (type, reqId) => _onHostCameraControl(type, reqId);
     _cmdSub = socket.commands.listen(_onRemoteShutter);
     _encoder.onFrame = (jpeg) {
       _fpsWindowFrames++;
@@ -453,7 +523,30 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     }
   }
 
+  /// 0.5s buzz — 0.2s pause — 0.5s buzz: the "someone over there is using MY
+  /// camera" pattern. Best-effort: no vibrator / suppressed by the OS just
+  /// skips silently.
+  Future<void> _alertBuzz() async {
+    try {
+      if (await Vibration.hasVibrator() != true) return;
+      await Vibration.vibrate(pattern: [0, 500, 200, 500]);
+    } catch (_) {}
+  }
+
+  /// camera_idle arriving mid-shot must NOT dispose the controller under
+  /// takePicture() (the in-flight photo would die): park the request and run
+  /// it from the shoot's finally instead.
+  bool _pendingHostIdle = false;
+
   void _onRemoteShutter(CaptureCommand cmd) {
+    // The phone must speak up whenever someone else drives its camera — the
+    // user-fired web-UI shutter and the model's phone_take_photo alike ride
+    // this same command. Opt-out lives in Settings (拍照提醒).
+    if (widget.store.remoteCaptureAlert) {
+      final note = cmd.note?.trim();
+      _toast(note == null || note.isEmpty ? '电脑端请求拍照并上传' : '电脑端请求拍照并上传: $note');
+      unawaited(_alertBuzz());
+    }
     if (_sending) {
       _socket?.reportCapture(cmd.captureId, 'declined', 'busy');
       return;
@@ -462,16 +555,88 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     // ANY down state — the idle auto-off, or released-under-a-covering-route
     // while the user sits on another tab — exactly like the on-screen shutter.
     if (!cameraReadyCheck) {
-      _reviveFromAutoClose().then((ok) {
-        if (!ok) {
-          _socket?.reportCapture(cmd.captureId, 'failed', 'camera unavailable');
-          return;
+      // hold the busy slot through revive + focus-settle: a second capture in
+      // that window gets a clean 'busy' decline instead of overtaking this
+      // one's delayed shot
+      setState(() => _sending = true);
+      _reviveFromAutoClose().then((ok) async {
+        try {
+          if (!ok) {
+            _socket?.reportCapture(cmd.captureId, 'failed', 'camera unavailable');
+            return;
+          }
+          // A just-woken camera hasn't converged auto-focus yet — an instant
+          // shot comes out blurry. Wait the user-configured settle time first
+          // (0 = shoot immediately; Settings → 画面 → 唤醒后对焦等待).
+          final delayMs = widget.store.wakeFocusDelayMs;
+          if (delayMs > 0) await Future<void>.delayed(Duration(milliseconds: delayMs));
+          await _shoot(captureId: cmd.captureId, note: cmd.note);
+        } finally {
+          if (mounted) setState(() => _sending = false);
+          // a camera_idle that arrived while we were shooting runs now
+          if (_pendingHostIdle) {
+            _pendingHostIdle = false;
+            unawaited(_onHostCameraControl('camera_idle', null));
+          }
         }
-        _shoot(captureId: cmd.captureId, note: cmd.note);
       });
       return;
     }
     _shoot(captureId: cmd.captureId, note: cmd.note);
+  }
+
+  /// Host-initiated camera parking/waking (model tools phone_camera_pause /
+  /// phone_camera_resume). The receipt echoes reqId so the host settles the
+  /// right tool call. Resume carries the same authority as an explicit user
+  /// tap: clear the idle flag AND restart the stream.
+  Future<void> _onHostCameraControl(String type, String? reqId) async {
+    if (type == 'camera_idle') {
+      if (_sending) {
+        // mid-shot: disposing the controller now would kill the in-flight
+        // photo — acknowledge and park; the shoot's finally runs this for real
+        _pendingHostIdle = true;
+        _socket?.reportCameraState(reqId, 'idle');
+        return;
+      }
+      if (cameraReadyCheck && !_autoClosed) {
+        debugPrint('[lens-mate] host requested camera idle');
+        // attribution: if the user had ALREADY stopped the preview themselves,
+        // the neutral idle wording is more honest than "电脑端已关闭摄像头"
+        await _autoCloseCamera(byHost: !_userStopped);
+      }
+      // a camera that was already parked (idle shutdown OR plain user-stopped
+      // preview) reports idle — 'live' is only true while it's actually open
+      _socket?.reportCameraState(reqId, cameraReadyCheck && !_autoClosed ? 'live' : 'idle');
+      return;
+    }
+    if (type == 'camera_resume') {
+      final wasAutoClosed = _autoClosed;
+      try {
+        if (!cameraReadyCheck || _autoClosed) {
+          debugPrint('[lens-mate] host requested camera resume');
+          _autoClosed = false;
+          _closedByHost = false;
+          _userStopped = false; // resume owns the same authority as 启动预览
+          if (mounted) setState(() {});
+          await _initCamera();
+          _touchCamera();
+          if (cameraReadyCheck && !_streaming && !_hostPaused) {
+            await _startStream(); // clears _userStopped on success
+          }
+        }
+        _socket?.reportCameraState(reqId, cameraReadyCheck ? 'live' : 'failed');
+      } catch (_) {
+        _socket?.reportCameraState(reqId, 'failed');
+      } finally {
+        // a failed resume (e.g. app backgrounded, Android refuses the camera)
+        // must not leave the idle flags cleared while the camera is actually
+        // down — roll back so the veil and the passive-init gates stay true
+        if (!cameraReadyCheck && wasAutoClosed) {
+          _autoClosed = true;
+          if (mounted) setState(() {});
+        }
+      }
+    }
   }
 
   /// Re-announce the SENSOR frame shape + rotation to the host (the hello
@@ -881,11 +1046,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// Floating badge over the viewfinder's top-right: pending upload count,
   /// red when something hard-failed, pulsing border while actively sending.
   /// Tap → queue management screen. Hidden when the queue is empty.
+  /// Queued-upload badge as an absolutely-positioned overlay (offline empty
+  /// state uses this form).
   Widget _queueBadge() {
-    return Positioned(
-      top: 12,
-      right: 12,
-      child: ValueListenableBuilder<List<UploadItem>>(
+    return Positioned(top: 12, right: 12, child: _queueBadgeContent());
+  }
+
+  /// Badge content without positioning — the viewfinder stacks it in the
+  /// top-right column together with the flash toggle and the zoom pill.
+  Widget _queueBadgeContent() {
+    return ValueListenableBuilder<List<UploadItem>>(
         valueListenable: UploadQueue.instance.items,
         builder: (_, items, __) {
           if (items.isEmpty) return const SizedBox.shrink();
@@ -932,8 +1102,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             ),
           );
         },
-      ),
-    );
+      );
   }
 
   @override
@@ -951,6 +1120,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _toastEntry = null;
     _socket?.close();
     _encoder.stop();
+    _zoom.dispose();
     _camera?.dispose();
     _api.dispose();
     super.dispose();
@@ -1158,7 +1328,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
                 ),
                 const SizedBox(height: 10),
                 const Text(
-                  '请确认手机与电脑在同一局域网;\n可在 设置 → 配对与设备 中切换连接,或长按电源重启电脑端 dsh。',
+                  '请确认手机与电脑在同一局域网;\n可在 设置 → 连接与配对 中切换连接,或重启电脑端 dsh。',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.6),
                 ),
@@ -1170,9 +1340,14 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     );
   }
 
+  /// Size of the full-bleed gesture layer over the preview (set by its
+  /// LayoutBuilder on every build) — tap-to-focus normalizes against THIS,
+  /// not the whole screen (top strip + chrome bar would skew Y).
+  Size _gestureLayerSize = Size.zero;
+
   Future<void> _onFocusTap(CameraController c, Offset local) async {
     if (!widget.store.focusEnabled) return;
-    final size = MediaQuery.of(context).size;
+    final size = _gestureLayerSize.width > 0 ? _gestureLayerSize : MediaQuery.of(context).size;
     final nx = (local.dx / size.width).clamp(0.0, 1.0);
     final ny = (local.dy / size.height).clamp(0.0, 1.0);
     try {
@@ -1246,6 +1421,114 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     );
   }
 
+  // ── pinch zoom + flash ─────────────────────────────────────────────────────
+
+  /// Re-read the device zoom range after every camera open and re-apply the
+  /// remembered ratio. Devices without zoom control (getMin/MaxZoomLevel
+  /// throws) leave _zoomMin null → gestures and the pill stay hidden.
+  Future<void> _applyZoomAfterInit(CameraController c) async {
+    try {
+      final min = await c.getMinZoomLevel();
+      final max = await c.getMaxZoomLevel();
+      if (!mounted) return;
+      final z = _zoom.value.clamp(min, max);
+      await c.setZoomLevel(z);
+      if (!mounted) return;
+      setState(() {
+        _zoomMin = min;
+        _zoomMax = max;
+        _zoom.value = z;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _zoomMin = null);
+    }
+  }
+
+  /// (Re-)apply the flash mode after every camera open: torch must come back
+  /// after a revive, and auto/off must track the user's pick across the
+  /// release/init cycles (backgrounding, covering routes, idle shutdown).
+  Future<void> _applyFlash(CameraController c) async {
+    try {
+      await c.setFlashMode(_flash);
+    } catch (_) {}
+  }
+
+  Future<void> _cycleFlash() async {
+    final next = switch (_flash) {
+      FlashMode.off => FlashMode.auto,
+      FlashMode.auto => FlashMode.torch,
+      _ => FlashMode.off,
+    };
+    setState(() => _flash = next);
+    _touchCamera(); // toggling the light is camera activity
+    final c = _camera;
+    if (c != null) await _applyFlash(c);
+  }
+
+  void _onScaleStart(ScaleStartDetails d) {
+    _scaleStartZoom = _zoom.value;
+  }
+
+  void _onScaleUpdate(ScaleUpdateDetails d) {
+    final min = _zoomMin;
+    final max = _zoomMax;
+    final start = _scaleStartZoom;
+    if (min == null || max == null || start == null) return;
+    // scale stays exactly 1.0 for a single-finger drag — only a real pinch
+    // (two pointers) may drive the zoom
+    if (d.scale == 1.0 || d.pointerCount < 2) return;
+    final z = (start * d.scale).clamp(min, max);
+    if ((z - _zoom.value).abs() < 0.01) return;
+    _zoom.value = z; // pill listens; no whole-screen setState on every tick
+    _camera?.setZoomLevel(z).catchError((_) {});
+  }
+
+  /// Top-right flash toggle: off → auto → torch. Torch lights up amber.
+  Widget _flashButton() {
+    final torch = _flash == FlashMode.torch;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: _cycleFlash,
+        child: Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.black54,
+            border: Border.all(color: torch ? Colors.amber : Colors.white24),
+          ),
+          child: Icon(
+            switch (_flash) { FlashMode.torch => Icons.flash_on, FlashMode.auto => Icons.flash_auto, _ => Icons.flash_off },
+            size: 18,
+            color: torch ? Colors.amber : Colors.white,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Zoom ratio pill — hidden while at 1.0x (nothing to report), appears on
+  /// the first pinch and reports the true (possibly optical) magnification.
+  Widget _zoomPill() {
+    return ValueListenableBuilder<double>(
+      valueListenable: _zoom,
+      builder: (_, z, __) {
+        if (_zoomMin == null || z <= 1.01) return const SizedBox.shrink();
+        return Container(
+          margin: const EdgeInsets.only(top: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(12)),
+          child: Text(
+            '${z.toStringAsFixed(1)}x',
+            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _previewArea(CameraController c) {
     final ps = c.value.previewSize;
     final w = (ps?.width ?? 360).toDouble();
@@ -1253,6 +1536,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     final shortSide = w < hh ? w : hh;
     final longSide = w < hh ? hh : w;
     final aspect = shortSide / longSide; // preview always portrait (not rotated)
+    final zoomAvailable = _zoomMin != null;
 
     return Stack(
       fit: StackFit.expand,
@@ -1264,35 +1548,66 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             child: CameraPreview(c),
           ),
         ),
-        if (widget.store.focusEnabled)
+        // one gesture layer for tap-to-focus / long-press-lock / pinch-zoom:
+        // the arena sorts them out (tap wins a still single finger, scale wins
+        // a two-finger pinch, long-press wins a held finger). The LayoutBuilder
+        // captures the layer's own size for focus-point normalization.
+        if (widget.store.focusEnabled || zoomAvailable)
           Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.translucent,
-              onTapUp: (d) => _onFocusTap(c, d.localPosition),
-              onLongPress: () => _onFocusLock(c),
+            child: LayoutBuilder(
+              builder: (_, constraints) {
+                _gestureLayerSize = constraints.biggest;
+                return GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTapUp: widget.store.focusEnabled ? (d) => _onFocusTap(c, d.localPosition) : null,
+                  onLongPress: widget.store.focusEnabled ? () => _onFocusLock(c) : null,
+                  onScaleStart: zoomAvailable ? _onScaleStart : null,
+                  onScaleUpdate: zoomAvailable ? _onScaleUpdate : null,
+                );
+              },
             ),
           ),
         _focusIndicator(),
-        if (_focusLocked && _showFocus) _focusLockBanner(),
-        _queueBadge(),
+        // the lock banner is PERSISTENT while locked (user request): the 900ms
+        // hide timer only owns the tap-focus indicator, not this badge — it
+        // disappears when the lock is released (refocus tap clears _focusLocked)
+        if (_focusLocked) _focusLockBanner(),
+        // top-right column: queue badge → flash toggle → zoom pill, stacked
+        // in ONE Positioned so the three never overlap each other
+        Positioned(
+          top: 12,
+          right: 12,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _queueBadgeContent(),
+              const SizedBox(height: 8),
+              _flashButton(),
+              _zoomPill(),
+            ],
+          ),
+        ),
       ],
     );
   }
 
-  /// Black veil for the idle shutdown, per spec: 主屏黑屏 + 提示文字.
+  /// Black veil for the idle shutdown, per spec: 主屏黑屏 + 提示文字. The
+  /// wording follows who parked the camera (idle timer vs host request).
   Widget _autoClosedOverlay() {
-    return const Positioned.fill(
+    final title = _closedByHost ? '电脑端已关闭摄像头' : '长时间无操作,已关闭摄像头';
+    return Positioned.fill(
       child: ColoredBox(
         color: Colors.black,
         child: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.videocam_off_outlined, color: Colors.white38, size: 42),
-              SizedBox(height: 12),
-              Text('长时间无操作,已关闭摄像头', style: TextStyle(color: Colors.white, fontSize: 16)),
-              SizedBox(height: 10),
-              Text(
+              const Icon(Icons.videocam_off_outlined, color: Colors.white38, size: 42),
+              const SizedBox(height: 12),
+              Text(title, style: const TextStyle(color: Colors.white, fontSize: 16)),
+              const SizedBox(height: 10),
+              const Text(
                 '点拍摄键或「启动预览」立即重新打开',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.6),

@@ -26,10 +26,18 @@ class _PairScreenState extends State<PairScreen> {
   String? _error;
   bool _showManual = false;
   Key _scannerKey = UniqueKey();
-  /// Payload whose pairing already FAILED: never auto-retry it — the scanner
+  /// Payload whose pairing last FAILED, plus when and why. The scanner
   /// re-detects the same QR several times a second and the receiver
-  /// rate-limits failed attempts (10/min), so retries just burn the budget.
+  /// rate-limits failed attempts (10/min), so an identical payload is ignored
+  /// while cooling down. Unlike a permanent latch the cooldown EXPIRES — the
+  /// same QR becomes scannable again automatically, and the retry button
+  /// clears it at once — so a failed scan never bricks scanning until the
+  /// app restarts (the old `_failedPayload`-forever bug).
   String? _failedPayload;
+  DateTime? _failedAt;
+  bool _rateLimited = false;
+  static const _retryCooldown = Duration(seconds: 12);
+  static const _rateLimitCooldown = Duration(seconds: 60);
 
   @override
   void dispose() {
@@ -90,6 +98,8 @@ class _PairScreenState extends State<PairScreen> {
       if (Navigator.of(context).canPop()) Navigator.of(context).pop();
     } catch (e) {
       _failedPayload = payload;
+      _failedAt = DateTime.now();
+      _rateLimited = e is LensApiError && e.code == 'RATE_LIMITED';
       if (mounted) setState(() => _error = _pairErrorText(e));
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -132,7 +142,14 @@ class _PairScreenState extends State<PairScreen> {
       }
       return;
     }
-    if (raw == _failedPayload) return; // already tried and failed — no auto-retry
+    // Already tried and failed recently: skip while cooling down (same-QR
+    /// re-detections would otherwise burn the receiver's rate-limit budget),
+    /// but let it through once the cooldown expires so the scanner recovers
+    /// by itself. RATE_LIMITED cools down longer — retrying sooner is futile.
+    if (raw == _failedPayload && _failedAt != null) {
+      final cooldown = _rateLimited ? _rateLimitCooldown : _retryCooldown;
+      if (DateTime.now().difference(_failedAt!) < cooldown) return;
+    }
     final host = uri.queryParameters['host'];
     final port = int.tryParse(uri.queryParameters['port'] ?? '');
     final code = uri.queryParameters['code'];
@@ -150,12 +167,23 @@ class _PairScreenState extends State<PairScreen> {
         setState(() => _error = '端口格式错误:应为数字(如 8791)');
         return;
       }
-      _pair(host: parts[0], port: port, code: parts[2]);
+      _pair(host: parts[0], port: port, code: parts[2], payload: 'manual:${parts[0]}:$port:${parts[2]}');
     } else if (parts.length == 2) {
-      _pair(host: parts[0], port: 8791, code: parts[1]);
+      _pair(host: parts[0], port: 8791, code: parts[1], payload: 'manual:${parts[0]}:8791:${parts[1]}');
     } else {
       setState(() => _error = '格式:主机:端口:配对码 或 主机:配对码(默认端口 8791)');
     }
+  }
+
+  /// Manual "重试扫码": clear the failure latch so the very next detection
+  /// (same QR or not) fires a pairing attempt immediately.
+  void _clearScanFailure() {
+    setState(() {
+      _failedPayload = null;
+      _failedAt = null;
+      _rateLimited = false;
+      _error = null;
+    });
   }
 
   @override
@@ -189,7 +217,14 @@ class _PairScreenState extends State<PairScreen> {
                       },
                       errorBuilder: (context, error, child) => _ScannerError(
                         error: error,
-                        onRetry: () => setState(() => _scannerKey = UniqueKey()),
+                        onRetry: () {
+                          // give the failing scanner controller a beat to fully
+                          // release the camera before the keyed rebuild binds it
+                          // again — an immediate rebuild re-raised "camera in use"
+                          Future.delayed(const Duration(milliseconds: 300), () {
+                            if (mounted) setState(() => _scannerKey = UniqueKey());
+                          });
+                        },
                       ),
                     ),
                     if (_busy)
@@ -205,7 +240,16 @@ class _PairScreenState extends State<PairScreen> {
             if (_error != null)
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
-                child: Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                child: Column(
+                  children: [
+                    Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error), textAlign: TextAlign.center),
+                    TextButton.icon(
+                      onPressed: _busy ? null : _clearScanFailure,
+                      icon: const Icon(Icons.refresh, size: 18),
+                      label: const Text('重试扫码'),
+                    ),
+                  ],
+                ),
               ),
             TextButton(
               onPressed: () => setState(() => _showManual = !_showManual),

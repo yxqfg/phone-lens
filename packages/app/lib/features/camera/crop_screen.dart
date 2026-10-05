@@ -1,5 +1,7 @@
-import 'dart:typed_data';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
 
@@ -9,6 +11,9 @@ import 'package:image/image.dart' as img;
 /// - Rotation via a 90° button (0/90/180/270), never free two-finger.
 /// - Crop frame snapped strictly inside the image — cannot exceed or trigger
 ///   the "auto-zoom" UCrop quirk.
+/// - Annotation strokes: freehand 画笔 (opaque marker) and 马赛克 (pixelate
+///   blocks), drawn on the full image before the crop — whatever the crop
+///   frame excludes is naturally discarded at export.
 /// - Back / cancel discards the photo (returns null).
 class CropScreen extends StatefulWidget {
   final Uint8List bytes;
@@ -41,6 +46,163 @@ class CropScreen extends StatefulWidget {
   State<CropScreen> createState() => _CropScreenState();
 }
 
+enum _DrawMode { crop, pen, mosaic }
+
+/// One freehand stroke in IMAGE pixel coordinates. Points arrive quantized
+/// ([_BakeStroke] doubles) so the exporter in a background isolate never sees
+/// dart:ui types.
+class _Stroke {
+  _Stroke({required this.mosaic, required this.points, required this.width});
+  final bool mosaic;
+  final List<Offset> points;
+  /// Pen: line thickness in image px. Mosaic: block size in image px (the
+  /// painted band is ~2.2 blocks wide so one pass covers what it crosses).
+  final double width;
+
+  _BakeStroke toBake() => _BakeStroke(
+        mosaic: mosaic,
+        xs: [for (final p in points) p.dx],
+        ys: [for (final p in points) p.dy],
+        width: width,
+      );
+}
+
+/// Plain-data stroke for the background isolate (no dart:ui dependencies).
+class _BakeStroke {
+  _BakeStroke({required this.mosaic, required this.xs, required this.ys, required this.width});
+  final bool mosaic;
+  final List<double> xs;
+  final List<double> ys;
+  final double width;
+}
+
+class _BakeArgs {
+  _BakeArgs({required this.image, required this.strokes});
+  final img.Image image;
+  final List<_BakeStroke> strokes;
+}
+
+/// Round-capped coverage outline of a thick polyline — union of rounded
+/// segments. Used ONLY for mosaic (a blocky aesthetic hides the joints); the
+/// pen paints a smooth stroked centerline instead (see _polylinePath).
+Path _strokeOutline(List<Offset> pts, double width) {
+  final path = Path();
+  if (pts.isEmpty) return path;
+  final r = width / 2;
+  if (pts.length == 1) {
+    path.addOval(Rect.fromCircle(center: pts.first, radius: r));
+    return path;
+  }
+  for (var i = 0; i < pts.length - 1; i++) {
+    final rect = Rect.fromPoints(pts[i], pts[i + 1]);
+    path.addRRect(RRect.fromRectAndRadius(rect.inflate(r), Radius.circular(r)));
+  }
+  return path;
+}
+
+/// Centerline of a polyline — painted with a round-cap/round-join stroke, so
+/// the pen reads as one smooth continuous marker line (the old per-segment
+/// rounded-rect union looked like chained boxes at every joint).
+Path _polylinePath(List<Offset> pts) {
+  final path = Path();
+  if (pts.isEmpty) return path;
+  path.moveTo(pts.first.dx, pts.first.dy);
+  for (var i = 1; i < pts.length; i++) {
+    path.lineTo(pts[i].dx, pts[i].dy);
+  }
+  return path;
+}
+
+/// Background-isolate bake: draw every stroke into the decoded image with the
+/// `image` package, so the exported JPEG matches what the preview showed.
+img.Image _bakeStrokes(_BakeArgs args) {
+  final image = args.image;
+  for (final s in args.strokes) {
+    if (s.mosaic) {
+      _bakeMosaic(image, s);
+    } else {
+      _bakePen(image, s);
+    }
+  }
+  return image;
+}
+
+const int _penR = 0xE5, _penG = 0x48, _penB = 0x4D; // #E5484D, matches preview
+
+void _bakePen(img.Image image, _BakeStroke s) {
+  final color = image.getColor(_penR, _penG, _penB);
+  final thickness = s.width.round().clamp(1, 512);
+  final radius = (s.width / 2).round();
+  // a filled circle at EVERY point + line segments between: the circles mask
+  // the square joints drawLine would otherwise leave at each turn, matching
+  // the round-cap preview
+  for (var i = 0; i < s.xs.length; i++) {
+    final x = s.xs[i].round();
+    final y = s.ys[i].round();
+    img.fillCircle(image, x: x, y: y, radius: radius, color: color);
+    if (i > 0) {
+      img.drawLine(
+        image,
+        x1: s.xs[i - 1].round(),
+        y1: s.ys[i - 1].round(),
+        x2: x,
+        y2: y,
+        color: color,
+        thickness: thickness,
+      );
+    }
+  }
+}
+
+void _bakeMosaic(img.Image image, _BakeStroke s) {
+  final cell = s.width.round().clamp(4, 512);
+  // walk the polyline, averaging the grid cell under every sample point
+  final seen = <String>{};
+  void touch(double fx, double fy) {
+    final gx = (fx.round() ~/ cell) * cell;
+    final gy = (fy.round() ~/ cell) * cell;
+    final key = '$gx:$gy';
+    if (!seen.add(key)) return;
+    _fillMosaicBlock(image, gx, gy, cell);
+  }
+
+  for (var i = 0; i < s.xs.length - 1; i++) {
+    final x0 = s.xs[i], y0 = s.ys[i], x1 = s.xs[i + 1], y1 = s.ys[i + 1];
+    final len = math.sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+    final steps = (len / (cell / 2)).ceil().clamp(1, 8192);
+    for (var k = 0; k <= steps; k++) {
+      final t = k / steps;
+      touch(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+    }
+  }
+  if (s.xs.length == 1) touch(s.xs.first, s.ys.first);
+}
+
+void _fillMosaicBlock(img.Image image, int gx, int gy, int cell) {
+  final xStart = gx.clamp(0, image.width);
+  final yStart = gy.clamp(0, image.height);
+  final xEnd = (gx + cell).clamp(0, image.width);
+  final yEnd = (gy + cell).clamp(0, image.height);
+  if (xEnd <= xStart || yEnd <= yStart) return;
+  int r = 0, g = 0, b = 0, n = 0;
+  for (var y = yStart; y < yEnd; y += 2) {
+    for (var x = xStart; x < xEnd; x += 2) {
+      final p = image.getPixel(x, y);
+      r += p.r.toInt();
+      g += p.g.toInt();
+      b += p.b.toInt();
+      n++;
+    }
+  }
+  if (n == 0) return;
+  final avg = image.getColor(r ~/ n, g ~/ n, b ~/ n);
+  for (var y = yStart; y < yEnd; y++) {
+    for (var x = xStart; x < xEnd; x++) {
+      image.setPixel(x, y, avg);
+    }
+  }
+}
+
 class _CropScreenState extends State<CropScreen> {
   img.Image? _image;
   Rect? _crop; // in IMAGE pixel coordinates
@@ -54,6 +216,23 @@ class _CropScreenState extends State<CropScreen> {
   // batch session state
   bool _uploading = false;
   int _uploaded = 0;
+  // ── strokes ──────────────────────────────────────────────────────────────
+  _DrawMode _drawMode = _DrawMode.crop;
+  final List<_Stroke> _strokes = [];
+  int _penSizeIdx = 1; // 0=细 1=中 2=粗
+  int _mosaicIdx = 1; // 0=轻 1=中 2=重
+  static const _penFracs = [0.012, 0.03, 0.06]; // of image width
+  static const _mosaicFracs = [0.02, 0.04, 0.08]; // block size, of image width
+  ui.Image? _pixelated; // pixelated WHOLE image, for the mosaic preview layer
+  bool _pixelating = false;
+  /// Generation counter: every discard/rotate/load bumps it; a build whose
+  /// captured gen is stale disposes its result instead of installing it (the
+  /// old code let a slow older-tier build overwrite a newer one, or attach a
+  /// layer built from the pre-rotation image).
+  int _pixelGen = 0;
+
+  double get _penWidth => (_imgW * _penFracs[_penSizeIdx]).clamp(8.0, 512.0);
+  double get _mosaicCell => (_imgW * _mosaicFracs[_mosaicIdx]).clamp(8.0, 512.0);
 
   bool get _isBatch => widget.batch != null && widget.batch!.isNotEmpty;
   int _currentIndex = 0;
@@ -64,6 +243,12 @@ class _CropScreenState extends State<CropScreen> {
   void initState() {
     super.initState();
     _load();
+  }
+
+  @override
+  void dispose() {
+    _pixelated?.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -77,7 +262,11 @@ class _CropScreenState extends State<CropScreen> {
       _imgH = decoded.height.toDouble();
       _crop = _centeredCrop(_imgW, _imgH, widget.defaultCropRatio);
       _displayBytes = _encode(decoded);
+      _strokes.clear();
+      _drawMode = _DrawMode.crop; // fresh image: back to crop mode (batch flow)
+      _discardPixelated();
       if (mounted) setState(() => _loading = false);
+      // entering mosaic mode later builds it lazily; nothing eager here
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -104,30 +293,112 @@ class _CropScreenState extends State<CropScreen> {
       _imgH = rotated.height.toDouble();
       _crop = _centeredCrop(_imgW, _imgH, widget.defaultCropRatio); // centered box of the new frame
       _displayBytes = _encode(rotated);
+      // stroke coordinates are image-space; rotation remaps every point, so
+      // the honest (and simplest) behaviour is to start clean
+      _strokes.clear();
+      _discardPixelated();
     });
   }
 
-  void _confirm() {
-    final result = _cropAndEncode();
-    if (result == null) return;
-    if (_isBatch) {
-      _batchConfirm(result);
-    } else {
-      Navigator.of(context).pop(result);
+  void _setDrawMode(_DrawMode m) {
+    setState(() => _drawMode = m);
+    if (m == _DrawMode.mosaic) _ensurePixelated();
+  }
+
+  void _setPenSize(int i) => setState(() => _penSizeIdx = i);
+
+  void _setMosaic(int i) {
+    setState(() {
+      _mosaicIdx = i;
+      _discardPixelated();
+    });
+    _ensurePixelated();
+  }
+
+  void _discardPixelated() {
+    _pixelGen++;
+    _pixelated?.dispose();
+    _pixelated = null;
+    _pixelating = false;
+  }
+
+  /// Build (once) the nearest-neighbour downsampled whole image the mosaic
+  /// preview paints through clip paths. Generation-guarded against concurrent
+  /// tier switches / rotations / batch loads.
+  Future<void> _ensurePixelated() async {
+    final src = _image;
+    if (src == null || _pixelated != null || _pixelating) return;
+    _pixelating = true;
+    final gen = _pixelGen;
+    try {
+      final cell = _mosaicCell;
+      final small = img.copyResize(
+        src,
+        width: (src.width / cell).round().clamp(1, src.width),
+        height: (src.height / cell).round().clamp(1, src.height),
+        interpolation: img.Interpolation.nearest,
+      );
+      final bytes = Uint8List.fromList(img.encodeJpg(small, quality: 80));
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      codec.dispose();
+      if (!mounted) {
+        frame.image.dispose();
+        return;
+      }
+      if (gen != _pixelGen) {
+        // superseded by a tier switch / rotation / next image — drop it
+        frame.image.dispose();
+        return;
+      }
+      final old = _pixelated;
+      setState(() => _pixelated = frame.image);
+      old?.dispose();
+    } catch (_) {
+      // mosaic preview falls back to a flat placeholder; export still works
+    } finally {
+      if (gen == _pixelGen) _pixelating = false;
     }
   }
 
-  /// Crop the current image to the active frame and JPEG-encode it.
-  /// Returns null if no image/crop is ready.
-  Uint8List? _cropAndEncode() {
+  bool _confirming = false; // guards the (async) confirm against double taps
+
+  Future<void> _confirm() async {
+    if (_confirming || _uploading) return;
+    _confirming = true;
+    try {
+      final result = await _cropAndEncode();
+      if (result == null) return;
+      if (_isBatch) {
+        await _batchConfirm(result);
+      } else {
+        if (mounted) Navigator.of(context).pop(result);
+      }
+    } finally {
+      _confirming = false;
+    }
+  }
+
+  /// Bake the strokes into the image (background isolate), crop to the active
+  /// frame and JPEG-encode. Returns null if no image/crop is ready.
+  Future<Uint8List?> _cropAndEncode() async {
     final image = _image;
     final crop = _crop;
     if (image == null || crop == null) return null;
-    final x = crop.left.round().clamp(0, image.width - 1);
-    final y = crop.top.round().clamp(0, image.height - 1);
-    final w = crop.width.round().clamp(1, image.width - x);
-    final h = crop.height.round().clamp(1, image.height - y);
-    final cropped = img.copyCrop(image, x: x, y: y, width: w, height: h);
+    // strokes live in image space and are baked BEFORE cropping — parts
+    // outside the frame are naturally discarded by copyCrop
+    var work = image;
+    if (_strokes.isNotEmpty) {
+      work = await compute(
+        _bakeStrokes,
+        _BakeArgs(image: image, strokes: [for (final s in _strokes) s.toBake()]),
+      );
+    }
+    final x = crop.left.round().clamp(0, work.width - 1);
+    final y = crop.top.round().clamp(0, work.height - 1);
+    final w = crop.width.round().clamp(1, work.width - x);
+    final h = crop.height.round().clamp(1, work.height - y);
+    final cropped = img.copyCrop(work, x: x, y: y, width: w, height: h);
     return _encode(cropped);
   }
 
@@ -219,7 +490,7 @@ class _CropScreenState extends State<CropScreen> {
             onPressed: _uploading ? null : _rotate90,
           ),
           TextButton(
-            onPressed: _uploading ? null : _confirm,
+            onPressed: _uploading ? null : () => _confirm(),
             child: Text(confirmLabel),
           ),
         ],
@@ -231,6 +502,23 @@ class _CropScreenState extends State<CropScreen> {
               : _error != null
                   ? Center(child: Text(_error!, style: const TextStyle(color: Colors.white70)))
                   : _buildCrop(),
+          // bottom: draw-mode bar (crop / pen / mosaic + undo) with the stroke
+          // size rows only while a drawing mode is active
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: SafeArea(
+              top: false,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_drawMode != _DrawMode.crop) _strokeSettings(),
+                  _modeBar(),
+                ],
+              ),
+            ),
+          ),
           // Blocking "uploading" overlay for the batch crop→upload→next flow.
           if (_uploading)
             Positioned.fill(
@@ -249,6 +537,114 @@ class _CropScreenState extends State<CropScreen> {
               ),
             ),
         ],
+      ),
+    );
+  }
+
+  Widget _modeBar() {
+    Widget modeBtn(_DrawMode m, IconData icon, String label) {
+      final active = _drawMode == m;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: _uploading ? null : () => _setDrawMode(m),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: active ? const Color(0xFF2A5D8F) : Colors.transparent,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 18, color: active ? Colors.white : Colors.white70),
+                const SizedBox(width: 4),
+                Text(label, style: TextStyle(fontSize: 12, color: active ? Colors.white : Colors.white70)),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xEE101418),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            modeBtn(_DrawMode.crop, Icons.crop, '裁剪'),
+            modeBtn(_DrawMode.pen, Icons.edit, '画笔'),
+            modeBtn(_DrawMode.mosaic, Icons.blur_on, '马赛克'),
+            const SizedBox(width: 6),
+            IconButton(
+              tooltip: '撤销一笔',
+              // undo also retires the pixelated layer lazily? No — the layer
+              // covers the WHOLE image, it stays valid regardless of strokes.
+              onPressed: _strokes.isEmpty ? null : () => setState(() => _strokes.removeLast()),
+              icon: const Icon(Icons.undo, size: 20, color: Colors.white70),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _strokeSettings() {
+    final penActive = _drawMode == _DrawMode.pen;
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xEE101418),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(penActive ? '笔画大小' : '模糊度', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+            const SizedBox(width: 10),
+            for (var i = 0; i < 3; i++)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: _uploading ? null : () => penActive ? _setPenSize(i) : _setMosaic(i),
+                  child: Container(
+                    width: 34,
+                    height: 34,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: (penActive ? _penSizeIdx : _mosaicIdx) == i ? const Color(0xFF2A5D8F) : Colors.white10,
+                    ),
+                    child: penActive
+                        ? Icon(
+                            // same brush glyph, growing with the size tier
+                            Icons.brush,
+                            size: 13.0 + i * 4.0,
+                            color: Colors.white,
+                          )
+                        : Container(
+                            // dot size previews the block coarseness
+                            width: 8.0 + i * 5,
+                            height: 8.0 + i * 5,
+                            decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white70),
+                          ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -275,9 +671,32 @@ class _CropScreenState extends State<CropScreen> {
         );
         // imgRect-LOCAL crop rect (for the painter: canvas origin == imgRect top-left)
         final cropBox = Rect.fromLTWH(crop.left * scale, crop.top * scale, crop.width * scale, crop.height * scale);
+        // display-space strokes for the painter (canvas origin == imgRect TL):
+        // pen = smooth stroked centerline (+ a dot when it's a single tap),
+        // mosaic = coverage outline to clip the pixelated layer through
+        final displayStrokes = [
+          for (final s in _strokes)
+            if (s.mosaic)
+              _DisplayStroke(
+                mosaic: true,
+                outline: _strokeOutline(
+                  [for (final p in s.points) Offset(p.dx * scale, p.dy * scale)],
+                  s.width * 2.2 * scale,
+                ),
+              )
+            else
+              _DisplayStroke(
+                mosaic: false,
+                centerline: s.points.length > 1 ? _polylinePath([for (final p in s.points) Offset(p.dx * scale, p.dy * scale)]) : null,
+                dot: s.points.length == 1 ? Offset(s.points.first.dx * scale, s.points.first.dy * scale) : null,
+                lineWidth: s.width * scale,
+              ),
+        ];
+        final drawing = _drawMode != _DrawMode.crop;
         return GestureDetector(
-          onPanStart: (d) => _onPanStart(d.localPosition, imgRect, cd),
-          onPanUpdate: (d) => _onPanUpdate(d.delta, scale),
+          onPanStart: (d) => drawing ? _beginStroke(d.localPosition, imgRect, scale) : _onPanStart(d.localPosition, imgRect, cd),
+          onPanUpdate: (d) => drawing ? _extendStroke(d.localPosition, imgRect, scale) : _onPanUpdate(d.delta, scale),
+          onPanEnd: (_) => _lastPanDrawing = false,
           child: Stack(
             children: [
               Positioned.fromRect(
@@ -286,13 +705,49 @@ class _CropScreenState extends State<CropScreen> {
               ),
               Positioned.fromRect(
                 rect: imgRect,
-                child: CustomPaint(painter: _CropPainter(cropBox: cropBox, handleSize: widget.handleSize)),
+                child: CustomPaint(
+                  painter: _CropPainter(
+                    cropBox: cropBox,
+                    handleSize: widget.handleSize,
+                    strokes: displayStrokes,
+                    pixelated: _pixelated,
+                    drawHandles: !drawing,
+                  ),
+                ),
               ),
             ],
           ),
         );
       },
     );
+  }
+
+  bool _lastPanDrawing = false;
+
+  void _beginStroke(Offset local, Rect imgRect, double scale) {
+    if (_image == null) return;
+    final px = ((local.dx - imgRect.left) / scale).clamp(0.0, _imgW);
+    final py = ((local.dy - imgRect.top) / scale).clamp(0.0, _imgH);
+    final mosaic = _drawMode == _DrawMode.mosaic;
+    if (mosaic) _ensurePixelated();
+    _lastPanDrawing = true;
+    setState(() {
+      _strokes.add(_Stroke(
+        mosaic: mosaic,
+        points: [Offset(px, py)],
+        width: mosaic ? _mosaicCell : _penWidth,
+      ));
+    });
+  }
+
+  void _extendStroke(Offset local, Rect imgRect, double scale) {
+    if (!_lastPanDrawing || _strokes.isEmpty) return;
+    final px = ((local.dx - imgRect.left) / scale).clamp(0.0, _imgW);
+    final py = ((local.dy - imgRect.top) / scale).clamp(0.0, _imgH);
+    final s = _strokes.last;
+    final last = s.points.last;
+    if ((Offset(px, py) - last).distance < 2) return; // dedupe micro-jitter
+    setState(() => s.points.add(Offset(px, py)));
   }
 
   void _onPanStart(Offset local, Rect imgRect, Rect cd) {
@@ -341,10 +796,33 @@ class _CropScreenState extends State<CropScreen> {
   }
 }
 
+/// Stroke already converted to display space (canvas origin == image TL).
+class _DisplayStroke {
+  _DisplayStroke({required this.mosaic, this.outline, this.centerline, this.dot, this.lineWidth = 0});
+  final bool mosaic;
+  /// Mosaic only: coverage outline the pixelated layer is clipped through.
+  final Path? outline;
+  /// Pen only: polyline centerline, painted with a round-cap stroke.
+  final Path? centerline;
+  /// Pen only: single-tap stroke = one dot at this position.
+  final Offset? dot;
+  /// Pen only: stroke width in display px.
+  final double lineWidth;
+}
+
 class _CropPainter extends CustomPainter {
   final Rect cropBox; // relative to the canvas origin (== image display box)
   final double handleSize;
-  _CropPainter({required this.cropBox, required this.handleSize});
+  final List<_DisplayStroke> strokes;
+  final ui.Image? pixelated;
+  final bool drawHandles;
+  _CropPainter({
+    required this.cropBox,
+    required this.handleSize,
+    this.strokes = const [],
+    this.pixelated,
+    this.drawHandles = true,
+  });
   @override
   void paint(Canvas canvas, Size size) {
     // dim outside the frame — canvas coords are LOCAL to the image box
@@ -357,6 +835,45 @@ class _CropPainter extends CustomPainter {
         ..fillType = PathFillType.evenOdd,
       dim,
     );
+    // strokes paint OVER the dim veil so marks stay readable outside the frame
+    for (final s in strokes) {
+      if (s.mosaic) {
+        final outline = s.outline;
+        if (outline == null) continue;
+        final px = pixelated;
+        canvas.save();
+        canvas.clipPath(outline);
+        if (px != null) {
+          // stretch the pixelated whole image over the display box — the clip
+          // reveals the blocky version of exactly what's underneath
+          canvas.drawImageRect(
+            px,
+            Rect.fromLTWH(0, 0, px.width.toDouble(), px.height.toDouble()),
+            Rect.fromLTWH(0, 0, size.width, size.height),
+            Paint(),
+          );
+        } else {
+          // pixelated layer still decoding: neutral placeholder
+          canvas.drawPath(outline, Paint()..color = Colors.white24);
+        }
+        canvas.restore();
+      } else {
+        // pen: ONE smooth round-cap/round-join stroke along the centerline
+        // (per-segment rounded rects used to read as chained boxes)
+        final paint = Paint()
+          ..color = const Color(0xFFE5484D)
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round
+          ..strokeWidth = s.lineWidth;
+        final cl = s.centerline;
+        if (cl != null) canvas.drawPath(cl, paint);
+        final d = s.dot;
+        if (d != null) {
+          canvas.drawCircle(d, s.lineWidth / 2, Paint()..color = const Color(0xFFE5484D));
+        }
+      }
+    }
     // crop frame
     final frame = Paint()
       ..color = Colors.white
@@ -364,6 +881,7 @@ class _CropPainter extends CustomPainter {
       ..strokeWidth = 2;
     canvas.drawRect(r, frame);
     // corner handles at the configured size
+    if (!drawHandles) return;
     final h = Paint()..color = Colors.white;
     final half = handleSize / 2;
     for (final p in [r.topLeft, r.topRight, r.bottomLeft, r.bottomRight]) {
@@ -372,5 +890,10 @@ class _CropPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _CropPainter old) => old.cropBox != cropBox || old.handleSize != handleSize;
+  bool shouldRepaint(covariant _CropPainter old) =>
+      old.cropBox != cropBox ||
+      old.handleSize != handleSize ||
+      !identical(old.strokes, strokes) ||
+      !identical(old.pixelated, pixelated) ||
+      old.drawHandles != drawHandles;
 }

@@ -8,7 +8,7 @@ import type { LensConfig } from "./types.js";
  * release known to exist (pointing it at a future tag would 404 until that
  * release is actually published).
  */
-export const GITEE_APK_DEFAULT = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.0.0/app-release.apk";
+export const GITEE_APK_DEFAULT = "https://gitee.com/qianfengbingtang/phone-lens/releases/download/v1.1.0/app-release.apk";
 
 /** Coerce an unknown config object (cordis patch row / CLI overrides) into LensConfig. */
 export function normalizeConfig(raw: unknown): LensConfig {

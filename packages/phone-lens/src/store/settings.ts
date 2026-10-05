@@ -11,6 +11,21 @@ export interface AppSettings {
   saveMode: SaveMode;
   /** Absolute target folder for folder/both modes. Empty = built-in default. */
   saveDir: string;
+  /**
+   * Master switch for the model-facing camera tools (phone_take_photo /
+   * phone_camera_pause / phone_camera_resume). Privacy-sensitive: off means
+   * the model can never drive the phone camera; tool calls are denied with a
+   * visible reason.
+   */
+  modelToolsEnabled: boolean;
+  /**
+   * When true, model-initiated camera tool calls are auto-approved inside the
+   * plugin (the host approval dialog is bypassed). When false every call
+   * falls through to the host's per-call confirmation. **Defaults to false**:
+   * the model must ask before driving the user's phone camera — confirm-free
+   * is an explicit opt-IN.
+   */
+  modelToolsConfirmFree: boolean;
 }
 
 /**
@@ -27,7 +42,7 @@ export class AppSettingsStore {
     /** Built-in default folder when saveDir is empty. */
     private readonly defaultSaveDir: string,
   ) {
-    this.data = { saveMode: "composer", saveDir: "" };
+    this.data = { saveMode: "composer", saveDir: "", modelToolsEnabled: true, modelToolsConfirmFree: false };
     this.load();
   }
 
@@ -37,6 +52,8 @@ export class AppSettingsStore {
       const raw = JSON.parse(readFileSync(this.file, "utf8")) as Partial<AppSettings>;
       if (SAVE_MODES.includes(raw.saveMode as SaveMode)) this.data.saveMode = raw.saveMode as SaveMode;
       if (typeof raw.saveDir === "string") this.data.saveDir = raw.saveDir;
+      if (typeof raw.modelToolsEnabled === "boolean") this.data.modelToolsEnabled = raw.modelToolsEnabled;
+      if (typeof raw.modelToolsConfirmFree === "boolean") this.data.modelToolsConfirmFree = raw.modelToolsConfirmFree;
     } catch {
       // corrupt settings file: start with defaults rather than refuse to boot
     }
@@ -57,6 +74,8 @@ export class AppSettingsStore {
       // strip wrapping quotes (right-click "copy path" often adds them)
       this.data.saveDir = patch.saveDir.replace(/^["']|["']$/g, "").trim();
     }
+    if (typeof patch.modelToolsEnabled === "boolean") this.data.modelToolsEnabled = patch.modelToolsEnabled;
+    if (typeof patch.modelToolsConfirmFree === "boolean") this.data.modelToolsConfirmFree = patch.modelToolsConfirmFree;
     this.persist();
     return this.get();
   }

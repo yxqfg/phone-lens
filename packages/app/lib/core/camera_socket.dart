@@ -18,6 +18,12 @@ class CaptureCommand {
 /// encode at a time (slow encode drops frames rather than queueing).
 class CameraSocket {
   final String url;
+  /// The phone App's version (PackageInfo.version), announced in every hello
+  /// so the host can surface cross-end version-consistency hints. MUTABLE on
+  /// purpose: PackageInfo resolves asynchronously after the socket exists —
+  /// the first hello may go out without it, the next announce picks it up.
+  /// Older hosts ignore the extra field; older App builds send hello without it.
+  String? appVersion;
   final _commands = StreamController<CaptureCommand>.broadcast();
   final _states = StreamController<LensLinkState>.broadcast();
 
@@ -49,7 +55,7 @@ class CameraSocket {
   static const _heartbeatInterval = Duration(seconds: 10);
   static const _serverSilenceLimit = Duration(seconds: 30);
 
-  CameraSocket(this.url) {
+  CameraSocket(this.url, {this.appVersion}) {
     _connect();
   }
 
@@ -60,6 +66,11 @@ class CameraSocket {
   /// Called when the host asks this phone to stop/start preview streaming
   /// (another device owns the PC preview, or control switched back to us).
   void Function(bool active)? onPreviewState;
+
+  /// Host-initiated camera parking/waking (the model tools phone_camera_pause
+  /// / phone_camera_resume). [reqId] must be echoed back via
+  /// [reportCameraState] so the host can correlate its waiter.
+  void Function(String type, String? reqId)? onCameraControl;
 
   void _setState(LensLinkState s) {
     _state = s;
@@ -100,6 +111,8 @@ class CameraSocket {
             onPreviewState?.call(false);
           } else if (msg['type'] == 'resume_preview') {
             onPreviewState?.call(true);
+          } else if (msg['type'] == 'camera_idle' || msg['type'] == 'camera_resume') {
+            onCameraControl?.call(msg['type'] as String, msg['reqId'] as String?);
           }
         },
         onDone: () {
@@ -192,6 +205,7 @@ class CameraSocket {
       'height': height,
       'fps': fps,
       'rotation': rotation,
+      if (appVersion != null) 'appVersion': appVersion,
     }));
   }
 
@@ -228,6 +242,16 @@ class CameraSocket {
   /// host then pauses every other phone and resumes us.
   void makeMain() {
     _send(jsonEncode({'type': 'claim_active'}));
+  }
+
+  /// Receipt for a host-initiated camera_idle / camera_resume: [reqId] echoes
+  /// what the host sent so it can settle the right tool call.
+  void reportCameraState(String? reqId, String state) {
+    _send(jsonEncode({
+      'type': 'camera_state',
+      if (reqId != null) 'reqId': reqId,
+      'state': state,
+    }));
   }
 
   void _send(String text) {

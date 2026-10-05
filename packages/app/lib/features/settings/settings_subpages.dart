@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../core/api.dart';
 import '../../core/camera_socket.dart';
@@ -20,6 +21,45 @@ class ConnectionSettingsPage extends StatefulWidget {
 }
 
 class _ConnectionSettingsPageState extends State<ConnectionSettingsPage> {
+  final _api = LensApi();
+  // Cross-end version consistency: the active receiver's host version (from
+  // /status) vs the local App version. Older hosts omit `version` → "—" and
+  // no hint (graceful degradation).
+  String? _hostVersion;
+  String? _appVersion;
+  bool _probingVersion = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVersions();
+  }
+
+  @override
+  void dispose() {
+    _api.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadVersions() async {
+    final s = widget.store.server;
+    if (s == null || _probingVersion) return;
+    _probingVersion = true;
+    try {
+      final info = await _api.status(s);
+      if (!mounted) return;
+      setState(() => _hostVersion = info['version'] as String?);
+    } catch (_) {
+      if (mounted) setState(() => _hostVersion = null);
+    } finally {
+      _probingVersion = false;
+    }
+    try {
+      final pi = await PackageInfo.fromPlatform();
+      if (mounted) setState(() => _appVersion = pi.version);
+    } catch (_) {}
+  }
+
   Future<void> _serverActions(PairedServer s) async {
     final active = widget.store.server?.id == s.id;
     final action = await showModalBottomSheet<String>(
@@ -122,6 +162,25 @@ class _ConnectionSettingsPageState extends State<ConnectionSettingsPage> {
                         : null,
                     onTap: () => _serverActions(s),
                   ),
+                if (activeId != null)
+                  Builder(
+                    builder: (_) {
+                      final mismatch = _hostVersion != null && _appVersion != null && _hostVersion != _appVersion;
+                      return ListTile(
+                        dense: true,
+                        leading: Icon(
+                          mismatch ? Icons.warning_amber_rounded : Icons.verified_user_outlined,
+                          size: 20,
+                          color: mismatch ? const Color(0xFFD9A441) : Colors.white38,
+                        ),
+                        title: Text('电脑端版本', style: TextStyle(color: mismatch ? const Color(0xFFD9A441) : null)),
+                        subtitle: mismatch
+                            ? const Text('两端版本不一致,建议两端同时更新', style: TextStyle(color: Color(0xFFD9A441), fontSize: 11))
+                            : null,
+                        trailing: Text(_hostVersion ?? '—', style: const TextStyle(color: Colors.white70)),
+                      );
+                    },
+                  ),
               ],
             ),
           ),
@@ -165,6 +224,47 @@ class _CaptureSettingsPageState extends State<CaptureSettingsPage> {
     5: '5 分钟(推荐)',
     30: '30 分钟',
   };
+
+  static const _wakeFocusOptions = <int, String>{
+    0: '直接拍(无等待)',
+    800: '0.8 秒',
+    1500: '1.5 秒(推荐)',
+    3000: '3 秒',
+  };
+
+  String get _wakeFocusLabel =>
+      _wakeFocusOptions[widget.store.wakeFocusDelayMs] ?? '${widget.store.wakeFocusDelayMs} 毫秒';
+
+  Future<void> _pickWakeFocusDelay() async {
+    final v = await showModalBottomSheet<int>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(14),
+              child: Text('唤醒后对焦等待', style: TextStyle(fontWeight: FontWeight.w600)),
+            ),
+            for (final e in _wakeFocusOptions.entries)
+              ListTile(
+                leading: Icon(
+                  widget.store.wakeFocusDelayMs == e.key ? Icons.check_circle : Icons.radio_button_unchecked,
+                  color: widget.store.wakeFocusDelayMs == e.key ? Theme.of(ctx).colorScheme.primary : null,
+                ),
+                title: Text(e.value),
+                onTap: () => Navigator.pop(ctx, e.key),
+              ),
+            const SizedBox(height: 6),
+          ],
+        ),
+      ),
+    );
+    if (v != null) {
+      await widget.store.setWakeFocusDelayMs(v);
+      if (mounted) setState(() {});
+    }
+  }
 
   String get _idleLabel => _idleOptions[widget.store.cameraIdleTimeoutMin] ?? '${widget.store.cameraIdleTimeoutMin} 分钟';
 
@@ -221,6 +321,21 @@ class _CaptureSettingsPageState extends State<CaptureSettingsPage> {
               await widget.store.setFocusEnabled(v);
               if (mounted) setState(() {});
             },
+          ),
+          SwitchListTile(
+            title: const Text('拍照提醒'),
+            subtitle: const Text('电脑端(含对话内模型)请求本机拍照上传时,弹出消息条并震动提醒'),
+            value: widget.store.remoteCaptureAlert,
+            onChanged: (v) async {
+              await widget.store.setRemoteCaptureAlert(v);
+              if (mounted) setState(() {});
+            },
+          ),
+          ListTile(
+            title: const Text('唤醒后对焦等待'),
+            subtitle: const Text('摄像头从休眠被远程请求唤醒后,先等待自动对焦收敛再拍,避免糊片;0 为直接拍'),
+            trailing: Text(_wakeFocusLabel, style: const TextStyle(color: Colors.white70)),
+            onTap: _pickWakeFocusDelay,
           ),
           const SectionHeader('裁剪'),
           _buildCropRatioTile(),

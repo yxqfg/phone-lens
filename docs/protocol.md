@@ -39,7 +39,7 @@ Header:`X-LM-Device: <deviceId>`、`X-LM-Token: <deviceToken>`
 
 ### GET /status —— 运行状态(鉴权同上)
 ```json
-{ "devices": [ { "id": "...", "name": "Pixel 8", "online": true, "streaming": true, "lastSeenAt": 0 } ],
+{ "version": "1.0.4", "devices": [ { "id": "...", "name": "Pixel 8", "online": true, "streaming": true, "lastSeenAt": 0 } ],
   "camera": { "connected": true, "fps": 5.8, "latencyMs": 310 },
   "target": { "mode": "latest", "sessionId": "...", "sessionTitle": "..." },
   "lastInjection": { "at": 0, "sessionId": "...", "attachmentId": "..." } }
@@ -59,12 +59,17 @@ Header:`X-LM-Device: <deviceId>`、`X-LM-Token: <deviceToken>`
 - 连接 query:`?deviceId=...&token=...`
 - **二进制消息** = 单帧 JPEG(无头;尺寸/质量以 hello 协商为准),单帧 ≤ previewFrameMaxBytes
 - **文本消息**(JSON):
-  - 手机→服:`{"type":"hello","width":854,"height":480,"fps":6}`
+  - 手机→服:`{"type":"hello","width":854,"height":480,"fps":6,"appVersion":"1.0.4"(可选,App 版本,供双端一致性提醒;老 App 不带)}`
   - 手机→服:`{"type":"bye"}`(主动停流)
   - 服→手机:`{"type":"set_preview","maxWidth":854,"maxHeight":480,"fps":6,"jpegQuality":60}`(服务端可动态调)
-  - 服→手机:`{"type":"capture","captureId":"<uuid>","note":"可选备注"}`
+  - 服→手机:`{"type":"capture","captureId":"<uuid>","note":"可选备注","direct":<可选>true}`
+    (`direct:true` = 模型主动拍照(phone_take_photo 工具):host 侧照片直入模型上下文,不走用户拍照注入模式)
   - 手机→服:`{"type":"capture_result","captureId":"<uuid>","status":"taken"|"declined"|"failed"}`
     (随后照片走 `POST /upload?captureId=...`;captureId 关联回执)
+  - 服→手机:`{"type":"camera_idle","reqId":"<uuid>"}` / `{"type":"camera_resume","reqId":"<uuid>"}`
+    (模型工具:让手机摄像头提前进入空闲/立即恢复拍摄;手机处理后必须回执)
+  - 手机→服:`{"type":"camera_state","reqId":"<uuid>","state":"idle"|"live"|"failed"}`
+    (camera_idle/camera_resume 的执行回执;reqId 原样带回)
 - 心心:双方 20s ping/pong(ws 协议层);90s 无帧且无 pong 判离线
 
 ### 2.2 /ws/view —— 浏览器 downlink(仅回环;Web UI 小窗与降级页共用)

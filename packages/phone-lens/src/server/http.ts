@@ -9,6 +9,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import QRCode from "qrcode";
 import type { DeliveryReceipt, LensConfig } from "../types.js";
 import { ERROR_CODES } from "../types.js";
+import { checkHostUpdate } from "./update-check.js";
 import type { DeliverySink } from "../inject/deliver.js";
 import { admitImage, magicMatches, type AttachmentStoreLike } from "../inject/admit.js";
 import type { TargetTracker } from "../inject/target.js";
@@ -120,8 +121,15 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
   const heartbeat = setInterval(() => hub.pingAll(), 20_000);
 
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(config.server.port, config.server.host, () => resolve());
+    const onError = reject as (e: Error) => void;
+    server.once("error", onError);
+    server.listen(config.server.port, config.server.host, () => {
+      // detach the startup reject: leaving it attached would silently swallow
+      // RUNTIME server errors into an already-settled promise
+      server.removeListener("error", onError);
+      server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
+      resolve();
+    });
   });
   log("info", `phone-lens listening on ${config.server.host}:${config.server.port} (paired devices: ${devices.count()})`);
   // Warm the APK-link cache so the first rendered download QR already carries
@@ -168,6 +176,13 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
     return sendJson(res, 200, { name: "PhoneLens 直连取景", version: hostVersion(), requiresPairing: true }, cors);
+  }
+
+  // Loopback: plugin-update check for the floating panel (a colored hint line,
+  // never a dialog). Cached 12h host-side — a panel-open costs no API call.
+  if (method === "GET" && path === "/update-check") {
+    if (!loop) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "update check is loopback-only");
+    return sendJson(res, 200, await checkHostUpdate(), cors);
   }
 
   // ── loopback-only endpoints (preview page, QR, view stream) ──────────────
@@ -262,8 +277,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (!magicMatches(mediaType, buf)) return sendError(res, 415, ERROR_CODES.BAD_MAGIC, "bytes do not match the declared type");
 
     const captureId = q.get("captureId");
-    const note = q.get("note") ?? (captureId ? hub.noteFor(captureId) : undefined);
-    if (captureId) hub.consumeCapture(captureId);
+    const pending = captureId ? hub.consumeCapture(captureId) : null;
+    const note = q.get("note") ?? pending?.note;
     const rawName = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
     const name = sanitizeFileName(rawName);
 
@@ -278,6 +293,22 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
     // keep the local archive bounded (retention: maxStoredUploads oldest-first)
     if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
+
+    // Model-initiated capture (phone_take_photo tool): the photo goes straight
+    // to the model as an image context — never staged into the composer, never
+    // written to the save folder, regardless of the user's capture mode.
+    if (pending?.direct && pending.onImage) {
+      pending.onImage(admitted);
+      log("info", `direct-to-model photo: ${name} (${admitted.ref.attachmentId})`);
+      const directBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, delivered: null, deliverReason: "delivered-to-model" };
+      if (uploadId) {
+        if (ctx.uploadReplays.size > 400) {
+          for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
+        }
+        ctx.uploadReplays.set(uploadId, { expires: Date.now() + 10 * 60_000, body: directBody });
+      }
+      return sendJson(res, 200, directBody);
+    }
 
     // Capture-mode routing (user-selected in the web UI settings). The photo
     // always lands in the attachment store first; the mode decides what
@@ -381,6 +412,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const online = hub.onlineDeviceIds();
     return sendJson(res, 200, {
       bootAt: SERVER_BOOT_AT,
+      version: hostVersion(),
       devices: devices.list().map((d) => ({ id: d.deviceId, name: d.name, model: d.model, online: online.has(d.deviceId), streaming: online.has(d.deviceId), lastSeenAt: d.lastSeenAt })),
       camera: hub.stats(),
       preview: config.preview,
@@ -397,17 +429,19 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   // Loopback-only; the settings live on the host because the folder save runs here.
   if (method === "GET" && path === "/app-settings") {
     const st = deps.appSettings.get();
-    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, cors);
+    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree }, cors);
   }
   if (method === "POST" && path === "/app-settings") {
     const body = await readJsonBody(req, 4096);
     if (!body) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "invalid JSON body");
-    const patch: { saveMode?: SaveMode; saveDir?: string } = {};
+    const patch: { saveMode?: SaveMode; saveDir?: string; modelToolsEnabled?: boolean; modelToolsConfirmFree?: boolean } = {};
     if (typeof body.saveMode === "string" && SAVE_MODES.includes(body.saveMode as SaveMode)) patch.saveMode = body.saveMode as SaveMode;
     if (typeof body.saveDir === "string") patch.saveDir = body.saveDir;
+    if (typeof body.modelToolsEnabled === "boolean") patch.modelToolsEnabled = body.modelToolsEnabled;
+    if (typeof body.modelToolsConfirmFree === "boolean") patch.modelToolsConfirmFree = body.modelToolsConfirmFree;
     const st = deps.appSettings.set(patch);
-    log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"}`);
-    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir() }, cors);
+    log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"} modelTools=${st.modelToolsEnabled}/${st.modelToolsConfirmFree}`);
+    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree }, cors);
   }
 
   // View-side control also arrives over /ws/view; a loopback HTTP trigger is

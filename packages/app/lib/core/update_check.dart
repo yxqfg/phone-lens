@@ -92,7 +92,11 @@ Future<UpdateInfo?> checkForUpdate({http.Client? client}) async {
         if (assets is List) {
           for (final a in assets) {
             if (a is! Map) continue;
-            if (a['name'] != 'app-release.apk') continue;
+            final name = a['name'];
+            // startsWith tolerates Gitee's double-suffix quirk (uploads have
+            // twice landed as "app-release.apk.apk"); anything after the
+            // prefix is still gated by the trusted-host URL check below.
+            if (name is! String || !name.startsWith('app-release.apk')) continue;
             final u = a['browser_download_url'];
             if (u is String && isTrustedReleaseUrl(u)) apkUrl = u;
           }

@@ -28,6 +28,10 @@ class CameraSocket {
   final _states = StreamController<LensLinkState>.broadcast();
 
   WebSocketChannel? _ws;
+  /// Listen subscription of the CURRENT connection (`_ws`). Cancelling it is
+  /// the only way to stop a replaced/abandoned socket's onDone/onError from
+  /// firing into the state of whichever connection is live now.
+  StreamSubscription? _sub;
   Timer? _reconnect;
   int _attempt = 0;
   bool _closedByUser = false;
@@ -79,6 +83,10 @@ class CameraSocket {
 
   Future<void> _connect() async {
     if (_closedByUser) return;
+    // in-flight mutex: a handshake is already dialing (kick() racing the
+    // reconnect timer, or two kicks in a row) — a second _connect() here
+    // would create TWO live sockets for one CameraSocket
+    if (_state == LensLinkState.connecting) return;
     _setState(LensLinkState.connecting);
     WebSocketChannel? ws;
     try {
@@ -90,14 +98,28 @@ class CameraSocket {
         unawaited(ws.sink.close());
         return;
       }
+      // retire the ghost of a previous connection BEFORE this one takes over:
+      // cancel its listeners (its late onDone/onError must never touch the
+      // state of the new link) and drop the socket WITHOUT awaiting (close()
+      // hangs forever on a dead peer — the LAN black-hole lesson)
+      final oldSub = _sub;
+      _sub = null;
+      unawaited(oldSub?.cancel());
+      final prev = _ws;
+      if (prev != null && !identical(prev, ws)) {
+        unawaited(prev.sink.close());
+      }
       _ws = ws;
       _attempt = 0;
       _lastServerMsgAt = DateTime.now();
       _pongSeen = false; // per-connection: re-negotiate with whoever answers
       _setState(LensLinkState.connected);
       _startHeartbeat();
-      ws.stream.listen(
+      _sub = ws.stream.listen(
         (data) {
+          // identity guard: stale traffic from a replaced connection must not
+          // feed the heartbeat timers or re-arm the command stream
+          if (!identical(ws, _ws)) return;
           _lastServerMsgAt = DateTime.now();
           if (data is! String) return;
           final msg = jsonDecode(data) as Map<String, dynamic>;
@@ -116,10 +138,16 @@ class CameraSocket {
           }
         },
         onDone: () {
+          // identity guard: onDone of an ABANDONED socket (half-open link whose
+          // sink.close() only completed after the network healed, or one
+          // replaced by a newer connection) arrives late — it must never tear
+          // down the CURRENT healthy link
+          if (!identical(ws, _ws)) return;
           debugPrint('[lens-mate] camera ws closed (code=${ws?.closeCode} reason=${ws?.closeReason}) attempt=$_attempt');
           _scheduleReconnect();
         },
         onError: (Object e) {
+          if (!identical(ws, _ws)) return;
           debugPrint('[lens-mate] camera ws error: $e attempt=$_attempt');
           _scheduleReconnect();
         },
@@ -177,6 +205,12 @@ class CameraSocket {
   void _abortConnection() {
     final dead = _ws;
     _ws = null;
+    // detach the listeners FIRST (null out before cancelling so a re-entrant
+    // callback can't see a stale sub): a cancelled subscription never fires
+    // onDone, so the dead link can't re-enter _scheduleReconnect after us
+    final sub = _sub;
+    _sub = null;
+    unawaited(sub?.cancel());
     unawaited(dead?.sink.close());
     _scheduleReconnect();
   }
@@ -191,6 +225,9 @@ class CameraSocket {
       _send(jsonEncode({'type': 'ping'}));
       return;
     }
+    // mid-handshake: do NOT dial again (that would create a second live
+    // socket); the in-flight _connect() owns the outcome either way
+    if (_state == LensLinkState.connecting) return;
     _reconnect?.cancel();
     _attempt = 0;
     unawaited(_connect());
@@ -265,7 +302,13 @@ class CameraSocket {
     _closedByUser = true;
     _stopHeartbeat();
     _reconnect?.cancel();
+    // detach listeners before closing: the socket's onDone must not fire into
+    // the shutdown sequence (belt to _closedByUser's braces)
+    final sub = _sub;
+    _sub = null;
+    unawaited(sub?.cancel());
     await _ws?.sink.close();
+    _ws = null;
     _setState(LensLinkState.disconnected);
     await _commands.close();
     await _states.close();

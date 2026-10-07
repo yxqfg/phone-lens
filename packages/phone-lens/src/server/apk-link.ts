@@ -42,7 +42,10 @@ async function fetchLatestGiteeApk(): Promise<string | null> {
     if (!Array.isArray(assets)) return null;
     for (const asset of assets) {
       const row = asset as { name?: unknown; browser_download_url?: unknown };
-      if (row.name === "app-release.apk" && isTrustedGiteeAsset(row.browser_download_url)) {
+      // startsWith tolerates Gitee's double-suffix quirk (uploads have landed
+      // as "app-release.apk.apk"); the trusted-host check below still gates
+      // whatever URL follows the name.
+      if (typeof row.name === "string" && row.name.startsWith("app-release.apk") && isTrustedGiteeAsset(row.browser_download_url)) {
         return row.browser_download_url;
       }
     }

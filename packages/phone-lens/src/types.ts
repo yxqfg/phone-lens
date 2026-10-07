@@ -103,7 +103,12 @@ export type ViewServerMessage =
   | { type: "device"; online: boolean; name?: string }
   // host→view: the ACTIVE phone's stream stalled (user turned preview off on
   // the phone) or resumed. `on:false` lets the web UI clear the last frame.
-  | { type: "preview_state"; on: boolean }
+  // `reason:"offline"` = the LINK died (no frames AND no inbound keepalive
+  // past the offline threshold — wifi drop / half-open TCP), NOT a preview
+  // toggle; the UI must say "connection lost", not "preview closed".
+  // Optional field: old clients ignore it (they just show the old text), and
+  // old hosts never send it (client keeps legacy behavior).
+  | { type: "preview_state"; on: boolean; reason?: "offline" }
   | { type: "capture_pending"; captureId: string; note?: string }
   | { type: "pending_image"; attachmentId: string; name?: string }
   // folder-only save: the photo bypassed the composer; surface a local hint.

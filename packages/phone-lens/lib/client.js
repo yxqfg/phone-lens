@@ -268,6 +268,7 @@ window.__ModuleLoader__.load({
 				const [rename, setRename] = useState(null); // {id, name} — self-drawn rename dialog
 				const [appQr, setAppQr] = useState(null); // app-download QR dialog payload (or {loading}/{fallback:true})
 				const [previewOff, setPreviewOff] = useState(false); // host says the phone's stream stopped (preview off on the phone)
+				const [previewOffline, setPreviewOffline] = useState(false); // host flagged the LINK itself dead (wifi drop, no frames AND no keepalive) — not a preview toggle
 				const [settingsOpen, setSettingsOpen] = useState(false); // collapsible settings section under the main card
 				const [appSt, setAppSt] = useState(null); // {saveMode, saveDir, effectiveSaveDir} | null (null = host too old)
 				const [dirDraft, setDirDraft] = useState("");
@@ -341,9 +342,13 @@ window.__ModuleLoader__.load({
 						} else if (m.type === "frame_meta") {
 							if (m.rotation !== undefined) rotRef.current = m.rotation;
 						} else if (m.type === "preview_state") {
-							// host-derived: the ACTIVE phone's stream stopped (user turned
-							// preview off in the app) or started again
+							// host-derived: the ACTIVE phone's stream stopped — either the
+							// user turned preview off in the app (keepalive still alive) or
+							// the link itself died (no frames AND no keepalive for 25s →
+							// reason:"offline"). Old hosts never send `reason` → legacy
+							// behavior is kept bit-for-bit.
 							setPreviewOff(!m.on);
+							setPreviewOffline(!m.on && m.reason === "offline");
 						} else if (m.type === "upload_saved") {
 							// folder-only mode: the photo bypassed the composer; local hint
 							setFlashOk(`已保存至 ${m.dir || "指定文件夹"}`);
@@ -387,6 +392,7 @@ window.__ModuleLoader__.load({
 						ws.onclose = () => {
 							setCamOn(false);
 							setPreviewOff(false);
+							setPreviewOffline(false);
 							if (!stopped) timer = setTimeout(connect, 2000);
 						};
 				};
@@ -577,11 +583,13 @@ window.__ModuleLoader__.load({
 								{ className: "lm-body" },
 								// only show the viewfinder canvas while a camera is actually
 								// streaming; when the phone turned preview off, clear the last
-								// frame and say so instead of freezing on a stale picture
+								// frame and say so instead of freezing on a stale picture.
+								// previewOffline = the host proved the LINK died (no frames AND
+								// no keepalive 25s): say "connection lost", never "preview off"
 								camOn && !previewOff
 									? h("canvas", { ref: canvasRef, className: "lm-canvas", width: 360, height: 640 })
 									: camOn && previewOff
-										? h("div", { className: "lm-preview-off" }, "您在手机端已关闭预览功能")
+										? h("div", { className: "lm-preview-off" }, previewOffline ? "与手机的连接已中断(设备离线)" : "您在手机端已关闭预览功能")
 										: null,
 								h(
 									"div",
@@ -589,12 +597,14 @@ window.__ModuleLoader__.load({
 									h("span", null, camOn && !previewOff && fps > 0 ? `${fps} fps` : "—"),
 									h(
 										"span",
-										{ className: !camOn ? "warn-big" : previewOff ? "warn" : "" },
+										{ className: !camOn || previewOffline ? "warn-big" : previewOff ? "warn" : "" },
 										!camOn
 											? "手机未连接！相同局域网下扫码添加配对设备；若已配对过的手机，请在设置内点击本电脑端，激活为活动设备"
-											: previewOff
-												? "预览已关闭,在手机端重新开启后恢复"
-												: "预览中",
+											: previewOffline
+												? "连接已断开(手机离线),请检查手机网络;网络恢复后将自动重连"
+												: previewOff
+													? "预览已关闭,在手机端重新开启后恢复"
+													: "预览中",
 									),
 								),
 								// ── version hints (plain colored lines, never dialogs) ──

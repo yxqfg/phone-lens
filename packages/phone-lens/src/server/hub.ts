@@ -40,14 +40,29 @@ interface PendingCapture {
 const CAM_SILENCE_MS = 60_000;
 
 /**
- * How long the ACTIVE device's stream may go silent before views are told the
- * preview was turned off. The phone app never announces "preview off" — it
- * just stops pushing frames (the WS stays up) — so the host derives the state:
- * a live, open camera uplink with no frames for this long means the user
- * switched preview off on the phone. Device disconnects are signalled
- * separately via the `devices` list.
+ * How long the ACTIVE device's stream may go silent before the hub starts
+ * DERIVING its state (see checkPreviewStall). The phone app never announces
+ * "preview off" — it just stops its frame pump while the WS stays up and the
+ * app-level keepalive ping (every 10s, independent of the preview state)
+ * keeps flowing. So the discriminator is INBOUND TRAFFIC: "frames stalled +
+ * keepalive still arriving" = user turned preview off (confirmed event-side
+ * in confirmPreviewOff the moment a ping lands during a stall); "frames
+ * stalled + keepalive dead" = the link itself died.
  */
 const PREVIEW_STALL_MS = 3_000;
+
+/**
+ * No frames AND no inbound traffic at all (no app ping, no ws pong, no
+ * control) for this long = the link is dead, e.g. the phone left the wifi
+ * while the OS keeps the TCP socket half-open without a FIN. 25s = 2.5× the
+ * app's 10s keepalive period, so ONE lost ping (worst-case inbound gap 20s)
+ * can NEVER trip it — offline is only ever declared on the COMBINATION
+ * "frames stalled + inbound silent past this floor". Single-condition
+ * verdicts are forbidden here: 宁可晚判,不可误判. The 60s CAM_SILENCE_MS
+ * terminate below still owns the actual eviction; this only corrects the
+ * UI semantics ~35s earlier.
+ */
+const OFFLINE_SILENCE_MS = 25_000;
 
 /**
  * The viewfinder hub: MULTIPLE camera uplinks (one per phone, keyed by
@@ -75,8 +90,17 @@ export class ViewHub {
   private readonly captureTimeoutMs = 60_000;
   /** reqId → settle callback for in-flight camera_idle/camera_resume requests. */
   private cameraStateWaiters = new Map<string, { deviceId: string; settle: (r: CameraStateOutcome) => void }>();
-  /** Whether the active device is confirmed to be streaming (hello/frame seen). */
-  private previewOn = false;
+  /**
+   * Derived stream state of the ACTIVE device, read off the traffic mix:
+   *   "on"      — frames flowing
+   *   "off"     — frames stalled but the app keepalive ping still arrives
+   *               (hard evidence the link is alive) → user turned preview
+   *               off on the phone
+   *   "offline" — frames stalled AND no inbound at all past
+   *               OFFLINE_SILENCE_MS → the link itself died (wifi drop,
+   *               half-open TCP), which is NOT "preview closed"
+   */
+  private previewState: "on" | "off" | "offline" = "off";
   private stallTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -132,12 +156,19 @@ export class ViewHub {
       if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
     });
     ws.on("pong", () => {
+      // identity guard (same as close): a replaced uplink's late pong must not
+      // refresh the NEW connection's watchdog timestamp
       const c = this.cameras.get(deviceId);
-      if (c) c.lastSeenAt = Date.now();
+      if (c?.ws !== ws) return;
+      c.lastSeenAt = Date.now();
     });
     ws.on("message", (data, isBinary) => {
+      // identity guard (same as close): stale traffic from a replaced uplink
+      // must not refresh liveness, inject frames, or run controls into the
+      // state of the connection that owns this deviceId now
       const c = this.cameras.get(deviceId);
-      if (c) c.lastSeenAt = Date.now();
+      if (c?.ws !== ws) return;
+      c.lastSeenAt = Date.now();
       if (isBinary) {
         this.ingestFrame(deviceId, data as Buffer);
         return;
@@ -232,6 +263,10 @@ export class ViewHub {
         // app-level keepalive echo (see types.ts); lets the phone detect a
         // half-open link its OS would keep "connected" for minutes
         this.sendControl(deviceId, { type: "pong" });
+        // and it lets US discriminate: a stalled stream + a live ping = the
+        // user closed the preview on the phone, NOT a dead link. A wifi drop
+        // kills frames AND pings together — see confirmPreviewOff.
+        this.confirmPreviewOff(deviceId);
         break;
       case "capture_result":
         if (msg.status !== "taken") {
@@ -288,26 +323,74 @@ export class ViewHub {
 
   /** Flip the view-side preview state to on (once) when stream activity returns. */
   private markPreviewActive(): void {
-    if (this.previewOn) return;
-    this.previewOn = true;
-    this.broadcastToViews({ type: "preview_state", on: true });
+    this.setPreviewState("on");
   }
 
   /**
-   * Watchdog: an open, ACTIVE camera uplink that has gone silent means the
-   * user turned preview off on the phone (the app keeps the WS while only
-   * stopping its frame pump). Tell views so they can clear the stale frame.
-   * Disconnected devices are NOT handled here — the `devices` broadcast owns
-   * the offline state on the view side.
+   * The phone's app-level keepalive ping just arrived (10s cadence, runs
+   * regardless of the preview state). If the ACTIVE stream has been stalled
+   * past PREVIEW_STALL_MS, that ping is hard evidence the LINK is alive and
+   * only the frame pump stopped → "user turned preview off on the phone",
+   * NOT a disconnect. It also de-escalates a premature "offline" verdict
+   * back to "off" once inbound traffic returns (the consecutive-lost-pings
+   * edge case). Only the app-level ping qualifies as the discriminator:
+   * ws-pongs fire from the OS network stack even when the app is wedged, and
+   * hello announces a stream STARTING, so neither may drive this verdict.
+   */
+  private confirmPreviewOff(deviceId: string): void {
+    if (deviceId !== this.activeDeviceId) return;
+    const cam = this.cameras.get(deviceId);
+    if (!cam || Date.now() - cam.lastFrameAt <= PREVIEW_STALL_MS) return;
+    this.setPreviewState("off");
+  }
+
+  /** Single choke point for preview-state transitions + view notification. */
+  private setPreviewState(next: "on" | "off" | "offline"): void {
+    if (this.previewState === next) return;
+    this.previewState = next;
+    this.broadcastToViews({ type: "preview_state", on: next === "on", ...(next === "offline" ? { reason: "offline" } : {}) });
+    this.log(next === "offline" ? "warn" : "info", `active preview state → ${next}`);
+  }
+
+  /**
+   * Watchdog tick (1s): derives the ACTIVE device's stream state from the
+   * traffic mix. The phone never announces "preview off" — the host reads it
+   * off the wire:
+   *
+   *   frames flowing                             → "on"  (set in ingestFrame)
+   *   frames stalled + app ping still arriving   → "off" (flipped the moment
+   *                                               a ping lands during a stall,
+   *                                               in confirmPreviewOff)
+   *   frames stalled + NO inbound at all past
+   *   OFFLINE_SILENCE_MS (2.5 keepalive periods) → "offline" (half-open link:
+   *                                               wifi drop — NOT "preview
+   *                                               closed"; this is the bug
+   *                                               where a dead wifi used to
+   *                                               render as "preview off")
+   *
+   * Between 3s and 25s of stall the hub deliberately says NOTHING (the view
+   * keeps the last frame): a wifi drop and a preview-off look identical for
+   * the first seconds, and guessing early is exactly the misjudgment this
+   * watchdog must not make. 宁可晚判,不可误判. The 60s CAM_SILENCE_MS
+   * terminate in pingAll still owns the actual eviction; this only fixes
+   * the UI semantics ~35s earlier.
    */
   private checkPreviewStall(): void {
-    if (!this.previewOn) return;
     const active = this.activeCam();
     if (!active || active.ws.readyState !== active.ws.OPEN) return;
-    if (Date.now() - active.lastFrameAt <= PREVIEW_STALL_MS) return;
-    this.previewOn = false;
-    this.broadcastToViews({ type: "preview_state", on: false });
-    this.log("info", `active preview stalled >${PREVIEW_STALL_MS}ms — notified views (preview off)`);
+    const now = Date.now();
+    if (now - active.lastFrameAt <= PREVIEW_STALL_MS) return;
+    if (now - active.lastSeenAt < OFFLINE_SILENCE_MS) {
+      // stalled, but the keepalive window hasn't expired: either a ping is
+      // about to land (→ confirmPreviewOff flips to "off") or the silence
+      // will outlast OFFLINE_SILENCE_MS (→ "offline" below). Wait. Also note
+      // an existing "off" upgrades to "offline" here if the keepalive dies
+      // later (preview closed first, THEN the wifi dropped).
+      return;
+    }
+    // double condition, both strong: frames stalled >3s AND zero inbound for
+    // ≥25s (2.5 ping periods). A single lost ping can never reach this.
+    this.setPreviewState("offline");
   }
 
   // ── view side ─────────────────────────────────────────────────────────────
@@ -346,11 +429,12 @@ export class ViewHub {
     );
     this.broadcastDevicesTo(ws);
     // initial preview state so a freshly (re)loaded view renders the correct
-    // canvas/placeholder instead of guessing
-    ws.send(JSON.stringify({ type: "preview_state", on: this.previewOn } satisfies ViewServerMessage));
+    // canvas/placeholder instead of guessing (reason carries the offline
+    // verdict so a mid-incident reload still says "connection lost")
+    ws.send(JSON.stringify({ type: "preview_state", on: this.previewState === "on", ...(this.previewState === "offline" ? { reason: "offline" } : {}) } satisfies ViewServerMessage));
     // only replay a cached frame while the stream is confirmed fresh; a stale
     // frame would flash an old picture before the "preview off" state lands
-    if (this.previewOn && active?.lastFrame && ws.readyState === ws.OPEN) ws.send(active.lastFrame, { binary: true });
+    if (this.previewState === "on" && active?.lastFrame && ws.readyState === ws.OPEN) ws.send(active.lastFrame, { binary: true });
   }
 
   viewCount(): number {
@@ -388,7 +472,7 @@ export class ViewHub {
     // replay the cached frame only when the preview is confirmed streaming;
     // otherwise views would briefly show an old picture before the stall
     // watchdog reports "preview off"
-    if (this.previewOn && active?.lastFrame) {
+    if (this.previewState === "on" && active?.lastFrame) {
       for (const view of this.views) {
         if (view.readyState === view.OPEN) view.send(active.lastFrame, { binary: true });
       }

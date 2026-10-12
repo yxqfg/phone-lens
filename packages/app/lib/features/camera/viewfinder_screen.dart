@@ -110,6 +110,26 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   PairedServer? get _server => widget.store.server;
 
+  /// The server the CURRENT socket was built from. Pairing a new receiver
+  /// from the settings page reuses this phone's deviceId, so server.id — and
+  /// with it this screen's ValueKey — stays the same and the widget never
+  /// rebuilds; the socket would keep redialing the OLD receiver forever.
+  /// didUpdateWidget diffs against this snapshot to catch that switch.
+  PairedServer? _boundServer;
+
+  @override
+  void didUpdateWidget(ViewfinderScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final s = _server;
+    final b = _boundServer;
+    if (s == null || b == null) return;
+    if (s.host == b.host && s.port == b.port && s.deviceId == b.deviceId && s.token == b.token) return;
+    // same rebind sequence as _autoSelectAvailable / the re-pair button
+    _socket?.close();
+    _socket = null;
+    _connectSocket();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -343,7 +363,14 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _cameraGen++;
     final cam = _camera;
     _camera = null;
-    if (mounted) setState(() => _cameraReady = false);
+    if (mounted) {
+      setState(() {
+        _cameraReady = false;
+        // the zoom range died with the controller: keep it around and the
+        // next session's first zoom command clamps against a stale range
+        _zoomMin = null;
+      });
+    }
     final f = cam?.dispose();
     if (f != null) _cameraDisposing = f;
     await f;
@@ -381,6 +408,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// a remote shutter must self-heal that). Re-opens the camera, then the
   /// caller proceeds.
   Future<bool> _reviveFromAutoClose() async {
+    // another init is mid-flight (passive re-open race): _initCamera would
+    // merely queue a pending re-run and return NOW — judge readiness only
+    // after the in-flight init (and its queued re-run) settled, or a remote
+    // shutter arriving during a tab-switch reports a fake failure
+    for (var i = 0; i < 50 && _cameraInitBusy; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
     if (!_autoClosed) {
       if (!cameraReadyCheck) {
         await _initCamera();
@@ -413,6 +447,11 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     );
     _socket = socket;
     socket.states.listen((st) {
+      // identity guard: a rebind (new pairing / autoSelect) closes the OLD
+      // socket, whose late `disconnected` event must not paint the NEW link's
+      // UI red or trigger autoSelect cascades — without this the header stuck
+      // at "未连接" until the link physically dropped once
+      if (!identical(socket, _socket)) return;
       globalLink.value = st; // share with settings list
       if (mounted) setState(() => _link = st);
       if (st == LensLinkState.connected) {
@@ -433,6 +472,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     });
     socket.onPreviewState = (active) => _onHostPreviewState(active);
     socket.onCameraControl = (type, reqId) => _onHostCameraControl(type, reqId);
+    socket.onZoomControl = (factor, step, reqId) => _onHostZoom(factor, step, reqId);
+    // cancel the PREVIOUS socket's subscription before taking the new one:
+    // an overwritten-but-live subscription leaks when the old close() stalls
+    _cmdSub?.cancel();
     _cmdSub = socket.commands.listen(_onRemoteShutter);
     _encoder.onFrame = (jpeg) {
       _fpsWindowFrames++;
@@ -451,6 +494,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       );
     });
     // follow the receiver's live preview config (fps/resolution/quality)
+    _boundServer = s;
     _refreshPreviewParams(s);
   }
 
@@ -573,11 +617,8 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           await _shoot(captureId: cmd.captureId, note: cmd.note);
         } finally {
           if (mounted) setState(() => _sending = false);
-          // a camera_idle that arrived while we were shooting runs now
-          if (_pendingHostIdle) {
-            _pendingHostIdle = false;
-            unawaited(_onHostCameraControl('camera_idle', null));
-          }
+          // NOTE: a parked camera_idle is consumed by _shoot's own finally now
+          // (every shoot path funnels through it); nothing to do here anymore
         }
       });
       return;
@@ -611,6 +652,11 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     }
     if (type == 'camera_resume') {
       final wasAutoClosed = _autoClosed;
+      // snapshot ALL three: a failed resume must not silently clear the
+      // user's explicit stop intent (the stream would auto-resume on the
+      // next passive re-open, overriding 启动预览's "stay off" semantics)
+      final wasClosedByHost = _closedByHost;
+      final wasUserStopped = _userStopped;
       try {
         if (!cameraReadyCheck || _autoClosed) {
           debugPrint('[lens-mate] host requested camera resume');
@@ -630,12 +676,61 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       } finally {
         // a failed resume (e.g. app backgrounded, Android refuses the camera)
         // must not leave the idle flags cleared while the camera is actually
-        // down — roll back so the veil and the passive-init gates stay true
-        if (!cameraReadyCheck && wasAutoClosed) {
-          _autoClosed = true;
+        // down — roll the full trio back so the veil and the passive-init
+        // gates stay truthful
+        if (!cameraReadyCheck) {
+          _autoClosed = wasAutoClosed;
+          _closedByHost = wasClosedByHost;
+          _userStopped = wasUserStopped;
           if (mounted) setState(() {});
         }
       }
+    }
+  }
+
+  /// Host-initiated zoom set/step/query (the model tools phone_camera_zoom /
+  /// phone_camera_zoom_info). Reads and writes the SAME ValueNotifier the
+  /// pinch gesture uses, so the pill and the next gesture start from the
+  /// model's value — never a second zoom state. A zoom command NEVER revives
+  /// a parked camera on its own (that would give an invisible model action a
+  /// visible side effect); it just reports "camera off" instead.
+  Future<void> _onHostZoom(double? factor, double? step, String? reqId) async {
+    final c = _camera;
+    final min = _zoomMin;
+    final max = _zoomMax;
+    if (c == null || !cameraReadyCheck) {
+      _socket?.reportZoom(reqId, ok: false, reason: '相机未开启');
+      return;
+    }
+    if (min == null || max == null) {
+      // null here means "not read yet" (camera just re-opened, the range
+      // probe is still in flight) OR "genuinely no zoom control" — say so
+      // without claiming which, the model can retry in a moment
+      _socket?.reportZoom(reqId, ok: false, reason: '变焦不可用(设备不支持或相机尚未就绪,可稍后重试)');
+      return;
+    }
+    try {
+      var target = _zoom.value;
+      if (factor != null) {
+        target = factor;
+      } else if (step != null) {
+        target += step;
+      } // neither → pure query, target stays at the current ratio
+      // non-finite targets (host/model bug) fall back to the current ratio
+      if (!target.isFinite) target = _zoom.value;
+      // setZoomLevel THROWS on out-of-range values — clamp BEFORE the call,
+      // and await success before publishing so a failed set can't poison the
+      // pill or the next gesture's starting point
+      final clamped = target.clamp(min, max).toDouble();
+      if ((clamped - _zoom.value).abs() >= 0.01) {
+        await c.setZoomLevel(clamped);
+        _zoom.value = clamped;
+      }
+      _socket?.reportZoom(reqId, ok: true, factor: _zoom.value, min: min, max: max);
+    } catch (_) {
+      // controller released mid-await, camera busy, or the set genuinely
+      // failed — report and keep the last known-good ratio
+      _socket?.reportZoom(reqId, ok: false, reason: '变焦执行失败(相机忙或已释放)');
     }
   }
 
@@ -917,6 +1012,14 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     } finally {
       _lastSendAt = DateTime.now().millisecondsSinceEpoch;
       if (mounted) setState(() => _sending = false);
+      // a camera_idle that arrived mid-shot runs now — EVERY shoot path
+      // (local shutter, remote-ready, remote-revive) funnels through this
+      // finally, so a parked idle can never dangle until some future
+      // remote-revive happens to consume it
+      if (_pendingHostIdle) {
+        _pendingHostIdle = false;
+        unawaited(_onHostCameraControl('camera_idle', null));
+      }
     }
   }
 
@@ -977,7 +1080,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
             // enqueueing is fast, so the overlay barely shows
             onBatchUpload: (b, name) async {
               final finalBytes = await _applyUploadQuality(b);
-              await UploadQueue.instance.enqueue(bytes: finalBytes, name: name);
+              await UploadQueue.instance.enqueue(bytes: finalBytes, name: _asJpegNameIfNeeded(name, finalBytes));
             },
             defaultCropRatio: widget.store.defaultCropRatio,
             handleSize: widget.store.handleSize,
@@ -995,7 +1098,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       if (!mounted) return;
       var bytes = await f.readAsBytes();
       bytes = await _applyUploadQuality(bytes);
-      await UploadQueue.instance.enqueue(bytes: bytes, name: _galleryName(f.name));
+      await UploadQueue.instance.enqueue(bytes: bytes, name: _asJpegNameIfNeeded(_galleryName(f.name), bytes));
     }
     if (!mounted) return;
     final pending = UploadQueue.instance.pendingCount;
@@ -1010,6 +1113,16 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     var base = clean.isEmpty ? 'photo' : clean;
     base = base.replaceFirst(RegExp(r'\.[A-Za-z0-9]+$'), '');
     return '${base}_${DateTime.now().millisecondsSinceEpoch % 100000}.${isPng ? 'png' : 'jpg'}';
+  }
+
+  /// Medium/low quality re-encodes gallery PNGs into JPEG bytes, but the
+  /// gallery-derived name kept ".png" — the PC then saved a JPEG under a .png
+  /// filename. Fix by the FINAL bytes' magic (high quality passes originals
+  /// through untouched, so a true PNG keeps its honest name).
+  String _asJpegNameIfNeeded(String name, Uint8List bytes) {
+    final isJpeg = bytes.length > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+    if (!isJpeg || !name.toLowerCase().endsWith('.png')) return name;
+    return name.replaceFirst(RegExp(r'\.[A-Za-z0-9]+$'), '.jpg');
   }
 
   void _toast(String msg) => _showToast(msg, const Duration(milliseconds: 1500));
@@ -1440,7 +1553,12 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         _zoom.value = z;
       });
     } catch (_) {
-      if (mounted) setState(() => _zoomMin = null);
+      // "device has no zoom" and "controller replaced mid-read" land in the
+      // same catch: only wipe the capability when THIS controller is still
+      // the live one — a release/init race must not erase a good device's
+      // zoom range (pinch gestures and the pill would vanish until the
+      // next successful open re-reads them)
+      if (mounted && identical(c, _camera)) setState(() => _zoomMin = null);
     }
   }
 

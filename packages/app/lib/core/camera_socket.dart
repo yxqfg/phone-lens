@@ -76,6 +76,11 @@ class CameraSocket {
   /// [reportCameraState] so the host can correlate its waiter.
   void Function(String type, String? reqId)? onCameraControl;
 
+  /// Host-initiated zoom set/step/query (the model tools phone_camera_zoom /
+  /// phone_camera_zoom_info). Neither [factor] nor [step] = pure query.
+  /// [reqId] must be echoed back via [reportZoom].
+  void Function(double? factor, double? step, String? reqId)? onZoomControl;
+
   void _setState(LensLinkState s) {
     _state = s;
     _states.add(s);
@@ -122,7 +127,18 @@ class CameraSocket {
           if (!identical(ws, _ws)) return;
           _lastServerMsgAt = DateTime.now();
           if (data is! String) return;
-          final msg = jsonDecode(data) as Map<String, dynamic>;
+          // malformed text frames (host bug, a proxy in the middle) must not
+          // kill the subscription: an exception thrown from onData would
+          // silently cancel the stream under cancelOnError and leave the link
+          // "connected" with a dead command channel
+          Map<String, dynamic> msg;
+          try {
+            final decoded = jsonDecode(data);
+            if (decoded is! Map<String, dynamic>) return;
+            msg = decoded;
+          } catch (_) {
+            return; // drop the junk frame, keep the link
+          }
           if (msg['type'] == 'pong') {
             _pongSeen = true; // host speaks keepalive — arm the eviction
             return;
@@ -135,6 +151,14 @@ class CameraSocket {
             onPreviewState?.call(true);
           } else if (msg['type'] == 'camera_idle' || msg['type'] == 'camera_resume') {
             onCameraControl?.call(msg['type'] as String, msg['reqId'] as String?);
+          } else if (msg['type'] == 'camera_zoom') {
+            // cast via num on purpose: JSON "2" decodes as int, and a direct
+            // `as double` on an int throws (classic Dart footgun)
+            onZoomControl?.call(
+              (msg['factor'] as num?)?.toDouble(),
+              (msg['step'] as num?)?.toDouble(),
+              msg['reqId'] as String?,
+            );
           }
         },
         onDone: () {
@@ -291,6 +315,27 @@ class CameraSocket {
     }));
   }
 
+  /// Receipt for a host-initiated camera_zoom (set/step/query alike):
+  /// [reqId] echoes what the host sent so it can settle the right tool call.
+  void reportZoom(
+    String? reqId, {
+    required bool ok,
+    double? factor,
+    double? min,
+    double? max,
+    String? reason,
+  }) {
+    _send(jsonEncode({
+      'type': 'zoom_result',
+      if (reqId != null) 'reqId': reqId,
+      'ok': ok,
+      if (factor != null) 'factor': factor,
+      if (min != null) 'min': min,
+      if (max != null) 'max': max,
+      if (reason != null) 'reason': reason,
+    }));
+  }
+
   void _send(String text) {
     if (_state != LensLinkState.connected) return;
     try {
@@ -307,7 +352,11 @@ class CameraSocket {
     final sub = _sub;
     _sub = null;
     unawaited(sub?.cancel());
-    await _ws?.sink.close();
+    // NEVER await a (possibly dead) peer's close handshake — the LAN
+    // black-hole lesson: it hangs forever, and while it hung the state
+    // event + stream closes below were stuck too, so callers that rebind
+    // (pair a new receiver) kept listening to a zombie socket
+    unawaited(_ws?.sink.close());
     _ws = null;
     _setState(LensLinkState.disconnected);
     await _commands.close();

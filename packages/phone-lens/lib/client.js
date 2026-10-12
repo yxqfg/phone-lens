@@ -277,6 +277,11 @@ window.__ModuleLoader__.load({
 			const wsRef = useRef(null);
 			const framesRef = useRef(0);
 			const rotRef = useRef(0);
+			// last devices-broadcast length — the onmessage closure never re-runs
+			// (the WS effect depends only on wsUrl), so comparing against the
+			// `devices` STATE there read a stale first-render value and fired the
+			// QR-rotation flash on EVERY broadcast instead of only on growth
+			const lastDeviceCount = useRef(0);
 
 			const baseUrl = `http://127.0.0.1:${port}`;
 			const wsUrl = `ws://127.0.0.1:${port}/ws/view`;
@@ -368,8 +373,10 @@ window.__ModuleLoader__.load({
 								.catch((e) => setFlashErr("自动放入失败: " + String(e && e.message || e).slice(0, 90)));
 						} else if (m.type === "devices") {
 							// side effects OUT of the updater (updaters must stay pure —
-							// StrictMode double-invokes them); compare here, setState below
-							const grew = (m.devices || []).length > (devices ? devices.length : 0);
+							// StrictMode double-invokes them); compare against the ref,
+							// NOT the `devices` state (stale-closure trap), then setState
+							const grew = (m.devices || []).length > lastDeviceCount.current;
+							lastDeviceCount.current = (m.devices || []).length;
 							setDevices(m.devices || []);
 							// a NEW device came online → the one-time pairing code was
 							// consumed; rotate the QR so the next scan sees a fresh code
@@ -385,6 +392,12 @@ window.__ModuleLoader__.load({
 								if (prev === "disconnected") return "connecting";
 								return prev;
 							});
+						} else if (m.type === "paired") {
+							// a phone completed /pair — the one-time pairing code burned
+							// with it. Rotate the QR right now; the devices-list growth
+							// path also rotates, but only once the uplink actually lands.
+							setFlashOk(`设备已配对${m.name ? ": " + m.name : ""},二维码已更换`);
+							void refreshQr(true);
 						} else if (m.type === "error") {
 							setFlashErr(`${m.code}${m.message ? ":" + m.message : ""}`);
 						}
@@ -928,9 +941,11 @@ window.__ModuleLoader__.load({
 										{ className: "lm-setsec-rows" },
 										// tool names in the open (user-requested): what the
 										// model will actually see in its tool list
-										infoRow("拍摄照片(phone_take_photo)", "手机立即拍照,照片直接进入模型视野——不放入输入框、不保存到电脑文件夹,与拍照注入模式设置无关。", "w1"),
-										infoRow("关闭手机摄像头(phone_camera_pause)", "让手机相机提前进入空闲省电状态。", "w2"),
-										infoRow("恢复手机摄像头(phone_camera_resume)", "立即打开相机并恢复预览拍摄。", "w3"),
+									infoRow("拍摄照片(phone_take_photo)", "手机立即拍照,照片直接进入模型视野——不放入输入框、不保存到电脑文件夹,与拍照注入模式设置无关。", "w1"),
+									infoRow("关闭手机摄像头(phone_camera_pause)", "让手机相机提前进入空闲省电状态。", "w2"),
+									infoRow("恢复手机摄像头(phone_camera_resume)", "立即打开相机并恢复预览拍摄。", "w3"),
+									infoRow("调整变焦(phone_camera_zoom)", "按指定倍数(或步进)拉近/拉远手机镜头,取景画面与照片同步生效,超出设备范围自动收拢。", "w4"),
+									infoRow("查询变焦(phone_camera_zoom_info)", "读取手机当前变焦倍数与设备支持的变焦范围。", "w5"),
 									),
 								),
 								flash ? h("div", { className: "lm-setsec-note", key: "f" }, flash) : null,

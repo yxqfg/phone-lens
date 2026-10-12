@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
-import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, ViewClientMessage, ViewServerMessage } from "../types.js";
+import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, ViewClientMessage, ViewServerMessage, ZoomOutcome } from "../types.js";
 
 /** Per-device camera uplink state; multiple phones coexist without kicking. */
 interface CamState {
@@ -38,6 +38,34 @@ interface PendingCapture {
  * 30s app-level silence limit so the phone normally tears down first.
  */
 const CAM_SILENCE_MS = 60_000;
+
+/** Oldest phone App that understands the camera_zoom control (zoom tools).
+ * MUST track the release the zoom tools actually ship in — the app version
+ * itself is 1.1.2 (zoom rides a patch release), not 1.2.0. */
+const ZOOM_MIN_APP = "1.1.2";
+
+/** How long a timed-out direct capture stays "abandoned" (late-photo guard). */
+const ABANDON_DIRECT_TTL_MS = 5 * 60_000;
+
+/**
+ * Compare "1.2.0"-style dotted versions. Malformed/missing segments parse as
+ * 0, so "1.2" >= "1.2.0" and garbage never accidentally passes a floor.
+ */
+function versionAtLeast(v: string | undefined, need: string): boolean {
+  if (!v) return false;
+  const seg = (s: string): number => {
+    const m = /^(\d+)/.exec(s.trim());
+    return m ? Number(m[1]) : 0;
+  };
+  const a = v.split(".");
+  const b = need.split(".");
+  for (let i = 0; i < 3; i++) {
+    const x = seg(a[i] ?? "");
+    const y = seg(b[i] ?? "");
+    if (x !== y) return x > y;
+  }
+  return true;
+}
 
 /**
  * How long the ACTIVE device's stream may go silent before the hub starts
@@ -90,6 +118,8 @@ export class ViewHub {
   private readonly captureTimeoutMs = 60_000;
   /** reqId → settle callback for in-flight camera_idle/camera_resume requests. */
   private cameraStateWaiters = new Map<string, { deviceId: string; settle: (r: CameraStateOutcome) => void }>();
+  /** reqId → settle callback for in-flight camera_zoom requests (set/step/query). */
+  private zoomWaiters = new Map<string, { deviceId: string; settle: (r: ZoomOutcome) => void }>();
   /**
    * Derived stream state of the ACTIVE device, read off the traffic mix:
    *   "on"      — frames flowing
@@ -118,6 +148,10 @@ export class ViewHub {
     for (const [id, waiter] of this.cameraStateWaiters) {
       waiter.settle({ ok: false, reason: "接收端服务已停止" });
       this.cameraStateWaiters.delete(id);
+    }
+    for (const [id, waiter] of this.zoomWaiters) {
+      waiter.settle({ ok: false, reason: "接收端服务已停止" });
+      this.zoomWaiters.delete(id);
     }
     for (const [id, p] of this.pendingCaptures) {
       p.onFail?.("接收端服务已停止");
@@ -155,6 +189,12 @@ export class ViewHub {
       this.log("warn", `camera ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (${name} ${deviceId.slice(0, 8)})`);
       if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
     });
+    // ws contract (same as attachView): without an error listener a malformed
+    // frame (e.g. a buggy phone sending a full-res JPEG past maxPayload)
+    // throws out of the EventEmitter and can kill the host process
+    ws.on("error", (err) => {
+      this.log("warn", `camera ws error: ${String(err)} (${name} ${deviceId.slice(0, 8)})`);
+    });
     ws.on("pong", () => {
       // identity guard (same as close): a replaced uplink's late pong must not
       // refresh the NEW connection's watchdog timestamp
@@ -189,6 +229,12 @@ export class ViewHub {
       if (waiter.deviceId === deviceId) {
         waiter.settle({ ok: false, reason: "手机已断开连接" });
         this.cameraStateWaiters.delete(id);
+      }
+    }
+    for (const [id, waiter] of this.zoomWaiters) {
+      if (waiter.deviceId === deviceId) {
+        waiter.settle({ ok: false, reason: "手机已断开连接" });
+        this.zoomWaiters.delete(id);
       }
     }
     if (this.activeDeviceId === deviceId) {
@@ -286,7 +332,28 @@ export class ViewHub {
           const waiter = this.cameraStateWaiters.get(msg.reqId);
           if (waiter) {
             this.cameraStateWaiters.delete(msg.reqId);
-            waiter.settle(msg.state === "failed" ? { ok: false, reason: "手机报告执行失败(相机不可用或权限被拒)" } : { ok: true, state: msg.state });
+            // explicit whitelist: an undefined/unknown state must read as
+            // failure, never fall through into an optimistic ok:true
+            waiter.settle(
+              msg.state === "idle" || msg.state === "live"
+                ? { ok: true, state: msg.state }
+                : { ok: false, reason: "手机报告执行失败(相机不可用或权限被拒)" },
+            );
+          }
+        }
+        break;
+      }
+      case "zoom_result": {
+        // receipt for the model tools' camera_zoom set/step/query requests
+        if (msg.reqId) {
+          const waiter = this.zoomWaiters.get(msg.reqId);
+          if (waiter) {
+            this.zoomWaiters.delete(msg.reqId);
+            waiter.settle(
+              msg.ok && typeof msg.factor === "number" && Number.isFinite(msg.factor)
+                ? { ok: true, factor: msg.factor, ...(typeof msg.min === "number" ? { min: msg.min } : {}), ...(typeof msg.max === "number" ? { max: msg.max } : {}) }
+                : { ok: false, reason: msg.reason ?? "手机报告变焦执行失败" },
+            );
           }
         }
         break;
@@ -376,6 +443,11 @@ export class ViewHub {
    * the UI semantics ~35s earlier.
    */
   private checkPreviewStall(): void {
+    // piggyback the capture GC on this 1s tick: a capture whose phone never
+    // delivers must time out on ITS OWN (previously it lingered until the
+    // NEXT capture request, and the web-UI shutter hung with no feedback)
+    this.gcCaptures();
+    this.gcAbandonedDirect();
     const active = this.activeCam();
     if (!active || active.ws.readyState !== active.ws.OPEN) return;
     const now = Date.now();
@@ -400,6 +472,12 @@ export class ViewHub {
     ws.on("close", (code, reason) => {
       this.log("warn", `view ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (views left: ${this.views.size - 1})`);
       this.views.delete(ws);
+    });
+    // ws contract: an unhandled "error" emission THROWS (EventEmitter rule) and
+    // can take the whole host down — a malformed/oversized frame is enough.
+    // ws always follows error with close, and close already detaches.
+    ws.on("error", (err) => {
+      this.log("warn", `view ws error: ${String(err)}`);
     });
     ws.on("message", (data, isBinary) => {
       if (isBinary) return;
@@ -524,6 +602,13 @@ export class ViewHub {
     return pending;
   }
 
+  /** Read a pending capture WITHOUT consuming it (admit-first flow: the
+   * record must survive an admitImage failure so the phone's retry can still
+   * route the photo to the waiting model tool). */
+  peekCapture(captureId: string): PendingCapture | null {
+    return this.pendingCaptures.get(captureId) ?? null;
+  }
+
   noteFor(captureId: string): string | undefined {
     return this.pendingCaptures.get(captureId)?.note;
   }
@@ -534,8 +619,33 @@ export class ViewHub {
       if (p.requestedAt < cutoff) {
         p.onFail?.("拍摄请求已超时");
         this.pendingCaptures.delete(id);
+        // web-UI shutter with no phone answer: close the loop visibly instead
+        // of leaving "快门已触发…" hanging forever (model-direct captures
+        // report through their own tool promise — no broadcast for those)
+        if (!p.direct) {
+          this.broadcastToViews({ type: "error", code: "CAPTURE_TIMEOUT", message: "拍摄请求已超时(手机未上传)" });
+        }
       }
     }
+  }
+
+  /** captureId → abandon time: direct captures that timed out but whose photo
+   * may STILL arrive. The upload handler drops those instead of injecting a
+   * surprise photo into the user's composer/folder after the tool already
+   * reported failure. */
+  private abandonedDirect = new Map<string, number>();
+
+  private gcAbandonedDirect(): void {
+    const cutoff = Date.now() - ABANDON_DIRECT_TTL_MS;
+    for (const [id, at] of this.abandonedDirect) {
+      if (at < cutoff) this.abandonedDirect.delete(id);
+    }
+  }
+
+  /** True when this captureId belongs to a model-direct capture that already
+   * timed out (its late photo must not fall into the capture mode). */
+  isAbandonedDirect(captureId: string): boolean {
+    return this.abandonedDirect.has(captureId);
   }
 
   /**
@@ -552,7 +662,12 @@ export class ViewHub {
       }
       const captureId = randomUUID();
       let settled = false;
-      const timer = setTimeout(() => finish({ ok: false, reason: `拍照超时(手机未在 ${Math.round(timeoutMs / 1000)} 秒内上传照片)` }), timeoutMs);
+      const timer = setTimeout(() => {
+        // the tool call is about to report failure — a photo landing AFTER
+        // this moment must be dropped, never delivered into the composer
+        this.abandonedDirect.set(captureId, Date.now());
+        finish({ ok: false, reason: `拍照超时(手机未在 ${Math.round(timeoutMs / 1000)} 秒内上传照片)` });
+      }, timeoutMs);
       const finish = (r: { ok: true; admitted: AdmittedImage } | { ok: false; reason: string }): void => {
         if (settled) return;
         settled = true;
@@ -599,6 +714,45 @@ export class ViewHub {
       };
       this.cameraStateWaiters.set(reqId, { deviceId, settle: finish });
       this.sendControl(deviceId, { type: action, reqId } satisfies CameraControl);
+    });
+  }
+
+  /**
+   * Model tool: set / step / query the ACTIVE phone's zoom ratio. Settles with
+   * the phone's zoom_result receipt (or a timeout). App builds before 1.2.0
+   * have no camera_zoom branch at all — they would silently swallow the
+   * command and burn the whole timeout, so fail fast with an upgrade hint
+   * instead (undefined appVersion = pre-1.0.4 build, same bucket).
+   */
+  requestZoom(params: { factor?: number; step?: number }, timeoutMs: number): Promise<ZoomOutcome> {
+    return new Promise((resolve) => {
+      const active = this.activeCam();
+      if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+        resolve({ ok: false, reason: "没有已连接的手机" });
+        return;
+      }
+      if (!versionAtLeast(active.meta.appVersion, ZOOM_MIN_APP)) {
+        resolve({ ok: false, reason: `手机 App 版本过旧(变焦需 ≥ ${ZOOM_MIN_APP}),请先更新手机端` });
+        return;
+      }
+      const reqId = randomUUID();
+      const deviceId = this.activeDeviceId;
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, reason: "手机未在时限内回执(可能不在前台或已断连)" }), timeoutMs);
+      const finish = (r: ZoomOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.zoomWaiters.delete(reqId);
+        resolve(r);
+      };
+      this.zoomWaiters.set(reqId, { deviceId, settle: finish });
+      this.sendControl(deviceId, {
+        type: "camera_zoom",
+        ...(params.factor !== undefined ? { factor: params.factor } : {}),
+        ...(params.step !== undefined ? { step: params.step } : {}),
+        reqId,
+      } satisfies CameraControl);
     });
   }
 

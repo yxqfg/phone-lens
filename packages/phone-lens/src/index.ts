@@ -74,7 +74,7 @@ export default class PhoneLens extends Service {
     // INACTIVE_EFFECT and took the receiver down with it. The receiver is
     // mandatory; the tools are optional.
     try {
-      const PHONE_TOOLS = new Set(["phone_take_photo", "phone_camera_pause", "phone_camera_resume"]);
+      const PHONE_TOOLS = new Set(["phone_take_photo", "phone_camera_pause", "phone_camera_resume", "phone_camera_zoom", "phone_camera_zoom_info"]);
     // Direct ctx.tools access, same as dsh-better-sidebar's registerOpenTool:
     // on the real host the tools service is already mounted by the time
     // plugins load, so a plain property read works. (ctx.inject(['tools'], …)
@@ -128,11 +128,20 @@ export default class PhoneLens extends Service {
       },
     );
     if (toolsSvc && typeof toolsSvc.register === "function") {
-      const disposers: Array<() => void> = [];
+      // NOTE: no shadowing `disposers` here — the outer array (which also
+      // carries the guard disposer) must be the one and only cleanup list.
+      // A shadowed inner list once left the stale guard on the tools service
+      // across plugin reloads, permanently denying the model tools.
       const textOutput = { schema: { type: "string" } as const, render: (_args: unknown, value: unknown) => [{ type: "text" as const, text: String(value) }] };
       const asText = (args: unknown, key: string): string | undefined => {
         const v = (args as Record<string, unknown> | null)?.[key];
         return typeof v === "string" && v.trim() ? v.trim().slice(0, 60) : undefined;
+      };
+      // Number.isFinite guard: the model can hand back NaN/Infinity-flavoured
+      // junk that must never travel down to the phone as a zoom target
+      const numArg = (args: unknown, key: string): number | undefined => {
+        const v = (args as Record<string, unknown> | null)?.[key];
+        return typeof v === "number" && Number.isFinite(v) ? v : undefined;
       };
       disposers.push(
         toolsSvc.register(
@@ -223,6 +232,57 @@ export default class PhoneLens extends Service {
           }) as never,
         ),
       );
+      disposers.push(
+        toolsSvc.register(
+          defineTool({
+            name: "phone_camera_zoom",
+            description:
+              "调整用户配对手机摄像头的变焦倍数(拉近/拉远)。" +
+              "两种用法:设定绝对倍数(如 factor=2.0 表示放大到 2 倍,1.0 为原始大小)," +
+              "或相对当前倍数步进(如 step=1 放大一档、step=-1 缩小一档;档位大小由手机决定)。" +
+              "超出设备支持范围时会自动收拢到最近的可用倍数,返回设置后的实际倍数与设备支持范围。" +
+              "相机未开启、设备不支持变焦或手机 App 版本过旧时返回失败原因。" +
+              "变焦会同时作用于取景画面与后续拍摄的照片。",
+            parameters: {
+              factor: { type: "number", description: "目标变焦倍数(绝对值),如 1.0=原始、2.0=放大到 2 倍" },
+              step: { type: "number", description: "相对当前倍数的步进量,正值放大、负值缩小,如 1 或 -1" },
+            },
+            output: textOutput,
+            async execute(args: unknown) {
+              const factor = numArg(args, "factor");
+              const step = numArg(args, "step");
+              if (factor === undefined && step === undefined) {
+                return "请提供 factor(目标倍数)或 step(步进)中的至少一个;只想查询当前倍数请用 phone_camera_zoom_info。";
+              }
+              const r = await hub.requestZoom({ factor, step }, 8_000);
+              if (!r.ok) return `变焦失败: ${r.reason}`;
+              const range = r.min !== undefined && r.max !== undefined ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
+              return `变焦成功:当前 ${fmtX(r.factor)}${range}。`;
+            },
+          }) as never,
+        ),
+      );
+      disposers.push(
+        toolsSvc.register(
+          defineTool({
+            name: "phone_camera_zoom_info",
+            description:
+              "查询用户配对手机摄像头当前的变焦倍数和设备支持的变焦范围。" +
+              "适用于需要先了解当前画面放大状态、再决定变焦幅度时。" +
+              "相机未开启或设备不支持变焦时返回失败原因。",
+            parameters: {},
+            output: textOutput,
+            async execute() {
+              const r = await hub.requestZoom({}, 8_000);
+              if (!r.ok) return `查询失败: ${r.reason}`;
+              const range = r.min !== undefined && r.max !== undefined ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
+              return `当前变焦 ${fmtX(r.factor)}${range}。`;
+            },
+          }) as never,
+        ),
+      );
+      // "2x" for whole numbers, "1.5x" otherwise — human-readable ratios
+      const fmtX = (v: number): string => (Number.isInteger(v) ? `${v}x` : `${v.toFixed(2).replace(/\.?0+$/, "")}x`);
       ctx.effect?.(() => () => {
         for (const d of disposers) {
           try {
@@ -232,7 +292,7 @@ export default class PhoneLens extends Service {
           }
         }
       }, "phone-lens.modelTools()");
-      log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume)");
+      log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_zoom_info)");
     } else {
       log("info", "no tools service on this ctx — model camera tools skipped (standalone/dev)");
     }
@@ -242,6 +302,11 @@ export default class PhoneLens extends Service {
     }
 
     let handle: LensServerHandle | null = null;
+    // set the moment the fiber disposes: the server promise may still be
+    // mid-listen, and without this flag its .then would park a live server
+    // (http + heartbeat + wss + hub timers) that nobody will ever dispose —
+    // EADDRINUSE on the next load, timers stacking on every reload
+    let disposed = false;
     startLensServer({
       config,
       pairing,
@@ -256,6 +321,10 @@ export default class PhoneLens extends Service {
       log,
     })
       .then(async (h) => {
+        if (disposed) {
+          void h.dispose();
+          return;
+        }
         handle = h;
         const { code, expiresAt } = pairing.current();
         const qr = await buildPairingQr(code, expiresAt, config);
@@ -272,6 +341,7 @@ export default class PhoneLens extends Service {
       });
 
     ctx.effect(() => () => {
+      disposed = true;
       void handle?.dispose();
       handle = null;
     }, "phone-lens.server()");

@@ -163,6 +163,12 @@ class UploadQueue {
       }
     } catch (e) {
       debugPrint('[lens-mate] upload queue restore failed: $e');
+      // keep the corrupt file from poisoning every future boot (it would
+      // parse-fail again each start while its photos sit orphaned); the
+      // orphaned photo files themselves stay on disk, user-recoverable
+      try {
+        await File('$_dirPath/queue.json').rename('$_dirPath/queue.json.corrupt');
+      } catch (_) {}
     }
     kick();
   }
@@ -178,8 +184,10 @@ class UploadQueue {
     final id = const Uuid().v4();
     final dir = _dirPath;
     if (dir == null) {
-      debugPrint('[lens-mate] upload queue not ready — photo dropped');
-      return;
+      // THROW, never swallow: the caller's catch turns this into a visible
+      // "拍摄失败" + a failed receipt to the host — a silent return here
+      // told BOTH sides "success" while the photo evaporated
+      throw Exception('本地存储不可用,无法保存照片');
     }
     // id prefix keeps names unique even when two shots share a second
     final filePath = '$dir/${id.substring(0, 8)}__$name';
@@ -362,6 +370,7 @@ class UploadQueue {
           _notify();
           await _persist();
           await _recordFailure(item, receipt, server.name);
+          await _trimFailed();
           continue; // move on to the rest of the queue
         }
 
@@ -456,9 +465,38 @@ class UploadQueue {
     try {
       final meta = File('$dir/queue.json');
       await meta.parent.create(recursive: true);
-      await meta.writeAsString(jsonEncode(items.value.map((e) => e.toJson()).toList()), flush: true);
+      final payload = jsonEncode(items.value.map((e) => e.toJson()).toList());
+      // atomic replace: a truncated queue.json (power loss mid-write) used
+      // to wipe the WHOLE queue on the next restore — tmp+rename keeps the
+      // previous file intact until the new one is fully flushed to disk
+      final tmp = File('$dir/queue.json.tmp');
+      await tmp.writeAsString(payload, flush: true);
+      try {
+        await tmp.rename(meta.path);
+      } catch (_) {
+        // a platform that refuses rename-over-existing: degrade to the
+        // direct write rather than losing persistence entirely
+        await meta.writeAsString(payload, flush: true);
+      }
     } catch (e) {
       debugPrint('[lens-mate] queue persist failed: $e');
     }
+  }
+
+  /// Hard-failed entries keep their photos on disk for inspection, but
+  /// without a cap a receiver mismatch (AUTH_REQUIRED) stacks EVERY future
+  /// shot — 1-3MB each — until the device fills up. Keep the newest 20.
+  static const _maxFailed = 20;
+  Future<void> _trimFailed() async {
+    final failed = items.value.where((i) => i.status == UploadStatus.failed).toList();
+    if (failed.length <= _maxFailed) return;
+    // items are in enqueue order, so the oldest failed come first
+    final evict = failed.take(failed.length - _maxFailed).toList();
+    final evictIds = evict.map((e) => e.id).toSet();
+    items.value = items.value.where((i) => !evictIds.contains(i.id)).toList();
+    for (final e in evict) {
+      _deleteFileQuietly(e.filePath);
+    }
+    await _persist();
   }
 }

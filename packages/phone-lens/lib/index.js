@@ -6,7 +6,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
-import { readFile, readdir, stat, unlink } from "node:fs/promises";
+import { readFile, readdir, rm, stat, unlink } from "node:fs/promises";
 import { WebSocketServer } from "ws";
 import QRCode from "qrcode";
 import { fileURLToPath } from "node:url";
@@ -828,6 +828,9 @@ function drawFrame(buf) {
     if (now - fpsTimer >= 1000) { $('fps').textContent = (frames * 1000 / (now - fpsTimer)).toFixed(1) + ' fps'; frames = 0; fpsTimer = now; }
     lastFrameAt = now;
   };
+  // truncated/corrupt JPEG: onload never fires and the blob URL leaks —
+  // revoke on error too (same fix the main client already has)
+  img.onerror = () => URL.revokeObjectURL(url);
   img.src = url;
 }
 
@@ -860,6 +863,12 @@ function connect() {
         $('hint').style.display = m.online ? 'none' : '';
         $('hint').textContent = '等待手机连接…';
         break;
+      case 'paired':
+        // pairing consumed the one-time code: rotate the QR now, don't wait
+        // for the uplink (this page keys off nothing else to trigger it)
+        log('设备已配对' + (m.name ? ': ' + m.name : '') + ',二维码已更换', 'ok');
+        void refreshQr();
+        break;
       case 'capture_pending':
         pendingShot = m.captureId;
         log('快门已触发' + (m.note ? '(' + m.note + ')' : '') + '…');
@@ -872,6 +881,29 @@ function connect() {
       case 'upload':
         log('图片已入库 ' + (m.name || ''), 'ok');
         break;
+      // modern-protocol branches (this page previously only knew the retired
+      // messages, so photos succeeded silently and preview-off was invisible)
+      case 'pending_image':
+        if (pendingShot) { pendingShot = null; log('照片已入库,已放入输入框' + (m.name ? ': ' + m.name : ''), 'ok'); }
+        else log('照片已入库,已放入输入框' + (m.name ? ': ' + m.name : ''), 'ok');
+        break;
+      case 'upload_saved':
+        if (pendingShot) pendingShot = null;
+        log('已保存至 ' + (m.dir || '指定文件夹') + (m.name ? ' · ' + m.name : ''), 'ok');
+        break;
+      case 'preview_state':
+        if (!m.on && m.reason === 'offline') { $('dev').textContent = '连接已断开'; $('hint').textContent = '等待手机连接…'; $('hint').style.display = ''; }
+        else if (!m.on) { $('dev').textContent = '预览已关闭'; $('hint').textContent = '手机端已停止预览'; $('hint').style.display = ''; }
+        break;
+      case 'devices': {
+        const active = (m.devices || []).find((d) => d.active);
+        $('dot').className = active ? 'on' : '';
+        $('dev').textContent = active ? (active.name || '已连接') : '未连接';
+        $('shoot').disabled = !active;
+        $('hint').style.display = active ? 'none' : '';
+        $('hint').textContent = '等待手机连接…';
+        break;
+      }
       case 'error':
         log('错误 ' + m.code + (m.message ? ': ' + m.message : ''), 'err');
         break;
@@ -1066,15 +1098,22 @@ async function startLensServer(deps) {
 		done(404, "Not Found");
 	});
 	const heartbeat = setInterval(() => hub.pingAll(), 2e4);
-	await new Promise((resolve$1, reject) => {
-		const onError = reject;
-		server.once("error", onError);
-		server.listen(config.server.port, config.server.host, () => {
-			server.removeListener("error", onError);
-			server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
-			resolve$1();
+	try {
+		await new Promise((resolve$1, reject) => {
+			const onError = reject;
+			server.once("error", onError);
+			server.listen(config.server.port, config.server.host, () => {
+				server.removeListener("error", onError);
+				server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
+				resolve$1();
+			});
 		});
-	});
+	} catch (error) {
+		clearInterval(heartbeat);
+		for (const client of wss.clients) client.terminate();
+		await new Promise((resolve$1) => wss.close(() => resolve$1()));
+		throw error;
+	}
 	log("info", `phone-lens listening on ${config.server.host}:${config.server.port} (paired devices: ${devices.count()})`);
 	resolveLatestGiteeApk().then((url) => {
 		if (url) log("info", `APK download link resolved from Gitee API: ${url}`);
@@ -1089,6 +1128,43 @@ async function startLensServer(deps) {
 			await new Promise((resolve$1) => server.close(() => resolve$1()));
 		}
 	};
+}
+/** Composer-staged photos older than this get swept (best effort). */
+const PENDING_TTL_MS = 24 * 60 * 6e4;
+/**
+
+* Cache an idempotent 200 receipt for a phone retry. The 400 cap must be a
+
+* HARD cap: within the 10min TTL a retry storm can keep the map full of
+
+* fresh entries, so once expired ones are gone we still evict oldest-first
+
+* (Map iteration order = insertion order).
+
+*/
+function rememberReplay(ctx, uploadId, body) {
+	if (!uploadId) return;
+	if (ctx.uploadReplays.size > 400) {
+		for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
+		while (ctx.uploadReplays.size >= 400) {
+			const oldest = ctx.uploadReplays.keys().next().value;
+			if (oldest === void 0) break;
+			ctx.uploadReplays.delete(oldest);
+		}
+	}
+	ctx.uploadReplays.set(uploadId, {
+		expires: Date.now() + 10 * 6e4,
+		body
+	});
+}
+/** Best-effort TTL sweep for composer-staged photos (see the staging site). */
+async function prunePending(dir, ttlMs) {
+	const cutoff = Date.now() - ttlMs;
+	for (const entry of await readdir(dir).catch(() => [])) {
+		const p = join(dir, entry);
+		const st = await stat(p).catch(() => null);
+		if (st?.isFile() && st.mtimeMs < cutoff) await rm(p, { force: true }).catch(() => {});
+	}
 }
 async function handle(deps, req, res, ctx) {
 	const { config, pairing, devices, hub, targets, sink, log } = deps;
@@ -1184,6 +1260,10 @@ async function handle(deps, req, res, ctx) {
 			tokenHash: hashToken(token)
 		});
 		log("info", `paired device "${name}" (${deviceId.slice(0, 8)})`);
+		hub.broadcastToViews({
+			type: "paired",
+			name
+		});
 		return sendJson(res, 200, {
 			token,
 			serverInfo: {
@@ -1214,7 +1294,8 @@ async function handle(deps, req, res, ctx) {
 		if (truncated) return sendError(res, 413, ERROR_CODES.TOO_LARGE, `> ${config.limits.maxUploadBytes} bytes`);
 		if (!magicMatches(mediaType, buf)) return sendError(res, 415, ERROR_CODES.BAD_MAGIC, "bytes do not match the declared type");
 		const captureId = q.get("captureId");
-		const pending = captureId ? hub.consumeCapture(captureId) : null;
+		const pending = captureId ? hub.peekCapture(captureId) : null;
+		const abandoned = captureId ? hub.isAbandonedDirect(captureId) : false;
 		const note = q.get("note") ?? pending?.note;
 		const rawName = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
 		const name = sanitizeFileName(rawName);
@@ -1230,6 +1311,22 @@ async function handle(deps, req, res, ctx) {
 			return sendError(res, 500, ERROR_CODES.STORE_FAILED, String(error));
 		}
 		log("info", `stored ${name} (${buf.byteLength}B) → ${admitted.storage}:${admitted.ref.attachmentId}`);
+		if (pending) hub.consumeCapture(captureId);
+		if (abandoned) {
+			log("warn", `dropping late direct-capture photo: ${name} (${admitted.ref.attachmentId})`);
+			const droppedBody = {
+				ok: true,
+				attachmentId: admitted.ref.attachmentId,
+				width: admitted.ref.width,
+				height: admitted.ref.height,
+				bytes: admitted.ref.bytes,
+				storage: admitted.storage,
+				delivered: null,
+				deliverReason: "dropped-late-direct"
+			};
+			rememberReplay(ctx, uploadId, droppedBody);
+			return sendJson(res, 200, droppedBody);
+		}
 		if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
 		if (pending?.direct && pending.onImage) {
 			pending.onImage(admitted);
@@ -1244,15 +1341,7 @@ async function handle(deps, req, res, ctx) {
 				delivered: null,
 				deliverReason: "delivered-to-model"
 			};
-			if (uploadId) {
-				if (ctx.uploadReplays.size > 400) {
-					for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
-				}
-				ctx.uploadReplays.set(uploadId, {
-					expires: Date.now() + 10 * 6e4,
-					body: directBody
-				});
-			}
+			rememberReplay(ctx, uploadId, directBody);
 			return sendJson(res, 200, directBody);
 		}
 		const st = deps.appSettings.get();
@@ -1283,6 +1372,7 @@ async function handle(deps, req, res, ctx) {
 			} catch (error) {
 				log("warn", `staging failed: ${String(error)}`);
 			}
+			prunePending(deps.pendingDir, PENDING_TTL_MS).catch(() => {});
 			hub.broadcastToViews({
 				type: "pending_image",
 				attachmentId: admitted.ref.attachmentId,
@@ -1293,7 +1383,7 @@ async function handle(deps, req, res, ctx) {
 			name,
 			dir: savedDir
 		});
-		if (uploadId) {
+		{
 			const replayBody = {
 				ok: true,
 				attachmentId: admitted.ref.attachmentId,
@@ -1304,24 +1394,18 @@ async function handle(deps, req, res, ctx) {
 				delivered: null,
 				deliverReason: savedDir ? wantComposer ? "saved-and-staged" : "saved-to-folder" : "staged-in-composer"
 			};
-			if (ctx.uploadReplays.size > 400) {
-				for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
-			}
-			ctx.uploadReplays.set(uploadId, {
-				expires: Date.now() + 10 * 6e4,
-				body: replayBody
+			rememberReplay(ctx, uploadId, replayBody);
+			return sendJson(res, 200, {
+				ok: true,
+				attachmentId: admitted.ref.attachmentId,
+				width: admitted.ref.width,
+				height: admitted.ref.height,
+				bytes: admitted.ref.bytes,
+				storage: admitted.storage,
+				delivered: null,
+				deliverReason: savedDir ? wantComposer ? "saved-and-staged" : "saved-to-folder" : "staged-in-composer"
 			});
 		}
-		return sendJson(res, 200, {
-			ok: true,
-			attachmentId: admitted.ref.attachmentId,
-			width: admitted.ref.width,
-			height: admitted.ref.height,
-			bytes: admitted.ref.bytes,
-			storage: admitted.storage,
-			delivered: null,
-			deliverReason: savedDir ? wantComposer ? "saved-and-staged" : "saved-to-folder" : "staged-in-composer"
-		});
 	}
 	if (method === "GET" && path.startsWith("/pending/") && loop) {
 		const id = path.slice(9).split("/")[0] ?? "";
@@ -1523,6 +1607,36 @@ async function pruneUploads(dir, max) {
 
 */
 const CAM_SILENCE_MS = 6e4;
+/** Oldest phone App that understands the camera_zoom control (zoom tools).
+
+* MUST track the release the zoom tools actually ship in — the app version
+
+* itself is 1.1.2 (zoom rides a patch release), not 1.2.0. */
+const ZOOM_MIN_APP = "1.1.2";
+/** How long a timed-out direct capture stays "abandoned" (late-photo guard). */
+const ABANDON_DIRECT_TTL_MS = 5 * 6e4;
+/**
+
+* Compare "1.2.0"-style dotted versions. Malformed/missing segments parse as
+
+* 0, so "1.2" >= "1.2.0" and garbage never accidentally passes a floor.
+
+*/
+function versionAtLeast(v, need) {
+	if (!v) return false;
+	const seg = (s) => {
+		const m = /^(\d+)/.exec(s.trim());
+		return m ? Number(m[1]) : 0;
+	};
+	const a = v.split(".");
+	const b = need.split(".");
+	for (let i = 0; i < 3; i++) {
+		const x = seg(a[i] ?? "");
+		const y = seg(b[i] ?? "");
+		if (x !== y) return x > y;
+	}
+	return true;
+}
 /**
 
 * How long the ACTIVE device's stream may go silent before the hub starts
@@ -1605,6 +1719,8 @@ var ViewHub = class {
 	captureTimeoutMs = 6e4;
 	/** reqId → settle callback for in-flight camera_idle/camera_resume requests. */
 	cameraStateWaiters = new Map();
+	/** reqId → settle callback for in-flight camera_zoom requests (set/step/query). */
+	zoomWaiters = new Map();
 	/**
 	
 	* Derived stream state of the ACTIVE device, read off the traffic mix:
@@ -1641,6 +1757,13 @@ var ViewHub = class {
 				reason: "接收端服务已停止"
 			});
 			this.cameraStateWaiters.delete(id);
+		}
+		for (const [id, waiter] of this.zoomWaiters) {
+			waiter.settle({
+				ok: false,
+				reason: "接收端服务已停止"
+			});
+			this.zoomWaiters.delete(id);
 		}
 		for (const [id, p] of this.pendingCaptures) {
 			p.onFail?.("接收端服务已停止");
@@ -1679,6 +1802,9 @@ var ViewHub = class {
 			this.log("warn", `camera ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (${name} ${deviceId.slice(0, 8)})`);
 			if (this.cameras.get(deviceId)?.ws === ws) this.detachCamera(deviceId);
 		});
+		ws.on("error", (err) => {
+			this.log("warn", `camera ws error: ${String(err)} (${name} ${deviceId.slice(0, 8)})`);
+		});
 		ws.on("pong", () => {
 			const c = this.cameras.get(deviceId);
 			if (c?.ws !== ws) return;
@@ -1706,6 +1832,13 @@ var ViewHub = class {
 				reason: "手机已断开连接"
 			});
 			this.cameraStateWaiters.delete(id);
+		}
+		for (const [id, waiter] of this.zoomWaiters) if (waiter.deviceId === deviceId) {
+			waiter.settle({
+				ok: false,
+				reason: "手机已断开连接"
+			});
+			this.zoomWaiters.delete(id);
 		}
 		if (this.activeDeviceId === deviceId) {
 			const next = [...this.cameras.keys()].at(-1) ?? null;
@@ -1792,12 +1925,30 @@ var ViewHub = class {
 					const waiter = this.cameraStateWaiters.get(msg.reqId);
 					if (waiter) {
 						this.cameraStateWaiters.delete(msg.reqId);
-						waiter.settle(msg.state === "failed" ? {
-							ok: false,
-							reason: "手机报告执行失败(相机不可用或权限被拒)"
-						} : {
+						waiter.settle(msg.state === "idle" || msg.state === "live" ? {
 							ok: true,
 							state: msg.state
+						} : {
+							ok: false,
+							reason: "手机报告执行失败(相机不可用或权限被拒)"
+						});
+					}
+				}
+				break;
+			}
+			case "zoom_result": {
+				if (msg.reqId) {
+					const waiter = this.zoomWaiters.get(msg.reqId);
+					if (waiter) {
+						this.zoomWaiters.delete(msg.reqId);
+						waiter.settle(msg.ok && typeof msg.factor === "number" && Number.isFinite(msg.factor) ? {
+							ok: true,
+							factor: msg.factor,
+							...typeof msg.min === "number" ? { min: msg.min } : {},
+							...typeof msg.max === "number" ? { max: msg.max } : {}
+						} : {
+							ok: false,
+							reason: msg.reason ?? "手机报告变焦执行失败"
 						});
 					}
 				}
@@ -1915,6 +2066,8 @@ var ViewHub = class {
 	
 	*/
 	checkPreviewStall() {
+		this.gcCaptures();
+		this.gcAbandonedDirect();
 		const active = this.activeCam();
 		if (!active || active.ws.readyState !== active.ws.OPEN) return;
 		const now = Date.now();
@@ -1927,6 +2080,9 @@ var ViewHub = class {
 		ws.on("close", (code, reason) => {
 			this.log("warn", `view ws closed: code=${code} reason=${reason.toString("utf8") || "-"} (views left: ${this.views.size - 1})`);
 			this.views.delete(ws);
+		});
+		ws.on("error", (err) => {
+			this.log("warn", `view ws error: ${String(err)}`);
 		});
 		ws.on("message", (data, isBinary) => {
 			if (isBinary) return;
@@ -2052,6 +2208,14 @@ var ViewHub = class {
 		this.pendingCaptures.delete(captureId);
 		return pending;
 	}
+	/** Read a pending capture WITHOUT consuming it (admit-first flow: the
+	
+	* record must survive an admitImage failure so the phone's retry can still
+	
+	* route the photo to the waiting model tool). */
+	peekCapture(captureId) {
+		return this.pendingCaptures.get(captureId) ?? null;
+	}
 	noteFor(captureId) {
 		return this.pendingCaptures.get(captureId)?.note;
 	}
@@ -2060,7 +2224,30 @@ var ViewHub = class {
 		for (const [id, p] of this.pendingCaptures) if (p.requestedAt < cutoff) {
 			p.onFail?.("拍摄请求已超时");
 			this.pendingCaptures.delete(id);
+			if (!p.direct) this.broadcastToViews({
+				type: "error",
+				code: "CAPTURE_TIMEOUT",
+				message: "拍摄请求已超时(手机未上传)"
+			});
 		}
+	}
+	/** captureId → abandon time: direct captures that timed out but whose photo
+	
+	* may STILL arrive. The upload handler drops those instead of injecting a
+	
+	* surprise photo into the user's composer/folder after the tool already
+	
+	* reported failure. */
+	abandonedDirect = new Map();
+	gcAbandonedDirect() {
+		const cutoff = Date.now() - ABANDON_DIRECT_TTL_MS;
+		for (const [id, at] of this.abandonedDirect) if (at < cutoff) this.abandonedDirect.delete(id);
+	}
+	/** True when this captureId belongs to a model-direct capture that already
+	
+	* timed out (its late photo must not fall into the capture mode). */
+	isAbandonedDirect(captureId) {
+		return this.abandonedDirect.has(captureId);
 	}
 	/**
 	
@@ -2083,10 +2270,13 @@ var ViewHub = class {
 			}
 			const captureId = randomUUID();
 			let settled = false;
-			const timer = setTimeout(() => finish({
-				ok: false,
-				reason: `拍照超时(手机未在 ${Math.round(timeoutMs / 1e3)} 秒内上传照片)`
-			}), timeoutMs);
+			const timer = setTimeout(() => {
+				this.abandonedDirect.set(captureId, Date.now());
+				finish({
+					ok: false,
+					reason: `拍照超时(手机未在 ${Math.round(timeoutMs / 1e3)} 秒内上传照片)`
+				});
+			}, timeoutMs);
 			const finish = (r) => {
 				if (settled) return;
 				settled = true;
@@ -2162,6 +2352,62 @@ var ViewHub = class {
 			});
 			this.sendControl(deviceId, {
 				type: action,
+				reqId
+			});
+		});
+	}
+	/**
+	
+	* Model tool: set / step / query the ACTIVE phone's zoom ratio. Settles with
+	
+	* the phone's zoom_result receipt (or a timeout). App builds before 1.2.0
+	
+	* have no camera_zoom branch at all — they would silently swallow the
+	
+	* command and burn the whole timeout, so fail fast with an upgrade hint
+	
+	* instead (undefined appVersion = pre-1.0.4 build, same bucket).
+	
+	*/
+	requestZoom(params, timeoutMs) {
+		return new Promise((resolve$1) => {
+			const active = this.activeCam();
+			if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+				resolve$1({
+					ok: false,
+					reason: "没有已连接的手机"
+				});
+				return;
+			}
+			if (!versionAtLeast(active.meta.appVersion, ZOOM_MIN_APP)) {
+				resolve$1({
+					ok: false,
+					reason: `手机 App 版本过旧(变焦需 ≥ ${ZOOM_MIN_APP}),请先更新手机端`
+				});
+				return;
+			}
+			const reqId = randomUUID();
+			const deviceId = this.activeDeviceId;
+			let settled = false;
+			const timer = setTimeout(() => finish({
+				ok: false,
+				reason: "手机未在时限内回执(可能不在前台或已断连)"
+			}), timeoutMs);
+			const finish = (r) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				this.zoomWaiters.delete(reqId);
+				resolve$1(r);
+			};
+			this.zoomWaiters.set(reqId, {
+				deviceId,
+				settle: finish
+			});
+			this.sendControl(deviceId, {
+				type: "camera_zoom",
+				...params.factor !== void 0 ? { factor: params.factor } : {},
+				...params.step !== void 0 ? { step: params.step } : {},
 				reqId
 			});
 		});
@@ -2249,7 +2495,9 @@ var PhoneLens = class extends Service {
 			const PHONE_TOOLS = new Set([
 				"phone_take_photo",
 				"phone_camera_pause",
-				"phone_camera_resume"
+				"phone_camera_resume",
+				"phone_camera_zoom",
+				"phone_camera_zoom_info"
 			]);
 			const toolsSvc = ctx.tools;
 			const disposers = [];
@@ -2280,7 +2528,6 @@ var PhoneLens = class extends Service {
 				};
 			});
 			if (toolsSvc && typeof toolsSvc.register === "function") {
-				const disposers$1 = [];
 				const textOutput = {
 					schema: { type: "string" },
 					render: (_args, value) => [{
@@ -2292,7 +2539,11 @@ var PhoneLens = class extends Service {
 					const v = args?.[key];
 					return typeof v === "string" && v.trim() ? v.trim().slice(0, 60) : void 0;
 				};
-				disposers$1.push(toolsSvc.register(defineTool({
+				const numArg = (args, key) => {
+					const v = args?.[key];
+					return typeof v === "number" && Number.isFinite(v) ? v : void 0;
+				};
+				disposers.push(toolsSvc.register(defineTool({
 					name: "phone_take_photo",
 					description: "通过用户配对的手机(PhoneLens)立即拍摄一张照片,照片会直接作为图片提供给你。照片不进入用户输入框、不保存到用户文件夹(与用户的拍照注入模式设置无关)。没有手机连接、手机拒绝拍摄或超时会返回失败原因。仅在对话需要查看手机相机画面时使用(例如用户让你拍摄桌上的文件、白板、实物)。",
 					parameters: { note: {
@@ -2335,7 +2586,7 @@ var PhoneLens = class extends Service {
 						return `照片已拍摄并保存到 ${result.admitted.filePath ?? result.admitted.ref.attachmentId}(当前环境无法直接展示图片)。`;
 					}
 				})));
-				disposers$1.push(toolsSvc.register(defineTool({
+				disposers.push(toolsSvc.register(defineTool({
 					name: "phone_camera_pause",
 					description: "让用户配对的手机摄像头立即进入空闲状态(关闭相机与预览流,省电散热)。适用于用户明确要求关闭手机摄像头、或一段时间内不再需要取景时。手机会回执执行结果。",
 					parameters: {},
@@ -2345,7 +2596,7 @@ var PhoneLens = class extends Service {
 						return r.ok ? `手机摄像头已进入空闲状态。` : `操作失败: ${r.reason}`;
 					}
 				})));
-				disposers$1.push(toolsSvc.register(defineTool({
+				disposers.push(toolsSvc.register(defineTool({
 					name: "phone_camera_resume",
 					description: "立即恢复用户配对手机的拍摄状态(打开相机并恢复预览流)。适用于用户要求重新打开手机摄像头、或接下来需要拍照/取景时。手机会回执执行结果。",
 					parameters: {},
@@ -2355,17 +2606,58 @@ var PhoneLens = class extends Service {
 						return r.ok ? `手机摄像头已恢复拍摄状态。` : `操作失败: ${r.reason}`;
 					}
 				})));
+				disposers.push(toolsSvc.register(defineTool({
+					name: "phone_camera_zoom",
+					description: "调整用户配对手机摄像头的变焦倍数(拉近/拉远)。两种用法:设定绝对倍数(如 factor=2.0 表示放大到 2 倍,1.0 为原始大小),或相对当前倍数步进(如 step=1 放大一档、step=-1 缩小一档;档位大小由手机决定)。超出设备支持范围时会自动收拢到最近的可用倍数,返回设置后的实际倍数与设备支持范围。相机未开启、设备不支持变焦或手机 App 版本过旧时返回失败原因。变焦会同时作用于取景画面与后续拍摄的照片。",
+					parameters: {
+						factor: {
+							type: "number",
+							description: "目标变焦倍数(绝对值),如 1.0=原始、2.0=放大到 2 倍"
+						},
+						step: {
+							type: "number",
+							description: "相对当前倍数的步进量,正值放大、负值缩小,如 1 或 -1"
+						}
+					},
+					output: textOutput,
+					async execute(args) {
+						const factor = numArg(args, "factor");
+						const step = numArg(args, "step");
+						if (factor === void 0 && step === void 0) return "请提供 factor(目标倍数)或 step(步进)中的至少一个;只想查询当前倍数请用 phone_camera_zoom_info。";
+						const r = await hub.requestZoom({
+							factor,
+							step
+						}, 8e3);
+						if (!r.ok) return `变焦失败: ${r.reason}`;
+						const range = r.min !== void 0 && r.max !== void 0 ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
+						return `变焦成功:当前 ${fmtX(r.factor)}${range}。`;
+					}
+				})));
+				disposers.push(toolsSvc.register(defineTool({
+					name: "phone_camera_zoom_info",
+					description: "查询用户配对手机摄像头当前的变焦倍数和设备支持的变焦范围。适用于需要先了解当前画面放大状态、再决定变焦幅度时。相机未开启或设备不支持变焦时返回失败原因。",
+					parameters: {},
+					output: textOutput,
+					async execute() {
+						const r = await hub.requestZoom({}, 8e3);
+						if (!r.ok) return `查询失败: ${r.reason}`;
+						const range = r.min !== void 0 && r.max !== void 0 ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
+						return `当前变焦 ${fmtX(r.factor)}${range}。`;
+					}
+				})));
+				const fmtX = (v) => Number.isInteger(v) ? `${v}x` : `${v.toFixed(2).replace(/\.?0+$/, "")}x`;
 				ctx.effect?.(() => () => {
-					for (const d of disposers$1) try {
+					for (const d of disposers) try {
 						d();
 					} catch {}
 				}, "phone-lens.modelTools()");
-				log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume)");
+				log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_zoom_info)");
 			} else log("info", "no tools service on this ctx — model camera tools skipped (standalone/dev)");
 		} catch (error) {
 			log("warn", `model camera tools not wired (receiver unaffected): ${String(error)}`);
 		}
 		let handle$1 = null;
+		let disposed = false;
 		startLensServer({
 			config,
 			pairing,
@@ -2379,6 +2671,10 @@ var PhoneLens = class extends Service {
 			appSettings,
 			log
 		}).then(async (h) => {
+			if (disposed) {
+				h.dispose();
+				return;
+			}
 			handle$1 = h;
 			const { code, expiresAt } = pairing.current();
 			const qr = await buildPairingQr(code, expiresAt, config);
@@ -2388,6 +2684,7 @@ var PhoneLens = class extends Service {
 			hub.dispose();
 		});
 		ctx.effect(() => () => {
+			disposed = true;
 			handle$1?.dispose();
 			handle$1 = null;
 		}, "phone-lens.server()");

@@ -506,7 +506,29 @@ class LensStore {
 
   String get historyMode =>
       _prefs.getString(_kHistoryMode) ?? historyUploadOnly;
-  Future<void> setHistoryMode(String mode) => _prefs.setString(_kHistoryMode, mode);
+  Future<void> setHistoryMode(String mode) async {
+    await _prefs.setString(_kHistoryMode, mode);
+    // switching AWAY from keepImage must clear what keepImage already parked
+    // on disk — otherwise "已关闭图片留档" left every existing photo right
+    // where it was and the app kept growing with the setting off
+    if (mode == historyKeepImage) return;
+    if (mode == historyNoTrace) {
+      await clearHistory(); // "不留任何痕迹" covers the existing rows too
+      return;
+    }
+    // uploadOnly: keep the rows (they are the delivery log), drop the images
+    final items = history;
+    var changed = false;
+    for (final it in items) {
+      final p = it['imagePath'] as String?;
+      if (p != null && p.isNotEmpty) {
+        it['imagePath'] = null;
+        changed = true;
+        File(p).delete().ignore();
+      }
+    }
+    if (changed) await _prefs.setString(_kHistory, jsonEncode({'items': items}));
+  }
 
   List<Map<String, dynamic>> get history {
     final raw = decode(_prefs.getString(_kHistory));
@@ -523,7 +545,16 @@ class LensStore {
     // new rows concurrently (indices would drift)
     item['id'] ??= '${DateTime.now().microsecondsSinceEpoch}';
     final items = history..insert(0, item);
-    if (items.length > 200) items.removeRange(200, items.length);
+    if (items.length > 200) {
+      // delete the evicted rows' archived images FIRST: dropping only the
+      // JSON rows orphaned the files — nothing could ever reach them again
+      // (the 200-cap hid them from every cleanup path), so keepImage slowly
+      // filled the disk with invisible photos
+      for (final evicted in items.sublist(200)) {
+        _deleteArchivedQuietly(evicted);
+      }
+      items.removeRange(200, items.length);
+    }
     await _prefs.setString(_kHistory, jsonEncode({'items': items}));
   }
 
@@ -532,32 +563,38 @@ class LensStore {
   Future<void> removeHistory(Set<String> keys) async {
     final items = history;
     final kept = <Map<String, dynamic>>[];
-    for (var i = 0; i < items.length; i++) {
-      final it = items[i];
+    final doomed = <Map<String, dynamic>>[];
+    for (final it in items) {
       if (keys.contains(historyKey(it))) {
-        final p = it['imagePath'] as String?;
-        if (p != null) {
-          final f = File(p);
-          if (await f.exists()) await f.delete();
-        }
+        doomed.add(it);
       } else {
         kept.add(it);
       }
     }
+    // persist FIRST, delete files after: the old order (await file deletes
+    // between read and write) let a concurrently finishing upload re-insert
+    // a row that our stale snapshot then overwrote away
     await _prefs.setString(_kHistory, jsonEncode({'items': kept}));
+    for (final it in doomed) {
+      _deleteArchivedQuietly(it);
+    }
   }
 
   /// Delete every entry (and its archived images).
   Future<void> clearHistory() async {
     final items = history;
-    for (final it in items) {
-      final p = it['imagePath'] as String?;
-      if (p != null) {
-        final f = File(p);
-        if (await f.exists()) await f.delete();
-      }
-    }
     await _prefs.setString(_kHistory, jsonEncode({'items': []}));
+    for (final it in items) {
+      _deleteArchivedQuietly(it);
+    }
+  }
+
+  /// Fire-and-forget archive cleanup: one undeletable file (locked, already
+  /// gone) must never abort the loop and strand the rest.
+  void _deleteArchivedQuietly(Map<String, dynamic> item) {
+    final p = item['imagePath'] as String?;
+    if (p == null || p.isEmpty) return;
+    File(p).delete().ignore();
   }
 
   static Map<String, dynamic>? decode(String? s) {

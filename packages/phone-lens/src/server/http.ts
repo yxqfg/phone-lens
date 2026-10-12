@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { readFile, readdir, stat, unlink } from "node:fs/promises";
+import { readFile, readdir, rm, stat, unlink } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -120,17 +120,28 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
 
   const heartbeat = setInterval(() => hub.pingAll(), 20_000);
 
-  await new Promise<void>((resolve, reject) => {
-    const onError = reject as (e: Error) => void;
-    server.once("error", onError);
-    server.listen(config.server.port, config.server.host, () => {
-      // detach the startup reject: leaving it attached would silently swallow
-      // RUNTIME server errors into an already-settled promise
-      server.removeListener("error", onError);
-      server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = reject as (e: Error) => void;
+      server.once("error", onError);
+      server.listen(config.server.port, config.server.host, () => {
+        // detach the startup reject: leaving it attached would silently swallow
+        // RUNTIME server errors into an already-settled promise
+        server.removeListener("error", onError);
+        server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    // listen failed (EADDRINUSE from a leaked previous instance is the usual
+    // one): the heartbeat interval and the wss above are ALREADY live —
+    // without this cleanup every failed start leaked a 20s timer that pings
+    // an empty hub forever and stacks across plugin reloads
+    clearInterval(heartbeat);
+    for (const client of wss.clients) client.terminate();
+    await new Promise<void>((resolve) => wss.close(() => resolve()));
+    throw error;
+  }
   log("info", `phone-lens listening on ${config.server.host}:${config.server.port} (paired devices: ${devices.count()})`);
   // Warm the APK-link cache so the first rendered download QR already carries
   // the dynamically resolved URL (never blocks startup on the network).
@@ -157,6 +168,38 @@ type RouteCtx = {
   noteInjection: (receipt: DeliveryReceipt, attachmentId: string) => void;
   getLastInjection: () => { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null;
 };
+
+/** Composer-staged photos older than this get swept (best effort). */
+const PENDING_TTL_MS = 24 * 60 * 60_000;
+
+/**
+ * Cache an idempotent 200 receipt for a phone retry. The 400 cap must be a
+ * HARD cap: within the 10min TTL a retry storm can keep the map full of
+ * fresh entries, so once expired ones are gone we still evict oldest-first
+ * (Map iteration order = insertion order).
+ */
+function rememberReplay(ctx: RouteCtx, uploadId: string | null, body: unknown): void {
+  if (!uploadId) return;
+  if (ctx.uploadReplays.size > 400) {
+    for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
+    while (ctx.uploadReplays.size >= 400) {
+      const oldest = ctx.uploadReplays.keys().next().value;
+      if (oldest === undefined) break;
+      ctx.uploadReplays.delete(oldest);
+    }
+  }
+  ctx.uploadReplays.set(uploadId, { expires: Date.now() + 10 * 60_000, body });
+}
+
+/** Best-effort TTL sweep for composer-staged photos (see the staging site). */
+async function prunePending(dir: string, ttlMs: number): Promise<void> {
+  const cutoff = Date.now() - ttlMs;
+  for (const entry of await readdir(dir).catch(() => [] as string[])) {
+    const p = join(dir, entry);
+    const st = await stat(p).catch(() => null);
+    if (st?.isFile() && st.mtimeMs < cutoff) await rm(p, { force: true }).catch(() => {});
+  }
+}
 
 async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerResponse, ctx: RouteCtx): Promise<void> {
   const { config, pairing, devices, hub, targets, sink, log } = deps;
@@ -238,6 +281,11 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const token = mintDeviceToken();
     devices.upsert({ deviceId, name, model, tokenHash: hashToken(token) });
     log("info", `paired device "${name}" (${deviceId.slice(0, 8)})`);
+    // the one-time code just burned: tell every view NOW (not when the phone's
+    // uplink lands) so the QR rotates immediately — /view.html has no
+    // devices-list growth to key off, and a second scan must never hit a
+    // dead code. Old clients ignore the unknown type.
+    hub.broadcastToViews({ type: "paired", name });
     return sendJson(res, 200, {
       token,
       serverInfo: { preview: config.preview, limits: config.limits },
@@ -277,7 +325,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (!magicMatches(mediaType, buf)) return sendError(res, 415, ERROR_CODES.BAD_MAGIC, "bytes do not match the declared type");
 
     const captureId = q.get("captureId");
-    const pending = captureId ? hub.consumeCapture(captureId) : null;
+    // PEEK, don't consume: admitImage below can still fail (transient
+    // attachments hiccup) and the phone WILL retry — the pending record must
+    // survive so the retry still routes the photo to the waiting model tool.
+    const pending = captureId ? hub.peekCapture(captureId) : null;
+    // a model-direct capture that already timed out (the tool answered
+    // "拍照超时" long ago): its late photo must be swallowed, never dropped
+    // into the user's composer/folder as a photo nobody asked for
+    const abandoned = captureId ? hub.isAbandonedDirect(captureId) : false;
     const note = q.get("note") ?? pending?.note;
     const rawName = (q.get("name") ?? `shot_${new Date().toISOString().replace(/[:.]/g, "-")}.${mediaType === "image/png" ? "png" : "jpg"}`).slice(0, 120);
     const name = sanitizeFileName(rawName);
@@ -291,6 +346,16 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     }
     log("info", `stored ${name} (${buf.byteLength}B) → ${admitted.storage}:${admitted.ref.attachmentId}`);
 
+    // the ledger entry dies only now that admit succeeded
+    if (pending) hub.consumeCapture(captureId as string);
+
+    if (abandoned) {
+      log("warn", `dropping late direct-capture photo: ${name} (${admitted.ref.attachmentId})`);
+      const droppedBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, delivered: null, deliverReason: "dropped-late-direct" };
+      rememberReplay(ctx, uploadId, droppedBody);
+      return sendJson(res, 200, droppedBody);
+    }
+
     // keep the local archive bounded (retention: maxStoredUploads oldest-first)
     if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
 
@@ -301,12 +366,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       pending.onImage(admitted);
       log("info", `direct-to-model photo: ${name} (${admitted.ref.attachmentId})`);
       const directBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, delivered: null, deliverReason: "delivered-to-model" };
-      if (uploadId) {
-        if (ctx.uploadReplays.size > 400) {
-          for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
-        }
-        ctx.uploadReplays.set(uploadId, { expires: Date.now() + 10 * 60_000, body: directBody });
-      }
+      rememberReplay(ctx, uploadId, directBody);
       return sendJson(res, 200, directBody);
     }
 
@@ -349,6 +409,10 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       } catch (error) {
         log("warn", `staging failed: ${String(error)}`);
       }
+      // nothing ever deletes staged copies otherwise (the client takes the
+      // bytes but sends no receipt) — sweep anything past the TTL so a
+      // long-running host doesn't slowly fill its disk with orphans
+      void prunePending(deps.pendingDir, PENDING_TTL_MS).catch(() => {});
       hub.broadcastToViews({ type: "pending_image", attachmentId: admitted.ref.attachmentId, name });
       // no direct delivery; the client owns placing it in the composer
     } else {
@@ -361,7 +425,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     // as the lookup KEY; the cached receipt is entirely server-generated data
     // (sha refs, probed dimensions, literal enums) — must stay byte-identical
     // to the 200 body returned below.
-    if (uploadId) {
+    {
       const replayBody = {
         ok: true,
         attachmentId: admitted.ref.attachmentId,
@@ -372,22 +436,19 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         delivered: null,
         deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
       };
-      if (ctx.uploadReplays.size > 400) {
-        for (const [k, v] of ctx.uploadReplays) if (v.expires <= Date.now()) ctx.uploadReplays.delete(k);
-      }
-      ctx.uploadReplays.set(uploadId, { expires: Date.now() + 10 * 60_000, body: replayBody });
-    }
+      rememberReplay(ctx, uploadId, replayBody);
 
-    return sendJson(res, 200, {
-      ok: true,
-      attachmentId: admitted.ref.attachmentId,
-      width: admitted.ref.width,
-      height: admitted.ref.height,
-      bytes: admitted.ref.bytes,
-      storage: admitted.storage,
-      delivered: null,
-      deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
-    });
+      return sendJson(res, 200, {
+        ok: true,
+        attachmentId: admitted.ref.attachmentId,
+        width: admitted.ref.width,
+        height: admitted.ref.height,
+        bytes: admitted.ref.bytes,
+        storage: admitted.storage,
+        delivered: null,
+        deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
+      });
+    }
   }
 
   // Browser client fetches the staged photo to place into the composer draft.

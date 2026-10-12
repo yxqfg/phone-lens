@@ -113,6 +113,9 @@ function drawFrame(buf) {
     if (now - fpsTimer >= 1000) { $('fps').textContent = (frames * 1000 / (now - fpsTimer)).toFixed(1) + ' fps'; frames = 0; fpsTimer = now; }
     lastFrameAt = now;
   };
+  // truncated/corrupt JPEG: onload never fires and the blob URL leaks —
+  // revoke on error too (same fix the main client already has)
+  img.onerror = () => URL.revokeObjectURL(url);
   img.src = url;
 }
 
@@ -145,6 +148,12 @@ function connect() {
         $('hint').style.display = m.online ? 'none' : '';
         $('hint').textContent = '等待手机连接…';
         break;
+      case 'paired':
+        // pairing consumed the one-time code: rotate the QR now, don't wait
+        // for the uplink (this page keys off nothing else to trigger it)
+        log('设备已配对' + (m.name ? ': ' + m.name : '') + ',二维码已更换', 'ok');
+        void refreshQr();
+        break;
       case 'capture_pending':
         pendingShot = m.captureId;
         log('快门已触发' + (m.note ? '(' + m.note + ')' : '') + '…');
@@ -157,6 +166,29 @@ function connect() {
       case 'upload':
         log('图片已入库 ' + (m.name || ''), 'ok');
         break;
+      // modern-protocol branches (this page previously only knew the retired
+      // messages, so photos succeeded silently and preview-off was invisible)
+      case 'pending_image':
+        if (pendingShot) { pendingShot = null; log('照片已入库,已放入输入框' + (m.name ? ': ' + m.name : ''), 'ok'); }
+        else log('照片已入库,已放入输入框' + (m.name ? ': ' + m.name : ''), 'ok');
+        break;
+      case 'upload_saved':
+        if (pendingShot) pendingShot = null;
+        log('已保存至 ' + (m.dir || '指定文件夹') + (m.name ? ' · ' + m.name : ''), 'ok');
+        break;
+      case 'preview_state':
+        if (!m.on && m.reason === 'offline') { $('dev').textContent = '连接已断开'; $('hint').textContent = '等待手机连接…'; $('hint').style.display = ''; }
+        else if (!m.on) { $('dev').textContent = '预览已关闭'; $('hint').textContent = '手机端已停止预览'; $('hint').style.display = ''; }
+        break;
+      case 'devices': {
+        const active = (m.devices || []).find((d) => d.active);
+        $('dot').className = active ? 'on' : '';
+        $('dev').textContent = active ? (active.name || '已连接') : '未连接';
+        $('shoot').disabled = !active;
+        $('hint').style.display = active ? 'none' : '';
+        $('hint').textContent = '等待手机连接…';
+        break;
+      }
       case 'error':
         log('错误 ' + m.code + (m.message ? ': ' + m.message : ''), 'err');
         break;

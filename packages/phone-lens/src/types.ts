@@ -48,6 +48,12 @@ export interface DeliveryReceipt {
 /** Settle shape for the model tools' camera_idle / camera_resume requests. */
 export type CameraStateOutcome = { ok: true; state: "idle" | "live" } | { ok: false; reason: string };
 
+/**
+ * Settle shape for the model tools' camera_zoom set/step/query requests.
+ * min/max are the device's hardware zoom range (omitted when unknown).
+ */
+export type ZoomOutcome = { ok: true; factor: number; min?: number; max?: number } | { ok: false; reason: string };
+
 /** Persistent paired-device record. The raw token never touches disk — only its SHA-256. */
 export interface DeviceRecord {
   deviceId: string;
@@ -91,6 +97,12 @@ export type CameraControl =
   | { type: "camera_resume"; reqId?: string }
   // phone→host: receipt for camera_idle/camera_resume (reqId echoed back)
   | { type: "camera_state"; reqId?: string; state: "idle" | "live" | "failed" }
+  // host→phone (model tools, App ≥ 1.1.2): set/step/query the zoom ratio.
+  // factor = absolute target (2.0 = 2x); step = relative nudge (positive zooms
+  // in); neither = pure query of the current ratio. The phone answers zoom_result.
+  | { type: "camera_zoom"; reqId?: string; factor?: number; step?: number }
+  // phone→host: receipt for camera_zoom (reqId echoed back)
+  | { type: "zoom_result"; reqId?: string; ok: boolean; factor?: number; min?: number; max?: number; reason?: string }
   // hello carries the phone App's version for cross-end consistency hints
   // (optional: older App builds omit it and the host shows nothing)
   | { type: "hello"; width: number; height: number; fps: number; rotation?: number; appVersion?: string };
@@ -113,6 +125,10 @@ export type ViewServerMessage =
   | { type: "pending_image"; attachmentId: string; name?: string }
   // folder-only save: the photo bypassed the composer; surface a local hint.
   | { type: "upload_saved"; name?: string; dir: string }
+  // host→view: a phone completed pairing (POST /pair). The one-time code just
+  // burned with it — views rotate the QR immediately instead of waiting for
+  // the phone's uplink, so a second scan never hits a dead code.
+  | { type: "paired"; name?: string }
   | { type: "injected"; captureId?: string; attachmentId: string; sessionId: string | null; ok: boolean; reason?: string; name?: string }
   | { type: "upload"; attachmentId: string; storage: string; name?: string }
   | { type: "error"; code: string; message?: string };

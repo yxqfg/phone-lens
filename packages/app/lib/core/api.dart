@@ -359,6 +359,23 @@ class LensStore {
   bool get updateAvailable => _prefs.getBool(_kUpdateAvailable) ?? false;
   Future<void> setUpdateAvailable(bool v) => _prefs.setBool(_kUpdateAvailable, v);
 
+  // ── update-dialog "ignore today" ─────────────────────────────────────────
+  // The date (yyyy-mm-dd, local) the user last tapped 今日忽略. While it equals
+  // TODAY the STARTUP check stays silent (the badge still lights; a MANUAL
+  // 检查更新 always shows the dialog). Any later day the dialog returns.
+  static const _kUpdateSnoozedOn = 'lens.updateSnoozedOn';
+  bool get updateSnoozedToday =>
+      _prefs.getString(_kUpdateSnoozedOn) == _todayKey();
+  Future<void> snoozeUpdateForToday() =>
+      _prefs.setString(_kUpdateSnoozedOn, _todayKey());
+
+  static String _todayKey() {
+    final n = DateTime.now();
+    return '${n.year.toString().padLeft(4, '0')}-'
+        '${n.month.toString().padLeft(2, '0')}-'
+        '${n.day.toString().padLeft(2, '0')}';
+  }
+
   // ── history auto-clean ────────────────────────────────────────────────────
   // Periodic wipe of send history (records + archived images). Pairing and
   // connection memories are NEVER touched — only the lens.history blob.

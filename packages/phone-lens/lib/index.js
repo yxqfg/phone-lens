@@ -1,4 +1,4 @@
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -7,11 +7,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile, readdir, rm, stat, unlink } from "node:fs/promises";
+import * as os from "node:os";
+import { homedir } from "node:os";
 import { WebSocketServer } from "ws";
 import QRCode from "qrcode";
 import { fileURLToPath } from "node:url";
-import * as os from "node:os";
-import { homedir } from "node:os";
+import { isIP } from "node:net";
 import { env } from "node:process";
 
 //#region src/config.ts
@@ -459,6 +460,7 @@ const ERROR_CODES = {
 	NO_CAMERA: "NO_CAMERA",
 	CAPTURE_TIMEOUT: "CAPTURE_TIMEOUT",
 	LOOPBACK_ONLY: "LOOPBACK_ONLY",
+	BAD_HOST: "BAD_HOST",
 	BAD_REQUEST: "BAD_REQUEST",
 	INTERNAL: "INTERNAL"
 };
@@ -973,6 +975,27 @@ function isLoopback(req) {
 }
 /**
 
+* DNS-rebinding shield: a hostile page's domain re-binds to 127.0.0.1, so the
+
+* connection LOOKS loopback and sails past isLoopback — but its Host header
+
+* still carries the attacker's DOMAIN, never an address this server is dialed
+
+* by. Every legitimate client (phone App, dsh web UI, desktop shell) connects
+
+* to an address paired/typed as an IP literal or localhost, so anything else
+
+* is refused. HTTP/1.0-style requests without a Host header fail the same way.
+
+*/
+function isAllowedHost(req) {
+	const host = req.headers.host;
+	if (typeof host !== "string" || host === "") return false;
+	const hostname = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
+	return hostname.toLowerCase() === "localhost" || isIP(hostname) !== 0;
+}
+/**
+
 * CORS for the dsh Web UI page (served on another loopback port, or the
 
 * desktop shell's `dsh-app://` origin) so it can fetch /qr.json and /status
@@ -1073,6 +1096,7 @@ async function startLensServer(deps) {
 			socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`);
 			socket.destroy();
 		};
+		if (!isAllowedHost(req)) return done(403, "Forbidden");
 		if (url.pathname === "/ws/camera") {
 			const q = url.searchParams;
 			const deviceId = q.get("deviceId") ?? "";
@@ -1171,8 +1195,10 @@ async function handle(deps, req, res, ctx) {
 	const url = new URL(req.url ?? "/", "http://phone-lens.local");
 	const path = url.pathname.replace(/\/+$/, "") || "/";
 	const method = req.method ?? "GET";
-	const loop = isLoopback(req);
+	const allowedHost = isAllowedHost(req);
+	const loop = allowedHost && isLoopback(req);
 	const cors = corsFor(req);
+	if (!allowedHost) return sendError(res, 403, ERROR_CODES.BAD_HOST, "unrecognized Host header");
 	if (method === "OPTIONS") {
 		res.writeHead(204, cors);
 		res.end();
@@ -1460,6 +1486,10 @@ async function handle(deps, req, res, ctx) {
 			modelToolsConfirmFree: st.modelToolsConfirmFree
 		}, cors);
 	}
+	if (method === "GET" && path === "/fs/dirs") {
+		if (!loop) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "folder browsing is loopback-only");
+		return sendJson(res, 200, await listDirs(url.searchParams.get("path") ?? ""), cors);
+	}
 	if (method === "POST" && path === "/app-settings") {
 		const body = await readJsonBody(req, 4096);
 		if (!body) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "invalid JSON body");
@@ -1485,6 +1515,58 @@ async function handle(deps, req, res, ctx) {
 		return sendJson(res, 202, { captureId });
 	}
 	return sendError(res, 404, ERROR_CODES.BAD_REQUEST, `no route ${method} ${path}`);
+}
+/** Cached drive roots (win32: existing C:..Z:, probed once per process). */
+let cachedRoots = null;
+function listRoots() {
+	if (cachedRoots) return cachedRoots;
+	const roots = [];
+	if (process.platform === "win32") for (let c = 67; c <= 90; c++) {
+		const drive = `${String.fromCharCode(c)}:\\`;
+		if (existsSync(drive)) roots.push(drive);
+	}
+	else roots.push("/");
+	cachedRoots = roots;
+	return roots;
+}
+/**
+
+* Directory listing for the save-folder picker (loopback-only route).
+
+* Directories only — no file names, no contents; a path the process cannot
+
+* read yields an empty listing plus an error line so the picker shows WHY,
+
+* never a hard failure the dialog can't recover from. An empty request path
+
+* starts at the user's home (where the default save dir already lives).
+
+*/
+async function listDirs(wanted) {
+	const home = homedir();
+	const target = wanted.trim() === "" ? home : resolve(wanted.trim());
+	const parent = dirname(target);
+	const base = {
+		path: target,
+		parent: parent !== target ? parent : null,
+		home,
+		roots: listRoots()
+	};
+	let entries;
+	try {
+		entries = await readdir(target, { withFileTypes: true });
+	} catch (error) {
+		return {
+			...base,
+			dirs: [],
+			error: `无法读取该文件夹(不存在或无权限): ${String(error.message || error).slice(0, 80)}`
+		};
+	}
+	const dirs = entries.filter((e) => e.isDirectory() && e.name !== "." && e.name !== "..").map((e) => e.name).sort((a, b) => a.localeCompare(b, "zh"));
+	return {
+		...base,
+		dirs
+	};
 }
 /** Strip path separators / reserved characters so a phone-supplied upload
 
@@ -1613,6 +1695,10 @@ const CAM_SILENCE_MS = 6e4;
 
 * itself is 1.1.2 (zoom rides a patch release), not 1.2.0. */
 const ZOOM_MIN_APP = "1.1.2";
+/** Oldest phone App that understands the camera_lens control (lens tool).
+
+* The lens switch ships in 1.1.3 together with the app_info handshake. */
+const LENS_MIN_APP = "1.1.3";
 /** How long a timed-out direct capture stays "abandoned" (late-photo guard). */
 const ABANDON_DIRECT_TTL_MS = 5 * 6e4;
 /**
@@ -1721,6 +1807,8 @@ var ViewHub = class {
 	cameraStateWaiters = new Map();
 	/** reqId → settle callback for in-flight camera_zoom requests (set/step/query). */
 	zoomWaiters = new Map();
+	/** reqId → settle callback for in-flight camera_lens requests (switch/query). */
+	lensWaiters = new Map();
 	/**
 	
 	* Derived stream state of the ACTIVE device, read off the traffic mix:
@@ -1765,6 +1853,13 @@ var ViewHub = class {
 			});
 			this.zoomWaiters.delete(id);
 		}
+		for (const [id, waiter] of this.lensWaiters) {
+			waiter.settle({
+				ok: false,
+				reason: "接收端服务已停止"
+			});
+			this.lensWaiters.delete(id);
+		}
 		for (const [id, p] of this.pendingCaptures) {
 			p.onFail?.("接收端服务已停止");
 			this.pendingCaptures.delete(id);
@@ -1783,6 +1878,7 @@ var ViewHub = class {
 			ws,
 			name,
 			meta: {},
+			helloSeen: false,
 			lastFrame: null,
 			lastFrameAt: 0,
 			lastSeenAt: Date.now(),
@@ -1840,6 +1936,13 @@ var ViewHub = class {
 			});
 			this.zoomWaiters.delete(id);
 		}
+		for (const [id, waiter] of this.lensWaiters) if (waiter.deviceId === deviceId) {
+			waiter.settle({
+				ok: false,
+				reason: "手机已断开连接"
+			});
+			this.lensWaiters.delete(id);
+		}
 		if (this.activeDeviceId === deviceId) {
 			const next = [...this.cameras.keys()].at(-1) ?? null;
 			this.activeDeviceId = next;
@@ -1880,6 +1983,7 @@ var ViewHub = class {
 		if (!cam) return;
 		switch (msg.type) {
 			case "hello":
+				cam.helloSeen = true;
 				cam.meta = {
 					width: msg.width,
 					height: msg.height,
@@ -1895,6 +1999,15 @@ var ViewHub = class {
 						height: msg.height,
 						...msg.rotation !== void 0 ? { rotation: msg.rotation } : {}
 					});
+				}
+				break;
+			case "app_info":
+				if (msg.appVersion !== void 0) {
+					cam.helloSeen = true;
+					cam.meta = {
+						...cam.meta,
+						appVersion: msg.appVersion
+					};
 				}
 				break;
 			case "bye":
@@ -1949,6 +2062,23 @@ var ViewHub = class {
 						} : {
 							ok: false,
 							reason: msg.reason ?? "手机报告变焦执行失败"
+						});
+					}
+				}
+				break;
+			}
+			case "lens_result": {
+				if (msg.reqId) {
+					const waiter = this.lensWaiters.get(msg.reqId);
+					if (waiter) {
+						this.lensWaiters.delete(msg.reqId);
+						waiter.settle(msg.ok && (msg.lens === "front" || msg.lens === "back") ? {
+							ok: true,
+							lens: msg.lens,
+							...Array.isArray(msg.available) ? { available: msg.available } : {}
+						} : {
+							ok: false,
+							reason: msg.reason ?? "手机报告镜头切换失败"
 						});
 					}
 				}
@@ -2306,6 +2436,29 @@ var ViewHub = class {
 	}
 	/**
 	
+	* Wait (≤ cap) for the ACTIVE phone's first identity message. A reconnected
+	
+	* phone starts with meta={} and appVersion rides the hello/app_info; judging
+	
+	* a version gate inside that window misreported "app too old" for perfectly
+	
+	* current builds (the exact bug this fixes). Callers re-read the active
+	
+	* camera AFTER this resolves — the active device may have switched mid-wait.
+	
+	*/
+	async awaitHandshake(capMs = 1e3) {
+		const deadline = Date.now() + capMs;
+		for (;;) {
+			const active = this.activeCam();
+			if (!active || active.ws.readyState !== active.ws.OPEN) return;
+			if (active.helloSeen) return;
+			if (Date.now() >= deadline) return;
+			await new Promise((r) => setTimeout(r, 50));
+		}
+	}
+	/**
+	
 	* Model tool: park the active phone's camera into the idle state, or wake
 	
 	* it back up. Settles with the phone's camera_state receipt (or a timeout).
@@ -2315,13 +2468,21 @@ var ViewHub = class {
 	* fail fast with an actionable reason instead of burning the 8s timeout.
 	
 	*/
-	requestCameraState(action, timeoutMs) {
+	async requestCameraState(action, timeoutMs) {
+		await this.awaitHandshake();
 		return new Promise((resolve$1) => {
 			const active = this.activeCam();
 			if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
 				resolve$1({
 					ok: false,
 					reason: "没有已连接的手机"
+				});
+				return;
+			}
+			if (!active.helloSeen) {
+				resolve$1({
+					ok: false,
+					reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)"
 				});
 				return;
 			}
@@ -2360,16 +2521,19 @@ var ViewHub = class {
 	
 	* Model tool: set / step / query the ACTIVE phone's zoom ratio. Settles with
 	
-	* the phone's zoom_result receipt (or a timeout). App builds before 1.2.0
+	* the phone's zoom_result receipt (or a timeout). App builds before 1.1.2
 	
 	* have no camera_zoom branch at all — they would silently swallow the
 	
 	* command and burn the whole timeout, so fail fast with an upgrade hint
 	
-	* instead (undefined appVersion = pre-1.0.4 build, same bucket).
+	* instead (undefined appVersion after a SEEN hello = pre-1.0.4 build; an
+	
+	* UNSEEN handshake is a reconnect gap and must not read as "too old").
 	
 	*/
-	requestZoom(params, timeoutMs) {
+	async requestZoom(params, timeoutMs) {
+		await this.awaitHandshake();
 		return new Promise((resolve$1) => {
 			const active = this.activeCam();
 			if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
@@ -2379,7 +2543,14 @@ var ViewHub = class {
 				});
 				return;
 			}
-			if (!versionAtLeast(active.meta.appVersion, ZOOM_MIN_APP)) {
+			if (!active.helloSeen) {
+				resolve$1({
+					ok: false,
+					reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)"
+				});
+				return;
+			}
+			if (active.meta.appVersion === void 0 || !versionAtLeast(active.meta.appVersion, ZOOM_MIN_APP)) {
 				resolve$1({
 					ok: false,
 					reason: `手机 App 版本过旧(变焦需 ≥ ${ZOOM_MIN_APP}),请先更新手机端`
@@ -2408,6 +2579,67 @@ var ViewHub = class {
 				type: "camera_zoom",
 				...params.factor !== void 0 ? { factor: params.factor } : {},
 				...params.step !== void 0 ? { step: params.step } : {},
+				reqId
+			});
+		});
+	}
+	/**
+	
+	* Model tool: switch the ACTIVE phone's front/back lens (lens given) or
+	
+	* query which lens is live (no lens). Settles with the phone's lens_result
+	
+	* receipt (or a timeout). App builds before 1.1.3 have no camera_lens
+	
+	* branch — same failure modes as zoom: handshake gap ≠ old build.
+	
+	*/
+	async requestLens(params, timeoutMs) {
+		await this.awaitHandshake();
+		return new Promise((resolve$1) => {
+			const active = this.activeCam();
+			if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+				resolve$1({
+					ok: false,
+					reason: "没有已连接的手机"
+				});
+				return;
+			}
+			if (!active.helloSeen) {
+				resolve$1({
+					ok: false,
+					reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)"
+				});
+				return;
+			}
+			if (active.meta.appVersion === void 0 || !versionAtLeast(active.meta.appVersion, LENS_MIN_APP)) {
+				resolve$1({
+					ok: false,
+					reason: `手机 App 版本过旧(镜头切换需 ≥ ${LENS_MIN_APP}),请先更新手机端`
+				});
+				return;
+			}
+			const reqId = randomUUID();
+			const deviceId = this.activeDeviceId;
+			let settled = false;
+			const timer = setTimeout(() => finish({
+				ok: false,
+				reason: "手机未在时限内回执(可能不在前台或已断连)"
+			}), timeoutMs);
+			const finish = (r) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				this.lensWaiters.delete(reqId);
+				resolve$1(r);
+			};
+			this.lensWaiters.set(reqId, {
+				deviceId,
+				settle: finish
+			});
+			this.sendControl(deviceId, {
+				type: "camera_lens",
+				...params.lens !== void 0 ? { lens: params.lens } : {},
 				reqId
 			});
 		});
@@ -2497,7 +2729,7 @@ var PhoneLens = class extends Service {
 				"phone_camera_pause",
 				"phone_camera_resume",
 				"phone_camera_zoom",
-				"phone_camera_zoom_info"
+				"phone_camera_lens"
 			]);
 			const toolsSvc = ctx.tools;
 			const disposers = [];
@@ -2608,7 +2840,7 @@ var PhoneLens = class extends Service {
 				})));
 				disposers.push(toolsSvc.register(defineTool({
 					name: "phone_camera_zoom",
-					description: "调整用户配对手机摄像头的变焦倍数(拉近/拉远)。两种用法:设定绝对倍数(如 factor=2.0 表示放大到 2 倍,1.0 为原始大小),或相对当前倍数步进(如 step=1 放大一档、step=-1 缩小一档;档位大小由手机决定)。超出设备支持范围时会自动收拢到最近的可用倍数,返回设置后的实际倍数与设备支持范围。相机未开启、设备不支持变焦或手机 App 版本过旧时返回失败原因。变焦会同时作用于取景画面与后续拍摄的照片。",
+					description: "调整或查询用户配对手机摄像头的变焦倍数。三种用法:设定绝对倍数(如 factor=2.0 表示放大到 2 倍,1.0 为原始大小),相对当前倍数步进(如 step=1 放大一档、step=-1 缩小一档;档位大小由手机决定),或不带任何参数直接查询当前倍数与设备支持的变焦范围。设定/步进超出设备支持范围时会自动收拢到最近的可用倍数,返回设置后的实际倍数与设备支持范围。相机未开启、设备不支持变焦或手机 App 版本过旧时返回失败原因。变焦会同时作用于取景画面与后续拍摄的照片。",
 					parameters: {
 						factor: {
 							type: "number",
@@ -2623,26 +2855,32 @@ var PhoneLens = class extends Service {
 					async execute(args) {
 						const factor = numArg(args, "factor");
 						const step = numArg(args, "step");
-						if (factor === void 0 && step === void 0) return "请提供 factor(目标倍数)或 step(步进)中的至少一个;只想查询当前倍数请用 phone_camera_zoom_info。";
 						const r = await hub.requestZoom({
 							factor,
 							step
 						}, 8e3);
 						if (!r.ok) return `变焦失败: ${r.reason}`;
 						const range = r.min !== void 0 && r.max !== void 0 ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
-						return `变焦成功:当前 ${fmtX(r.factor)}${range}。`;
+						return factor === void 0 && step === void 0 ? `当前变焦 ${fmtX(r.factor)}${range}。` : `变焦成功:当前 ${fmtX(r.factor)}${range}。`;
 					}
 				})));
 				disposers.push(toolsSvc.register(defineTool({
-					name: "phone_camera_zoom_info",
-					description: "查询用户配对手机摄像头当前的变焦倍数和设备支持的变焦范围。适用于需要先了解当前画面放大状态、再决定变焦幅度时。相机未开启或设备不支持变焦时返回失败原因。",
-					parameters: {},
+					name: "phone_camera_lens",
+					description: "切换或查询用户配对手机摄像头正在使用的前置/后置镜头。两种用法:lens 传 \"front\" 或 \"back\" 切换到指定镜头(手机会重开相机,约需 1-2 秒);或不带参数查询当前使用的镜头与设备可用的镜头列表。适用于:拍摄 selfie/自己、用户要求切换前后摄像头、或拍照前先确认当前是哪个镜头。相机未开启时仅记录偏好,下次打开相机生效,同样返回成功。手机 App 版本过旧(需 ≥ 1.1.3)或设备只有一个镜头时返回失败或说明。",
+					parameters: { lens: {
+						type: "string",
+						description: "目标镜头方向:\"front\"(前置)或 \"back\"(后置);不传即查询当前镜头"
+					} },
 					output: textOutput,
-					async execute() {
-						const r = await hub.requestZoom({}, 8e3);
-						if (!r.ok) return `查询失败: ${r.reason}`;
-						const range = r.min !== void 0 && r.max !== void 0 ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
-						return `当前变焦 ${fmtX(r.factor)}${range}。`;
+					async execute(args) {
+						const raw = asText(args, "lens")?.toLowerCase();
+						const lens = raw === "front" || raw === "前置" ? "front" : raw === "back" || raw === "后置" ? "back" : void 0;
+						if (raw && lens === void 0) return `无法识别的镜头方向 \"${raw}\",请传 \"front\"(前置)或 \"back\"(后置),或不带参数查询。`;
+						const r = await hub.requestLens({ lens }, 12e3);
+						if (!r.ok) return `镜头操作失败: ${r.reason}`;
+						const now = r.lens === "front" ? "前置" : "后置";
+						const avail = r.available && r.available.length > 1 ? `,设备可用镜头: ${r.available.map((d) => d === "front" ? "前置" : d === "back" ? "后置" : d).join("、")}` : "";
+						return lens === void 0 ? `当前使用${now}摄像头${avail}。` : `已切换到${now}摄像头${avail}。`;
 					}
 				})));
 				const fmtX = (v) => Number.isInteger(v) ? `${v}x` : `${v.toFixed(2).replace(/\.?0+$/, "")}x`;
@@ -2651,7 +2889,7 @@ var PhoneLens = class extends Service {
 						d();
 					} catch {}
 				}, "phone-lens.modelTools()");
-				log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_zoom_info)");
+				log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_lens)");
 			} else log("info", "no tools service on this ctx — model camera tools skipped (standalone/dev)");
 		} catch (error) {
 			log("warn", `model camera tools not wired (receiver unaffected): ${String(error)}`);

@@ -70,7 +70,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Startup update check: EVERY launch (user request — no daily throttle).
   /// Silent on failure; a newer release pops the dialog AND lights the amber
-  /// "有更新!" badge next to Settings → 检查更新.
+  /// "有更新!" badge next to Settings → 检查更新 — unless the user tapped
+  /// 今日忽略 earlier TODAY (the badge still lights; only the dialog stays
+  /// quiet until tomorrow).
   Future<void> _maybeAutoCheckUpdate() async {
     final info = await checkForUpdate();
     if (!mounted) return;
@@ -78,8 +80,9 @@ class _HomeScreenState extends State<HomeScreen> {
     await widget.store.setUpdateAvailable(newer);
     globalUpdateAvailable.value = newer;
     if (info == null || !info.isNewer || !mounted || _updateDialogShown) return;
+    if (widget.store.updateSnoozedToday) return; // 今日忽略 in effect
     _updateDialogShown = true;
-    await showUpdateDialog(context, info);
+    await showUpdateDialog(context, info, onSnoozeToday: widget.store.snoozeUpdateForToday);
     _updateDialogShown = false;
   }
 

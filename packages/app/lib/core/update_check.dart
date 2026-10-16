@@ -131,7 +131,10 @@ Future<bool> openDownloadUrl(String url) {
 
 /// Shared "new version available" dialog (startup prompt + Settings entry).
 /// 需要外部 context 之外不持有任何状态，弹完即走。
-Future<void> showUpdateDialog(BuildContext context, UpdateInfo info) {
+/// [onSnoozeToday] wires the 今日忽略 button: record today's date so the
+/// STARTUP check stays silent for the rest of the day (manual checks from
+/// Settings always show the dialog again).
+Future<void> showUpdateDialog(BuildContext context, UpdateInfo info, {Future<void> Function()? onSnoozeToday}) {
   return showDialog<void>(
     context: context,
     builder: (ctx) => AlertDialog(
@@ -156,6 +159,14 @@ Future<void> showUpdateDialog(BuildContext context, UpdateInfo info) {
         ],
       ),
       actions: [
+        if (onSnoozeToday != null)
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              onSnoozeToday();
+            },
+            child: const Text('今日忽略'),
+          ),
         TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('稍后再说')),
         FilledButton.icon(
           icon: const Icon(Icons.download, size: 18),

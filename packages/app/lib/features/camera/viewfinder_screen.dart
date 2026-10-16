@@ -71,6 +71,15 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   // flash at capture time when the scene is dark. Torch dies with the idle
   // auto-off (camera release) and comes back on revive via _applyFlash.
   FlashMode _flash = FlashMode.off;
+  // ── front/back lens ─────────────────────────────────────────────────────
+  // Which direction the NEXT camera open prefers (user toggle or a host
+  // phone_camera_lens command). Switching re-runs _initCamera, which picks
+  // the preferred direction from availableCameras() and falls back to
+  // whatever exists when the device only has one side. Cached so the UI
+  // can hide the toggle on single-camera devices.
+  CameraLensDirection _lensPref = CameraLensDirection.back;
+  Set<CameraLensDirection> _availableDirections = const {};
+  bool _lensSwitching = false;
   bool _sending = false;
   bool _cropBeforeSend = false;
   int _lastSendAt = 0;
@@ -135,13 +144,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     // cache the App version once for the hello handshake (cross-end hint);
-    // the socket field is mutable so late resolution still reaches the NEXT
-    // announce — the very first hello on a cold start may miss it
+    // the socket re-announces (app_info) the moment this lands — the very
+    // first announce on a cold start may miss it
     () async {
       try {
         final p = await PackageInfo.fromPlatform();
         _appVersion = p.version;
-        _socket?.appVersion = p.version;
+        _socket?.updateAppVersion(p.version);
       } catch (_) {}
     }();
     _initCamera();
@@ -272,16 +281,23 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       final gen = _cameraGen;
       try {
         final cameras = await availableCameras();
-        final back = cameras.firstWhere(
-          (c) => c.lensDirection == CameraLensDirection.back,
-          orElse: () => cameras.first,
+        // cache the directions for the toggle's visibility + the host lens
+        // query; prefer the user/host-chosen direction, fall back to anything
+        final dirs = cameras.map((c) => c.lensDirection).toSet();
+        final preferred = cameras.firstWhere(
+          (c) => c.lensDirection == _lensPref,
+          orElse: () => cameras.firstWhere(
+            (c) => c.lensDirection == CameraLensDirection.back,
+            orElse: () => cameras.first,
+          ),
         );
+        if (mounted) setState(() => _availableDirections = dirs);
         // NOTE: ImageFormatGroup.jpeg initializes but never delivers a single
         // frame on this device family (measured: cam=0 forever), so we stay
         // on yuv420 and assemble ourselves — chroma order is settled from the
         // logged plane census, not guesses.
         final controller = CameraController(
-          back,
+          preferred,
           ResolutionPreset.high,
           enableAudio: false,
           imageFormatGroup: ImageFormatGroup.yuv420,
@@ -473,6 +489,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     socket.onPreviewState = (active) => _onHostPreviewState(active);
     socket.onCameraControl = (type, reqId) => _onHostCameraControl(type, reqId);
     socket.onZoomControl = (factor, step, reqId) => _onHostZoom(factor, step, reqId);
+    socket.onLensControl = (lens, reqId) => _onHostLens(lens, reqId);
     // cancel the PREVIOUS socket's subscription before taking the new one:
     // an overwritten-but-live subscription leaks when the old close() stalls
     _cmdSub?.cancel();
@@ -688,8 +705,8 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     }
   }
 
-  /// Host-initiated zoom set/step/query (the model tools phone_camera_zoom /
-  /// phone_camera_zoom_info). Reads and writes the SAME ValueNotifier the
+  /// Host-initiated zoom set/step/query (the model tool phone_camera_zoom;
+  /// no args = pure query). Reads and writes the SAME ValueNotifier the
   /// pinch gesture uses, so the pill and the next gesture start from the
   /// model's value — never a second zoom state. A zoom command NEVER revives
   /// a parked camera on its own (that would give an invisible model action a
@@ -1583,6 +1600,104 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     if (c != null) await _applyFlash(c);
   }
 
+  // ── front/back lens switch (user button + host phone_camera_lens) ─────────
+
+  List<String> _lensNames() => _availableDirections
+      .where((d) => d == CameraLensDirection.front || d == CameraLensDirection.back)
+      .map((d) => d.name)
+      .toList();
+
+  /// Fill the direction cache on demand (camera never opened → cache is
+  /// empty; a host query/switch should still see the real device shape).
+  Future<void> _ensureDirections() async {
+    if (_availableDirections.isNotEmpty) return;
+    try {
+      final dirs = (await availableCameras()).map((c) => c.lensDirection).toSet();
+      if (mounted) setState(() => _availableDirections = dirs);
+    } catch (_) {}
+  }
+
+  /// Switch the preferred lens direction. Camera closed (idle shutdown) → the
+  /// preference alone flips and the next explicit open picks it up; camera
+  /// open → release + re-init with the new direction (the stream survives as
+  /// desired state; zoom range and flash are re-read by [_initCamera]).
+  /// Returns whether the direction is now live; answers [reqId] when given.
+  Future<bool> _switchLens(CameraLensDirection dir, {String? reqId}) async {
+    await _ensureDirections();
+    if (!_availableDirections.contains(dir)) {
+      final name = dir == CameraLensDirection.front ? '前置' : '后置';
+      _socket?.reportLens(reqId, ok: false, reason: '设备没有$name摄像头');
+      return false;
+    }
+    if (_lensSwitching) {
+      _socket?.reportLens(reqId, ok: false, reason: '正在切换镜头,请稍候重试');
+      return false;
+    }
+    if (dir == _lensPref) {
+      // no-op switch (or a query landing here): answer with the live direction
+      _socket?.reportLens(reqId, ok: true, lens: _lensPref.name, available: _lensNames());
+      return true;
+    }
+    _lensSwitching = true;
+    if (mounted) setState(() => _lensPref = dir);
+    try {
+      await _releaseCamera();
+      await _initCamera();
+      // the init may be swallowed by the busy lock (a pending re-run picks
+      // the new preference up within moments) — the direction is committed
+      _socket?.reportLens(reqId, ok: true, lens: _lensPref.name, available: _lensNames());
+      return true;
+    } catch (_) {
+      _socket?.reportLens(reqId, ok: false, reason: '镜头切换失败(相机被占用或初始化出错)');
+      return false;
+    } finally {
+      _lensSwitching = false;
+      if (mounted) setState(() {}); // spinner back to the switch glyph
+    }
+  }
+
+  /// Host-initiated phone_camera_lens: null lens = query of the live lens
+  /// (works with the camera closed — it reads preference + cached device
+  /// directions), "front"/"back" = switch.
+  Future<void> _onHostLens(String? lens, String? reqId) async {
+    await _ensureDirections();
+    if (lens != null && lens != 'front' && lens != 'back') {
+      _socket?.reportLens(reqId, ok: false, reason: '未知的镜头方向: $lens');
+      return;
+    }
+    if (lens == null) {
+      _socket?.reportLens(reqId, ok: true, lens: _lensPref.name, available: _lensNames());
+      return;
+    }
+    await _switchLens(lens == 'front' ? CameraLensDirection.front : CameraLensDirection.back, reqId: reqId);
+  }
+
+  /// Top-right lens toggle: flips front/back. Hidden on single-camera
+  /// devices; shows a spinner while the release/re-init cycle runs.
+  Widget _lensButton() {
+    if (_availableDirections.length < 2) return const SizedBox.shrink();
+    final switching = _lensSwitching;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: switching ? null : () => _switchLens(_lensPref == CameraLensDirection.front ? CameraLensDirection.back : CameraLensDirection.front),
+        child: Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.black54,
+            border: Border.all(color: Colors.white24),
+          ),
+          child: switching
+              ? const Padding(padding: EdgeInsets.all(9), child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+              : const Icon(Icons.cameraswitch_outlined, size: 18, color: Colors.white),
+        ),
+      ),
+    );
+  }
+
   void _onScaleStart(ScaleStartDetails d) {
     _scaleStartZoom = _zoom.value;
   }
@@ -1690,8 +1805,8 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         // hide timer only owns the tap-focus indicator, not this badge — it
         // disappears when the lock is released (refocus tap clears _focusLocked)
         if (_focusLocked) _focusLockBanner(),
-        // top-right column: queue badge → flash toggle → zoom pill, stacked
-        // in ONE Positioned so the three never overlap each other
+        // top-right column: queue badge → flash toggle → lens switch → zoom
+        // pill, stacked in ONE Positioned so they never overlap each other
         Positioned(
           top: 12,
           right: 12,
@@ -1702,6 +1817,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
               _queueBadgeContent(),
               const SizedBox(height: 8),
               _flashButton(),
+              _lensButton(),
               _zoomPill(),
             ],
           ),

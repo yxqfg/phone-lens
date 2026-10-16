@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { isIP } from "node:net";
 
 /** Sliding-window rate limiter (in-memory; resets with the process). */
 export class RateLimiter {
@@ -27,6 +28,22 @@ const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 export function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress ?? "";
   return LOOPBACK.has(addr);
+}
+
+/**
+ * DNS-rebinding shield: a hostile page's domain re-binds to 127.0.0.1, so the
+ * connection LOOKS loopback and sails past isLoopback — but its Host header
+ * still carries the attacker's DOMAIN, never an address this server is dialed
+ * by. Every legitimate client (phone App, dsh web UI, desktop shell) connects
+ * to an address paired/typed as an IP literal or localhost, so anything else
+ * is refused. HTTP/1.0-style requests without a Host header fail the same way.
+ */
+export function isAllowedHost(req: IncomingMessage): boolean {
+  const host = req.headers.host;
+  if (typeof host !== "string" || host === "") return false;
+  // "[::1]:8791" → ::1 ; "192.168.1.5:8791" / "localhost" → first segment
+  const hostname = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0]!;
+  return hostname.toLowerCase() === "localhost" || isIP(hostname) !== 0;
 }
 
 /**

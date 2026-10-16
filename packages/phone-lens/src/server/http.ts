@@ -3,7 +3,8 @@ import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readFile, readdir, rm, stat, unlink } from "node:fs/promises";
-import { basename, join, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import QRCode from "qrcode";
@@ -20,7 +21,7 @@ import type { ViewHub } from "./hub.js";
 import { refreshAppApkLinks, resolveLatestGiteeApk } from "./apk-link.js";
 import { buildPairingQr } from "./qr.js";
 import { VIEW_HTML } from "./static-view.js";
-import { clientKey, corsFor, deviceAuth, isLoopback, queryOf, RateLimiter } from "./auth.js";
+import { clientKey, corsFor, deviceAuth, isAllowedHost, isLoopback, queryOf, RateLimiter } from "./auth.js";
 
 export interface ServerDeps {
   config: LensConfig;
@@ -93,6 +94,8 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
       socket.write(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`);
       socket.destroy();
     };
+    // same DNS-rebinding shield as the HTTP routes (see isAllowedHost)
+    if (!isAllowedHost(req)) return done(403, "Forbidden");
     if (url.pathname === "/ws/camera") {
       const q = url.searchParams;
       const deviceId = q.get("deviceId") ?? "";
@@ -206,8 +209,17 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   const url = new URL(req.url ?? "/", "http://phone-lens.local");
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = req.method ?? "GET";
-  const loop = isLoopback(req);
+  // DNS-rebinding shield (applies to EVERY route incl. preflight): legitimate
+  // callers dial an IP literal or localhost, a re-bound attacker page does not
+  const allowedHost = isAllowedHost(req);
+  const loop = allowedHost && isLoopback(req);
   const cors = corsFor(req);
+
+  if (!allowedHost) {
+    // the Host header is a domain (or missing), never an address any
+    // legitimate client dials — classic DNS-rebinding signature
+    return sendError(res, 403, ERROR_CODES.BAD_HOST, "unrecognized Host header");
+  }
 
   // Preflight from the Web UI page (another loopback origin).
   if (method === "OPTIONS") {
@@ -492,6 +504,14 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     const st = deps.appSettings.get();
     return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree }, cors);
   }
+  // Save-folder picker backend: lists DIRECTORIES under a path for the web
+  // UI's browser-style folder dialog. The browser cannot learn absolute
+  // paths of its own (no system dialog in a web page), so the host walks
+  // the tree instead — loopback-only, directory names only, never files.
+  if (method === "GET" && path === "/fs/dirs") {
+    if (!loop) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "folder browsing is loopback-only");
+    return sendJson(res, 200, await listDirs(url.searchParams.get("path") ?? ""), cors);
+  }
   if (method === "POST" && path === "/app-settings") {
     const body = await readJsonBody(req, 4096);
     if (!body) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "invalid JSON body");
@@ -518,6 +538,48 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+/** Cached drive roots (win32: existing C:..Z:, probed once per process). */
+let cachedRoots: string[] | null = null;
+function listRoots(): string[] {
+  if (cachedRoots) return cachedRoots;
+  const roots: string[] = [];
+  if (process.platform === "win32") {
+    for (let c = 67; c <= 90; c++) {
+      const drive = `${String.fromCharCode(c)}:\\`;
+      if (existsSync(drive)) roots.push(drive);
+    }
+  } else {
+    roots.push("/");
+  }
+  cachedRoots = roots;
+  return roots;
+}
+
+/**
+ * Directory listing for the save-folder picker (loopback-only route).
+ * Directories only — no file names, no contents; a path the process cannot
+ * read yields an empty listing plus an error line so the picker shows WHY,
+ * never a hard failure the dialog can't recover from. An empty request path
+ * starts at the user's home (where the default save dir already lives).
+ */
+async function listDirs(wanted: string): Promise<{ path: string; parent: string | null; home: string; roots: string[]; dirs: string[]; error?: string }> {
+  const home = homedir();
+  const target = wanted.trim() === "" ? home : resolve(wanted.trim());
+  const parent = dirname(target);
+  const base = { path: target, parent: parent !== target ? parent : null, home, roots: listRoots() };
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await readdir(target, { withFileTypes: true });
+  } catch (error) {
+    return { ...base, dirs: [], error: `无法读取该文件夹(不存在或无权限): ${String((error as Error).message || error).slice(0, 80)}` };
+  }
+  const dirs = entries
+    .filter((e) => e.isDirectory() && e.name !== "." && e.name !== "..")
+    .map((e) => e.name)
+    .sort((a, b) => a.localeCompare(b, "zh"));
+  return { ...base, dirs };
+}
 
 /** Strip path separators / reserved characters so a phone-supplied upload
  *  name can never escape the target directory or hide as a dotfile. */

@@ -54,6 +54,13 @@ export type CameraStateOutcome = { ok: true; state: "idle" | "live" } | { ok: fa
  */
 export type ZoomOutcome = { ok: true; factor: number; min?: number; max?: number } | { ok: false; reason: string };
 
+/**
+ * Settle shape for the model tools' camera_lens switch/query requests.
+ * `available` lists the directions the device can switch to (omitted when
+ * the phone did not report them).
+ */
+export type LensStateOutcome = { ok: true; lens: "front" | "back"; available?: string[] } | { ok: false; reason: string };
+
 /** Persistent paired-device record. The raw token never touches disk — only its SHA-256. */
 export interface DeviceRecord {
   deviceId: string;
@@ -103,9 +110,20 @@ export type CameraControl =
   | { type: "camera_zoom"; reqId?: string; factor?: number; step?: number }
   // phone→host: receipt for camera_zoom (reqId echoed back)
   | { type: "zoom_result"; reqId?: string; ok: boolean; factor?: number; min?: number; max?: number; reason?: string }
+  // host→phone (model tools, App ≥ 1.1.3): switch the front/back lens, or
+  // (lens omitted) query which lens is live. The phone answers lens_result.
+  | { type: "camera_lens"; reqId?: string; lens?: "front" | "back" }
+  // phone→host: receipt for camera_lens (reqId echoed back). `lens` = the
+  // direction now live; `available` = directions this device can switch to.
+  | { type: "lens_result"; reqId?: string; ok: boolean; lens?: "front" | "back"; available?: string[]; reason?: string }
   // hello carries the phone App's version for cross-end consistency hints
   // (optional: older App builds omit it and the host shows nothing)
-  | { type: "hello"; width: number; height: number; fps: number; rotation?: number; appVersion?: string };
+  | { type: "hello"; width: number; height: number; fps: number; rotation?: number; appVersion?: string }
+  // phone→host (App ≥ 1.1.3): fired on EVERY fresh connection, before any
+  // stream starts — keeps the host's version gates truthful while the preview
+  // is closed (hello only rides _startStream). A version-less copy (PackageInfo
+  // unresolved) is legal; the re-announce after it resolves carries the value.
+  | { type: "app_info"; appVersion?: string };
 
 /** JSON message on the view websocket. */
 export type ViewServerMessage =
@@ -158,6 +176,7 @@ export const ERROR_CODES = {
   NO_CAMERA: "NO_CAMERA",
   CAPTURE_TIMEOUT: "CAPTURE_TIMEOUT",
   LOOPBACK_ONLY: "LOOPBACK_ONLY",
+  BAD_HOST: "BAD_HOST",
   BAD_REQUEST: "BAD_REQUEST",
   INTERNAL: "INTERNAL",
 } as const;

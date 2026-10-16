@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
-import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, ViewClientMessage, ViewServerMessage, ZoomOutcome } from "../types.js";
+import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, LensStateOutcome, ViewClientMessage, ViewServerMessage, ZoomOutcome } from "../types.js";
 
 /** Per-device camera uplink state; multiple phones coexist without kicking. */
 interface CamState {
   ws: WebSocket;
   name: string;
   meta: { width?: number; height?: number; fps?: number; rotation?: number; appVersion?: string };
+  /**
+   * The phone has stated its identity on THIS connection (a version-bearing
+   * app_info, or any hello). A reconnect resets meta={}, and appVersion rides
+   * the hello/app_info — until one lands, a version-gate check CANNOT know the
+   * build and must not misreport "app too old" for a current phone.
+   */
+  helloSeen: boolean;
   lastFrame: Buffer | null;
   lastFrameAt: number;
   /** Any inbound traffic (frame, control, ws-pong) — drives the dead-link watchdog. */
@@ -43,6 +50,10 @@ const CAM_SILENCE_MS = 60_000;
  * MUST track the release the zoom tools actually ship in — the app version
  * itself is 1.1.2 (zoom rides a patch release), not 1.2.0. */
 const ZOOM_MIN_APP = "1.1.2";
+
+/** Oldest phone App that understands the camera_lens control (lens tool).
+ * The lens switch ships in 1.1.3 together with the app_info handshake. */
+const LENS_MIN_APP = "1.1.3";
 
 /** How long a timed-out direct capture stays "abandoned" (late-photo guard). */
 const ABANDON_DIRECT_TTL_MS = 5 * 60_000;
@@ -120,6 +131,8 @@ export class ViewHub {
   private cameraStateWaiters = new Map<string, { deviceId: string; settle: (r: CameraStateOutcome) => void }>();
   /** reqId → settle callback for in-flight camera_zoom requests (set/step/query). */
   private zoomWaiters = new Map<string, { deviceId: string; settle: (r: ZoomOutcome) => void }>();
+  /** reqId → settle callback for in-flight camera_lens requests (switch/query). */
+  private lensWaiters = new Map<string, { deviceId: string; settle: (r: LensStateOutcome) => void }>();
   /**
    * Derived stream state of the ACTIVE device, read off the traffic mix:
    *   "on"      — frames flowing
@@ -153,6 +166,10 @@ export class ViewHub {
       waiter.settle({ ok: false, reason: "接收端服务已停止" });
       this.zoomWaiters.delete(id);
     }
+    for (const [id, waiter] of this.lensWaiters) {
+      waiter.settle({ ok: false, reason: "接收端服务已停止" });
+      this.lensWaiters.delete(id);
+    }
     for (const [id, p] of this.pendingCaptures) {
       p.onFail?.("接收端服务已停止");
       this.pendingCaptures.delete(id);
@@ -170,7 +187,7 @@ export class ViewHub {
       } catch {}
       this.cameras.delete(deviceId);
     }
-    const cam: CamState = { ws, name, meta: {}, lastFrame: null, lastFrameAt: 0, lastSeenAt: Date.now(), frameCount: 0, windowStart: Date.now(), measuredFps: 0 };
+    const cam: CamState = { ws, name, meta: {}, helloSeen: false, lastFrame: null, lastFrameAt: 0, lastSeenAt: Date.now(), frameCount: 0, windowStart: Date.now(), measuredFps: 0 };
     this.cameras.set(deviceId, cam);
     if (this.activeDeviceId === null) {
       this.activeDeviceId = deviceId;
@@ -237,6 +254,12 @@ export class ViewHub {
         this.zoomWaiters.delete(id);
       }
     }
+    for (const [id, waiter] of this.lensWaiters) {
+      if (waiter.deviceId === deviceId) {
+        waiter.settle({ ok: false, reason: "手机已断开连接" });
+        this.lensWaiters.delete(id);
+      }
+    }
     if (this.activeDeviceId === deviceId) {
       const next = [...this.cameras.keys()].at(-1) ?? null;
       this.activeDeviceId = next;
@@ -289,12 +312,28 @@ export class ViewHub {
     if (!cam) return;
     switch (msg.type) {
       case "hello":
+        cam.helloSeen = true;
         cam.meta = { width: msg.width, height: msg.height, fps: msg.fps, ...(msg.rotation !== void 0 ? { rotation: msg.rotation } : {}), ...(msg.appVersion !== void 0 ? { appVersion: msg.appVersion } : {}) };
         if (this.activeDeviceId === deviceId) {
           // hello is the phone's "stream starting" announcement (sent on every
           // _startStream) — treat it as preview-on for the view side.
           this.markPreviewActive();
           this.broadcastToViews({ type: "frame_meta", width: msg.width, height: msg.height, ...(msg.rotation !== void 0 ? { rotation: msg.rotation } : {}) });
+        }
+        break;
+      case "app_info":
+        // First message on every fresh connection from App ≥ 1.1.3: carries
+        // the build version WITHOUT waiting for a stream start, so the version
+        // gates stay truthful even while the preview is closed (hello only
+        // rides _startStream — a reconnect during a closed preview used to
+        // leave the host version-blind and its zoom/idle tools misreported
+        // "app too old" for minutes). A version-less app_info (PackageInfo
+        // not yet resolved) does NOT mark the handshake seen — the re-announce
+        // that follows once it resolves does. Pre-1.1.3 hosts ignore this
+        // type; pre-1.1.3 apps never send it.
+        if (msg.appVersion !== void 0) {
+          cam.helloSeen = true;
+          cam.meta = { ...cam.meta, appVersion: msg.appVersion };
         }
         break;
       case "bye":
@@ -353,6 +392,23 @@ export class ViewHub {
               msg.ok && typeof msg.factor === "number" && Number.isFinite(msg.factor)
                 ? { ok: true, factor: msg.factor, ...(typeof msg.min === "number" ? { min: msg.min } : {}), ...(typeof msg.max === "number" ? { max: msg.max } : {}) }
                 : { ok: false, reason: msg.reason ?? "手机报告变焦执行失败" },
+            );
+          }
+        }
+        break;
+      }
+      case "lens_result": {
+        // receipt for the model tools' camera_lens switch/query requests
+        if (msg.reqId) {
+          const waiter = this.lensWaiters.get(msg.reqId);
+          if (waiter) {
+            this.lensWaiters.delete(msg.reqId);
+            // explicit whitelist: a missing/garbled lens on success must read
+            // as failure, never fall through into an optimistic ok:true
+            waiter.settle(
+              msg.ok && (msg.lens === "front" || msg.lens === "back")
+                ? { ok: true, lens: msg.lens, ...(Array.isArray(msg.available) ? { available: msg.available } : {}) }
+                : { ok: false, reason: msg.reason ?? "手机报告镜头切换失败" },
             );
           }
         }
@@ -685,16 +741,42 @@ export class ViewHub {
   }
 
   /**
+   * Wait (≤ cap) for the ACTIVE phone's first identity message. A reconnected
+   * phone starts with meta={} and appVersion rides the hello/app_info; judging
+   * a version gate inside that window misreported "app too old" for perfectly
+   * current builds (the exact bug this fixes). Callers re-read the active
+   * camera AFTER this resolves — the active device may have switched mid-wait.
+   */
+  private async awaitHandshake(capMs = 1_000): Promise<void> {
+    const deadline = Date.now() + capMs;
+    for (;;) {
+      const active = this.activeCam();
+      if (!active || active.ws.readyState !== active.ws.OPEN) return;
+      if (active.helloSeen) return;
+      if (Date.now() >= deadline) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /**
    * Model tool: park the active phone's camera into the idle state, or wake
    * it back up. Settles with the phone's camera_state receipt (or a timeout).
    * Old App builds (no appVersion in hello) never answer camera_idle/resume —
    * fail fast with an actionable reason instead of burning the 8s timeout.
    */
-  requestCameraState(action: "camera_idle" | "camera_resume", timeoutMs: number): Promise<CameraStateOutcome> {
+  async requestCameraState(action: "camera_idle" | "camera_resume", timeoutMs: number): Promise<CameraStateOutcome> {
+    await this.awaitHandshake();
     return new Promise((resolve) => {
       const active = this.activeCam();
       if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
         resolve({ ok: false, reason: "没有已连接的手机" });
+        return;
+      }
+      if (!active.helloSeen) {
+        // reconnect window: the phone is online but its hello/app_info hasn't
+        // landed (old App with the preview closed) — a handshake gap, NOT an
+        // old build. Say so; opening the phone's preview delivers the hello.
+        resolve({ ok: false, reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)" });
         return;
       }
       if (active.meta.appVersion === undefined) {
@@ -719,19 +801,26 @@ export class ViewHub {
 
   /**
    * Model tool: set / step / query the ACTIVE phone's zoom ratio. Settles with
-   * the phone's zoom_result receipt (or a timeout). App builds before 1.2.0
+   * the phone's zoom_result receipt (or a timeout). App builds before 1.1.2
    * have no camera_zoom branch at all — they would silently swallow the
    * command and burn the whole timeout, so fail fast with an upgrade hint
-   * instead (undefined appVersion = pre-1.0.4 build, same bucket).
+   * instead (undefined appVersion after a SEEN hello = pre-1.0.4 build; an
+   * UNSEEN handshake is a reconnect gap and must not read as "too old").
    */
-  requestZoom(params: { factor?: number; step?: number }, timeoutMs: number): Promise<ZoomOutcome> {
+  async requestZoom(params: { factor?: number; step?: number }, timeoutMs: number): Promise<ZoomOutcome> {
+    await this.awaitHandshake();
     return new Promise((resolve) => {
       const active = this.activeCam();
       if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
         resolve({ ok: false, reason: "没有已连接的手机" });
         return;
       }
-      if (!versionAtLeast(active.meta.appVersion, ZOOM_MIN_APP)) {
+      if (!active.helloSeen) {
+        // reconnect window, NOT an old build — see requestCameraState
+        resolve({ ok: false, reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)" });
+        return;
+      }
+      if (active.meta.appVersion === undefined || !versionAtLeast(active.meta.appVersion, ZOOM_MIN_APP)) {
         resolve({ ok: false, reason: `手机 App 版本过旧(变焦需 ≥ ${ZOOM_MIN_APP}),请先更新手机端` });
         return;
       }
@@ -751,6 +840,49 @@ export class ViewHub {
         type: "camera_zoom",
         ...(params.factor !== undefined ? { factor: params.factor } : {}),
         ...(params.step !== undefined ? { step: params.step } : {}),
+        reqId,
+      } satisfies CameraControl);
+    });
+  }
+
+  /**
+   * Model tool: switch the ACTIVE phone's front/back lens (lens given) or
+   * query which lens is live (no lens). Settles with the phone's lens_result
+   * receipt (or a timeout). App builds before 1.1.3 have no camera_lens
+   * branch — same failure modes as zoom: handshake gap ≠ old build.
+   */
+  async requestLens(params: { lens?: "front" | "back" }, timeoutMs: number): Promise<LensStateOutcome> {
+    await this.awaitHandshake();
+    return new Promise((resolve) => {
+      const active = this.activeCam();
+      if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+        resolve({ ok: false, reason: "没有已连接的手机" });
+        return;
+      }
+      if (!active.helloSeen) {
+        // reconnect window, NOT an old build — see requestCameraState
+        resolve({ ok: false, reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)" });
+        return;
+      }
+      if (active.meta.appVersion === undefined || !versionAtLeast(active.meta.appVersion, LENS_MIN_APP)) {
+        resolve({ ok: false, reason: `手机 App 版本过旧(镜头切换需 ≥ ${LENS_MIN_APP}),请先更新手机端` });
+        return;
+      }
+      const reqId = randomUUID();
+      const deviceId = this.activeDeviceId;
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, reason: "手机未在时限内回执(可能不在前台或已断连)" }), timeoutMs);
+      const finish = (r: LensStateOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.lensWaiters.delete(reqId);
+        resolve(r);
+      };
+      this.lensWaiters.set(reqId, { deviceId, settle: finish });
+      this.sendControl(deviceId, {
+        type: "camera_lens",
+        ...(params.lens !== undefined ? { lens: params.lens } : {}),
         reqId,
       } satisfies CameraControl);
     });

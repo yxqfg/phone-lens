@@ -74,7 +74,7 @@ export default class PhoneLens extends Service {
     // INACTIVE_EFFECT and took the receiver down with it. The receiver is
     // mandatory; the tools are optional.
     try {
-      const PHONE_TOOLS = new Set(["phone_take_photo", "phone_camera_pause", "phone_camera_resume", "phone_camera_zoom", "phone_camera_zoom_info"]);
+      const PHONE_TOOLS = new Set(["phone_take_photo", "phone_camera_pause", "phone_camera_resume", "phone_camera_zoom", "phone_camera_lens"]);
     // Direct ctx.tools access, same as dsh-better-sidebar's registerOpenTool:
     // on the real host the tools service is already mounted by the time
     // plugins load, so a plain property read works. (ctx.inject(['tools'], …)
@@ -237,10 +237,11 @@ export default class PhoneLens extends Service {
           defineTool({
             name: "phone_camera_zoom",
             description:
-              "调整用户配对手机摄像头的变焦倍数(拉近/拉远)。" +
-              "两种用法:设定绝对倍数(如 factor=2.0 表示放大到 2 倍,1.0 为原始大小)," +
-              "或相对当前倍数步进(如 step=1 放大一档、step=-1 缩小一档;档位大小由手机决定)。" +
-              "超出设备支持范围时会自动收拢到最近的可用倍数,返回设置后的实际倍数与设备支持范围。" +
+              "调整或查询用户配对手机摄像头的变焦倍数。" +
+              "三种用法:设定绝对倍数(如 factor=2.0 表示放大到 2 倍,1.0 为原始大小)," +
+              "相对当前倍数步进(如 step=1 放大一档、step=-1 缩小一档;档位大小由手机决定)," +
+              "或不带任何参数直接查询当前倍数与设备支持的变焦范围。" +
+              "设定/步进超出设备支持范围时会自动收拢到最近的可用倍数,返回设置后的实际倍数与设备支持范围。" +
               "相机未开启、设备不支持变焦或手机 App 版本过旧时返回失败原因。" +
               "变焦会同时作用于取景画面与后续拍摄的照片。",
             parameters: {
@@ -251,13 +252,14 @@ export default class PhoneLens extends Service {
             async execute(args: unknown) {
               const factor = numArg(args, "factor");
               const step = numArg(args, "step");
-              if (factor === undefined && step === undefined) {
-                return "请提供 factor(目标倍数)或 step(步进)中的至少一个;只想查询当前倍数请用 phone_camera_zoom_info。";
-              }
+              // no args = pure query (the phone answers with the current ratio
+              // and its supported range — absorbed phone_camera_zoom_info)
               const r = await hub.requestZoom({ factor, step }, 8_000);
               if (!r.ok) return `变焦失败: ${r.reason}`;
               const range = r.min !== undefined && r.max !== undefined ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
-              return `变焦成功:当前 ${fmtX(r.factor)}${range}。`;
+              return factor === undefined && step === undefined
+                ? `当前变焦 ${fmtX(r.factor)}${range}。`
+                : `变焦成功:当前 ${fmtX(r.factor)}${range}。`;
             },
           }) as never,
         ),
@@ -265,18 +267,29 @@ export default class PhoneLens extends Service {
       disposers.push(
         toolsSvc.register(
           defineTool({
-            name: "phone_camera_zoom_info",
+            name: "phone_camera_lens",
             description:
-              "查询用户配对手机摄像头当前的变焦倍数和设备支持的变焦范围。" +
-              "适用于需要先了解当前画面放大状态、再决定变焦幅度时。" +
-              "相机未开启或设备不支持变焦时返回失败原因。",
-            parameters: {},
+              "切换或查询用户配对手机摄像头正在使用的前置/后置镜头。" +
+              "两种用法:lens 传 \"front\" 或 \"back\" 切换到指定镜头(手机会重开相机,约需 1-2 秒);" +
+              "或不带参数查询当前使用的镜头与设备可用的镜头列表。" +
+              "适用于:拍摄 selfie/自己、用户要求切换前后摄像头、或拍照前先确认当前是哪个镜头。" +
+              "相机未开启时仅记录偏好,下次打开相机生效,同样返回成功。" +
+              "手机 App 版本过旧(需 ≥ 1.1.3)或设备只有一个镜头时返回失败或说明。",
+            parameters: {
+              lens: { type: "string", description: "目标镜头方向:\"front\"(前置)或 \"back\"(后置);不传即查询当前镜头" },
+            },
             output: textOutput,
-            async execute() {
-              const r = await hub.requestZoom({}, 8_000);
-              if (!r.ok) return `查询失败: ${r.reason}`;
-              const range = r.min !== undefined && r.max !== undefined ? `,设备支持 ${fmtX(r.min)} - ${fmtX(r.max)}` : "";
-              return `当前变焦 ${fmtX(r.factor)}${range}。`;
+            async execute(args: unknown) {
+              const raw = asText(args, "lens")?.toLowerCase();
+              const lens = raw === "front" || raw === "前置" ? "front" : raw === "back" || raw === "后置" ? "back" : undefined;
+              if (raw && lens === undefined) {
+                return `无法识别的镜头方向 \"${raw}\",请传 \"front\"(前置)或 \"back\"(后置),或不带参数查询。`;
+              }
+              const r = await hub.requestLens({ lens }, 12_000);
+              if (!r.ok) return `镜头操作失败: ${r.reason}`;
+              const now = r.lens === "front" ? "前置" : "后置";
+              const avail = r.available && r.available.length > 1 ? `,设备可用镜头: ${r.available.map((d) => (d === "front" ? "前置" : d === "back" ? "后置" : d)).join("、")}` : "";
+              return lens === undefined ? `当前使用${now}摄像头${avail}。` : `已切换到${now}摄像头${avail}。`;
             },
           }) as never,
         ),
@@ -292,7 +305,7 @@ export default class PhoneLens extends Service {
           }
         }
       }, "phone-lens.modelTools()");
-      log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_zoom_info)");
+      log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_lens)");
     } else {
       log("info", "no tools service on this ctx — model camera tools skipped (standalone/dev)");
     }

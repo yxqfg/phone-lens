@@ -19,10 +19,11 @@ class CaptureCommand {
 class CameraSocket {
   final String url;
   /// The phone App's version (PackageInfo.version), announced in every hello
-  /// so the host can surface cross-end version-consistency hints. MUTABLE on
-  /// purpose: PackageInfo resolves asynchronously after the socket exists —
-  /// the first hello may go out without it, the next announce picks it up.
-  /// Older hosts ignore the extra field; older App builds send hello without it.
+  /// and app_info so the host can surface cross-end version-consistency
+  /// hints. Null until PackageInfo resolves — set via [updateAppVersion],
+  /// which re-announces so the host never stays version-blind. Older hosts
+  /// ignore the extra field; older App builds send neither hello nor
+  /// app_info with it.
   String? appVersion;
   final _commands = StreamController<CaptureCommand>.broadcast();
   final _states = StreamController<LensLinkState>.broadcast();
@@ -76,10 +77,15 @@ class CameraSocket {
   /// [reportCameraState] so the host can correlate its waiter.
   void Function(String type, String? reqId)? onCameraControl;
 
-  /// Host-initiated zoom set/step/query (the model tools phone_camera_zoom /
-  /// phone_camera_zoom_info). Neither [factor] nor [step] = pure query.
+  /// Host-initiated zoom set/step/query (the model tool phone_camera_zoom;
+  /// the old phone_camera_zoom_info is absorbed — no args = pure query).
   /// [reqId] must be echoed back via [reportZoom].
   void Function(double? factor, double? step, String? reqId)? onZoomControl;
+
+  /// Host-initiated lens switch/query (the model tool phone_camera_lens).
+  /// Null [lens] = pure query of the live lens; "front"/"back" = switch to it.
+  /// [reqId] must be echoed back via [reportLens].
+  void Function(String? lens, String? reqId)? onLensControl;
 
   void _setState(LensLinkState s) {
     _state = s;
@@ -119,6 +125,7 @@ class CameraSocket {
       _lastServerMsgAt = DateTime.now();
       _pongSeen = false; // per-connection: re-negotiate with whoever answers
       _setState(LensLinkState.connected);
+      _announce();
       _startHeartbeat();
       _sub = ws.stream.listen(
         (data) {
@@ -159,6 +166,8 @@ class CameraSocket {
               (msg['step'] as num?)?.toDouble(),
               msg['reqId'] as String?,
             );
+          } else if (msg['type'] == 'camera_lens') {
+            onLensControl?.call(msg['lens'] as String?, msg['reqId'] as String?);
           }
         },
         onDone: () {
@@ -270,6 +279,26 @@ class CameraSocket {
     }));
   }
 
+  /// First text message on every fresh connection: tells the host this
+  /// build's version IMMEDIATELY. hello only rides stream starts — with the
+  /// preview closed, a reconnect left the host version-blind and its
+  /// zoom/idle tools misreported "app too old" for a current build. Goes out
+  /// version-less when PackageInfo hasn't resolved yet; [updateAppVersion]
+  /// re-announces the moment it lands. Older hosts ignore the unknown type.
+  void _announce() {
+    _send(jsonEncode({
+      'type': 'app_info',
+      if (appVersion != null) 'appVersion': appVersion,
+    }));
+  }
+
+  /// Publish the App version once PackageInfo resolves (it is async — the
+  /// connection-opening [_announce] may have gone out without it).
+  void updateAppVersion(String? version) {
+    appVersion = version;
+    if (version != null) _announce();
+  }
+
   void pushFrame(Uint8List jpeg) {
     if (_state != LensLinkState.connected) {
       _drops++;
@@ -332,6 +361,26 @@ class CameraSocket {
       if (factor != null) 'factor': factor,
       if (min != null) 'min': min,
       if (max != null) 'max': max,
+      if (reason != null) 'reason': reason,
+    }));
+  }
+
+  /// Receipt for a host-initiated camera_lens (switch/query alike):
+  /// [reqId] echoes what the host sent. [lens] = the direction now live
+  /// ("front"/"back"); [available] = directions this device can switch to.
+  void reportLens(
+    String? reqId, {
+    required bool ok,
+    String? lens,
+    List<String>? available,
+    String? reason,
+  }) {
+    _send(jsonEncode({
+      'type': 'lens_result',
+      if (reqId != null) 'reqId': reqId,
+      'ok': ok,
+      if (lens != null) 'lens': lens,
+      if (available != null) 'available': available,
       if (reason != null) 'reason': reason,
     }));
   }

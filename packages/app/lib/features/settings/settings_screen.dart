@@ -57,7 +57,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       globalUpdateAvailable.value = true;
       if (!mounted) return;
       setState(() {});
-      await showUpdateDialog(context, info);
+      await showUpdateDialog(context, info, onSnoozeToday: widget.store.snoozeUpdateForToday);
     }
   }
 

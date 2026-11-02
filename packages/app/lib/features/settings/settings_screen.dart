@@ -108,7 +108,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             leading: const Icon(Icons.photo_camera_outlined),
             title: const Text('拍摄与上传'),
             subtitle: Text(
-              '画质:${qualityLabel(widget.store.uploadQuality)} · 裁剪 ${(widget.store.defaultCropRatio * 100).round()}%',
+              '画质:${qualityLabel(widget.store.uploadQuality)} · ${previewQualityLabel(widget.store.previewQuality)} · 裁剪 ${(widget.store.defaultCropRatio * 100).round()}%',
             ),
             trailing: const Icon(Icons.chevron_right, color: Colors.white54),
             onTap: () => _pushSub(CaptureSettingsPage(store: widget.store)),

@@ -18,7 +18,7 @@ import z from "@deepseek-ai/schemastery";
  */
 declare class PhoneLens extends Service {
   static inject: string[];
-  static Config: z<any, any>;
+  static Config: z<any, any, "plain">;
   constructor(ctx: any, rawConfig: unknown);
 }
 

@@ -359,6 +359,33 @@ class _CaptureSettingsPageState extends State<CaptureSettingsPage> {
                 if (mounted) setState(() {});
               },
             ),
+          const SectionHeader('推流画质'),
+          for (final entry in const [
+            (LensStore.previewQualityUltraLow, '极低', '320P 8fps'),
+            (LensStore.previewQualityLow, '低', '480P 10fps'),
+            (LensStore.previewQualityMedium, '中(默认)', '640P 10fps'),
+            (LensStore.previewQualityHigh, '高', '720P 10fps'),
+          ])
+            RadioListTile<String>(
+              value: entry.$1,
+              // ignore: deprecated_member_use
+              groupValue: widget.store.previewQuality,
+              title: Text(entry.$2),
+              subtitle: Text(entry.$3),
+              // ignore: deprecated_member_use
+              onChanged: (v) async {
+                if (v == null) return;
+                await widget.store.setPreviewQuality(v);
+                if (mounted) setState(() {});
+              },
+            ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(
+              '仅影响电脑端实时取景;照片画质由上传画质决定,切换立即生效。',
+              style: TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
         ],
       ),
     );
@@ -533,6 +560,15 @@ String qualityLabel(String quality) => switch (quality) {
   LensStore.qualityMedium => '中(推荐)',
   LensStore.qualityLow => '低(省流量)',
   _ => quality,
+};
+
+/// Preview-stream quality label helper for the capture entry's summary line.
+String previewQualityLabel(String quality) => switch (quality) {
+  LensStore.previewQualityUltraLow => '推流:极低',
+  LensStore.previewQualityLow => '推流:低',
+  LensStore.previewQualityMedium => '推流:中',
+  LensStore.previewQualityHigh => '推流:高',
+  _ => '推流:中',
 };
 
 /// History-mode label helper for the history entry's summary line.

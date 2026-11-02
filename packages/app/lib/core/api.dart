@@ -277,6 +277,35 @@ class LensStore {
 
   Future<void> setUploadQuality(String v) => _prefs.setString(_kUploadQuality, v);
 
+  static const _kPreviewQuality = 'lens.previewQuality';
+
+  // Preview-stream quality tiers (Settings → 拍摄与上传 → 推流画质). These
+  // govern ONLY the live framing stream to the PC — captured photos follow
+  // uploadQuality above. "medium" keeps whatever the host advertises via
+  // /status preview params (the historical behaviour); the other tiers
+  // override all four per-frame params locally (see _previewTierParams).
+  static const previewQualityUltraLow = 'ultraLow';
+  static const previewQualityLow = 'low';
+  static const previewQualityMedium = 'medium';
+  static const previewQualityHigh = 'high';
+
+  /// Fresh installs default to medium: keep the historical default (the
+  /// host-advertised preview params) unless the user opts into another tier.
+  /// Unknown stored values (future tiers, corrupt prefs) degrade to medium.
+  String get previewQuality {
+    final v = _prefs.getString(_kPreviewQuality);
+    if (v != null &&
+        (v == previewQualityUltraLow ||
+            v == previewQualityLow ||
+            v == previewQualityMedium ||
+            v == previewQualityHigh)) {
+      return v;
+    }
+    return previewQualityMedium;
+  }
+
+  Future<void> setPreviewQuality(String v) => _prefs.setString(_kPreviewQuality, v);
+
   /// Last automatic update-check epoch ms (24h throttle for the startup check;
   /// manual checks from Settings bypass it).
   static const _kLastUpdateCheck = 'lens.lastUpdateCheckAt';

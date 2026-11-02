@@ -2,7 +2,14 @@
 
 版本号三处联动：host `package.json` ↔ App `pubspec.yaml`（三段 = tag，build number 只增不减）↓ Release tag。App 版本号必须与 Gitee release tag 同步 bump，否则手机端会反复弹"发现新版本"。
 
-## 1.1.3（未发布）
+## 1.1.4（2026-11-03）
+
+- **新增：推流画质四档可调（App 端）**。设置 → 拍摄与上传 → 推流画质：极低（320P 8fps）/ 低（480P 10fps）/ 中（默认，640P 10fps，与升级前取景画质一致，跟随电脑端下发参数）/ 高（720P 10fps）。仅影响电脑端实时取景，不影响拍摄照片画质（照片仍由"上传画质"决定）；切换下一帧即生效，无需重启预览或重连；帧协议不变（裸 JPEG 二进制），host 与 Web UI 零改动，新老版本双向兼容，无需版本门槛。推流画质存独立档位键，不被电脑端下发的预览参数在重连时覆盖（"中"档则严格采用下发值）。
+- **修复：会话追踪数据面与宿主真实状态脱节（热重载补漏）**。`agent/created` 只在 agent 创建瞬间派发一次（无回放，cordis 事件无 retain），插件（重）加载晚于会话创建时内部存活表/活跃目标为空。现在声明 `agents` 服务依赖，服务就绪后枚举 `ctx.agents.list()` 回填：运行中的会话立即成为投递目标（与 `agent/status`→running 同语义），空闲会话进入存活表（pinned 目标模式可解析）；无 agents 服务的环境（standalone/dev）自动跳过，任何回填异常都不影响接收服务。
+- devDependencies 对齐宿主实际运行版本并钉死精确版本（cordis 4.0.5、dsh-llm 0.2.1-rc.4、dsh-tools 0.2.1-rc.4、schemastery 3.18.5），类型参考与 0.2.1 一致；peerDependencies 范围不变。
+- 文档勘误（docs/dsh-caps.md、docs/architecture.md）：移除对 0.1.7 已删除 `agent/session-start` 事件的引用；补记 live ctx 事件（`dsh-agent-loop` 派发）与持久会话日志事件（`agent/inbox/spliced`）的两层模型，防止按单包检索误判事件死活。
+
+## 1.1.3（2026-10-16）
 
 - **新增：前后置镜头切换（双端）**。手机端取景器右上角新增镜头切换按钮（单摄设备自动隐藏，切换中转圈）；电脑端新增模型工具 `phone_camera_lens`——`lens` 传 "front"/"back" 切换镜头，不带参数查询当前镜头与设备可用镜头（工具对相机关闭的手机同样可用：仅记录偏好，下次开启生效）。需手机端 ≥ 1.1.3，沿用三档失败判定。
 - **精简：`phone_camera_zoom_info` 并入 `phone_camera_zoom`**——不带参数调用 zoom 即查询当前倍数与支持范围（手机端早已支持，纯工具层冗余）；工具总数 7→6。`phone_camera_pause`/`resume` 审查后保留独立（反义动作直命名对模型更清晰）。

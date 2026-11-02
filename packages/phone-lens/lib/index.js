@@ -121,6 +121,21 @@ var HostDeliverySink = class {
 		this.lastActiveId = id;
 		this.log("info", `tracking agent ${id} (active target)`);
 	}
+	/**
+	
+	* Record an agent as alive WITHOUT promoting it to the active target —
+	
+	* hot-reload backfill only. A *running* agent claims the target via track();
+	
+	* idle ones land here so pinned-mode delivery still resolves against the
+	
+	* alive-map instead of reporting "no live agent".
+	
+	*/
+	trackIdle(agent) {
+		const id = agent.id ?? String(agent.session.id);
+		this.agents.set(id, agent);
+	}
 	/** Forget a disposed agent. */
 	untrack(agent) {
 		const id = agent.id ?? String(agent.session.id);
@@ -2723,6 +2738,32 @@ var PhoneLens = class extends Service {
 			if (payload.status === "running") onAgent(payload.agent);
 		});
 		ctx.on?.("agent/disposed", (payload) => offAgent(payload.agent));
+		let backfilled = false;
+		const runBackfill = (registry) => {
+			if (backfilled) return;
+			if (!registry) try {
+				registry = ctx.agents;
+			} catch {
+				return;
+			}
+			if (!registry || typeof registry.list !== "function") return;
+			const live = registry.list() ?? [];
+			let running = 0;
+			for (const agent of live) if (agent?.status === "running") {
+				running++;
+				onAgent(agent);
+			} else sink.trackIdle(agent);
+			backfilled = true;
+			if (live.length > 0) log("info", `backfilled ${live.length} live agent(s) (${running} running) from ctx.agents`);
+		};
+		ctx.inject?.(["agents"], (injectCtx) => {
+			try {
+				runBackfill(injectCtx.agents);
+			} catch {}
+		});
+		setTimeout(() => {
+			if (!backfilled) runBackfill();
+		}, 0).unref?.();
 		try {
 			const PHONE_TOOLS = new Set([
 				"phone_take_photo",

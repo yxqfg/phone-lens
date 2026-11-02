@@ -23,6 +23,18 @@ import '../pair/pair_screen.dart';
 import '../upload/upload_queue_screen.dart';
 import 'crop_screen.dart';
 
+/// Preview-stream quality tiers (Settings → 拍摄与上传 → 推流画质) mapped to
+/// the per-frame encode params (maxShort, maxLong, quality, fps). Long-edge
+/// targets ride the native encoder's integer-downsample ladder (sensor 1280 →
+/// scale 1/2/3), so the effective sizes land exactly on 320×180 / 427×240 /
+/// 1280×720. "medium" is intentionally absent from this table: it means
+/// "keep the host-pushed params untouched" (the historical behaviour).
+const _previewTierParams = <String, (int, int, int, int)>{
+  LensStore.previewQualityUltraLow: (180, 320, 45, 8),
+  LensStore.previewQualityLow: (270, 480, 60, 10),
+  LensStore.previewQualityHigh: (720, 1280, 80, 10),
+};
+
 /// Camera-app style viewfinder: full-ratio (never cropped) preview with
 /// translucent top/bottom chrome floating OVER the video, so what you frame
 /// is exactly what the photo contains.
@@ -761,7 +773,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _socket?.sendHello(
       ps?.width.round() ?? 1280,
       ps?.height.round() ?? 720,
-      widget.store.previewParams['fps'] ?? 10,
+      // report the fps the tier actually runs at, not the raw host baseline
+      _previewTierParams[widget.store.previewQuality]?.$4 ??
+          widget.store.previewParams['fps'] ??
+          10,
       _streamRotation(),
     );
   }
@@ -913,8 +928,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _camFrames++;
     if (!_streaming) return;
     final p = widget.store.previewParams;
+    // Preview quality tier: "medium" (= the host-advertised baseline) leaves
+    // the pushed params untouched; every other tier replaces all four values.
+    // Re-read per frame, so a settings change applies to the very next frame
+    // — no camera rebuild, no reconnect.
+    final tier = _previewTierParams[widget.store.previewQuality];
     // a 0 fps (mis)config must not raise IntegerDivisionByZero per frame
-    final fps = (p['fps'] ?? 10) <= 0 ? 10 : (p['fps'] ?? 10);
+    final fps = tier?.$4 ?? ((p['fps'] ?? 10) <= 0 ? 10 : (p['fps'] ?? 10));
     final minGap = 1000 ~/ fps;
     final now = DateTime.now();
     if (now.difference(_lastFramePushed).inMilliseconds < minGap) {
@@ -941,9 +961,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _lastFramePushed = now;
     _encoder.encode(
       snap,
-      p['maxShort'] ?? 480,
-      p['maxLong'] ?? 854,
-      p['quality'] ?? 70,
+      tier?.$1 ?? p['maxShort'] ?? 480,
+      tier?.$2 ?? p['maxLong'] ?? 854,
+      tier?.$3 ?? p['quality'] ?? 70,
     );
   }
 

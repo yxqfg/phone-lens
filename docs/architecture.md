@@ -58,6 +58,7 @@
 ### D4 · 注入目标:"最近活跃 agent",可锁定
 host 侧没有"当前会话"概念,维护规则:
 - 订阅 `agent/inbox/inserted`、`agent/status`(→running)更新 `lastActiveAgentId`;`agent/created/disposed` 维护存活表。
+- 插件(重)加载时用 `ctx.agents.list()` 回填:`agent/created` 只在创建时派发一次不回放(cordis 事件无 retain),热重载后 running 者补 track 为活跃目标,idle 者仅入存活表。
 - 配置 `target.mode: 'latest' | 'pinned'`(pinned 固定 sessionId)。
 - 手机端可拉取 `GET /targets` 选择目标(默认最近活跃)。
 - 全部失败(无 agent)时:图片仍入库保存,回执标注"未注入(无活动会话)",不丢数据。
@@ -99,9 +100,9 @@ host 侧没有"当前会话"概念,维护规则:
 
 ### D9 · Hook:不用 Claude Code 格式,用 DSH agent 事件
 DSH 无 `UserPromptSubmit` 等 hooks(`docs/dsh-caps.md` Q3)。本项目用到的:
-- `agent/inbox/inserted` / `agent/status` → 活跃目标跟踪(D4)
-- `agent/created` / `agent/disposed` → 存活表维护
-- `agent/session-start` → 新会话广播给手机端(可选目标列表刷新)
+- `agent/inbox/inserted` / `agent/status` → 活跃目标跟踪(D4;派发点在 dsh-agent-loop)
+- `agent/created` / `agent/disposed` → 存活表维护(created 0.1.7 起替代已移除的 session-start)
+- ~~`agent/session-start`~~ → 0.1.7-alpha.1 已移除,无等价需求(新会话由 created 覆盖)
 - 预留 `agent/pre-step`(waterfall)做"注入前改写备注文本"等扩展,Phase 2 不实现。
 
 ## 3. 目录结构

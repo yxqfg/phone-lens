@@ -18,6 +18,8 @@ export interface EventedAgent {
   steer(message: unknown): void;
   session: { id: string };
   id?: string;
+  /** Live-registry view only (ctx.agents.list()): "idle" | "running". */
+  status?: string;
 }
 
 /**
@@ -47,6 +49,17 @@ export class HostDeliverySink implements DeliverySink {
     this.agents.set(id, agent);
     this.lastActiveId = id;
     this.log("info", `tracking agent ${id} (active target)`);
+  }
+
+  /**
+   * Record an agent as alive WITHOUT promoting it to the active target —
+   * hot-reload backfill only. A *running* agent claims the target via track();
+   * idle ones land here so pinned-mode delivery still resolves against the
+   * alive-map instead of reporting "no live agent".
+   */
+  trackIdle(agent: EventedAgent): void {
+    const id = agent.id ?? String(agent.session.id);
+    this.agents.set(id, agent);
   }
 
   /** Forget a disposed agent. */

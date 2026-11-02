@@ -58,6 +58,9 @@ export default class PhoneLens extends Service {
 
     // agent wiring (scope-filtered events fire on the root ctx for global
     // listeners): the sink tracks the last-active session for delivery.
+    // Dispatched by dsh-agent-loop (dsh-agent only owns created/disposed):
+    // inbox/inserted rides every inbox insert, agent/status rides every phase
+    // flip — both fused with the agent field, matching the payload reads below.
     const onAgent = (agent: EventedAgent) => sink.track(agent);
     const offAgent = (agent: EventedAgent) => sink.untrack(agent);
     ctx.on?.("agent/created", (payload: { agent: EventedAgent }) => onAgent(payload.agent));
@@ -66,6 +69,61 @@ export default class PhoneLens extends Service {
       if (payload.status === "running") onAgent(payload.agent);
     });
     ctx.on?.("agent/disposed", (payload: { agent: EventedAgent }) => offAgent(payload.agent));
+
+    // Hot-reload backfill: agent/created is announced exactly once at agent
+    // creation (no replay) and cordis events carry no retain, so agents that
+    // already exist when this plugin (re)loads never reach the wiring above.
+    // CRITICAL: reading `ctx.agents` during the constructor THROWS on the real
+    // host while the agents service is not yet mounted (cordis service
+    // accessors throw on inactive services; a plain-object smoke ctx returns
+    // undefined instead — this exact gap took the receiver down once). Access
+    // it lazily: ctx.inject fires when the service mounts (verified working on
+    // cordis 4.0.5 by dsh-acp), with a guarded direct read as the fallback.
+    let backfilled = false;
+    const runBackfill = (registry?: { list?: () => (EventedAgent[] | undefined) }) => {
+      if (backfilled) return;
+      if (!registry) {
+        try {
+          registry = (ctx as { agents?: { list?: () => (EventedAgent[] | undefined) } }).agents;
+        } catch {
+          // the real host THROWS on undeclared service access ("cannot get
+          // property ... without inject") — the inject callback below is the
+          // authorized path, this direct read is only the last-resort probe
+          return;
+        }
+      }
+      if (!registry || typeof registry.list !== "function") return;
+      const live = registry.list() ?? [];
+      let running = 0;
+      for (const agent of live) {
+        if (agent?.status === "running") {
+          running++;
+          onAgent(agent);
+        } else {
+          sink.trackIdle(agent);
+        }
+      }
+      backfilled = true;
+      if (live.length > 0) log("info", `backfilled ${live.length} live agent(s) (${running} running) from ctx.agents`);
+    };
+    // authorized access path: inject(deps, callback) starts a fiber whose body
+    // runs once all deps are mounted; the callback receives `(ctx, config)` —
+    // the service is read off THAT ctx (declared deps grant property access),
+    // not off the outer host ctx. Reading ctx.agents during the constructor
+    // throws until the service mounts, so this is the ONLY safe entry.
+    ctx.inject?.(["agents"], (injectCtx: { agents?: { list?: () => (EventedAgent[] | undefined) } }) => {
+      try {
+        runBackfill(injectCtx.agents);
+      } catch {
+        // never let the backfill take the receiver down
+      }
+    });
+    // fallback for hosts where imperative inject never fires (cordis 4.0.2
+    // defect; 4.0.5 verified working): also poke once on the next tick, when
+    // the service may have mounted after our constructor ran.
+    setTimeout(() => {
+      if (!backfilled) runBackfill();
+    }, 0).unref?.();
 
     // ── model-facing camera tools (dsh-tools) ─────────────────────────────
     // The WHOLE wiring sits inside a try/catch and must NEVER throw out: an

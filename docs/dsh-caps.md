@@ -29,10 +29,11 @@
 ## Q3 hooks:无 Claude Code 兼容
 
 - 全树无 `UserPromptSubmit/PreToolUse/PostToolUse/hooks` 配置面。
-- 等价物 = cordis agent 事件(`dsh-agent/lib/types/runtime-types.d.ts`):
+- 等价物 = cordis agent 事件(`dsh-agent/lib/types/runtime-types.d.ts`;created/disposed 由 dsh-agent 派发,status/inbox 由 `dsh-agent-loop` 派发,payload 经 `agentEvents` 融入 `agent` 字段):
   - `agent/created` `agent/disposed` `agent/status`(emit)
   - `agent/inbox/inserted` `agent/inbox/claimed` `agent/inbox/discarded`(emit)
-  - `agent/session-start`(emit;配 `agent.inject()` 播种上下文)
+  - ~~`agent/session-start`~~(0.1.7-alpha.1 已移除;新 agent 走 `agent/created`,payload 形状相同)
+  - 注:live ctx 事件之外另有持久会话日志事件层(如 inbox 变更的 `agent/inbox/spliced`,经 `session/event` ctx 事件观察),两层勿混。
   - **`agent/pre-step`(waterfall)** ≈ UserPromptSubmit:payload `{agent, messages, turn, step, signal}`,`next()` 保留 / 返回 `{kind:'reject'}` 拒绝 / `{kind:'enter', messages}` 替换进入该步的消息;触发点 `dsh-agent-loop/lib/index.js` L501-514
   - `agent/request`(waterfall,改 LLM 配置,不能改 messages)、`agent/request-error`(waterfall)、`agent/turn-stopping`(serial)、`agent/error`(emit)
 - 注册:`apply(ctx)` 内 `ctx.on("agent/pre-step", (payload, next) => {...})`;agent 事件经 `agentEvents`→`scopeTarget` 分发,无 scope 监听者全局放行(`dsh-scope/lib/index.js` L327-338),普通 host 插件可收到。

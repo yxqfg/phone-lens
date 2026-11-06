@@ -52,28 +52,52 @@ enum _DrawMode { crop, pen, mosaic }
 /// ([_BakeStroke] doubles) so the exporter in a background isolate never sees
 /// dart:ui types.
 class _Stroke {
-  _Stroke({required this.mosaic, required this.points, required this.width});
+  _Stroke({
+    required this.mosaic,
+    required this.points,
+    required this.width,
+    this.colorRgb = _defaultPenRgb,
+    required this.createdMs,
+  });
   final bool mosaic;
   final List<Offset> points;
   /// Pen: line thickness in image px. Mosaic: block size in image px (the
   /// painted band is ~2.2 blocks wide so one pass covers what it crosses).
   final double width;
+  /// Pen only: 0xRRGGBB of the marker color (mosaic ignores it).
+  final int colorRgb;
+  /// Epoch ms at creation — lets the pinch sweep recognise stray tap-dots.
+  final int createdMs;
 
   _BakeStroke toBake() => _BakeStroke(
         mosaic: mosaic,
         xs: [for (final p in points) p.dx],
         ys: [for (final p in points) p.dy],
         width: width,
+        r: (colorRgb >> 16) & 0xFF,
+        g: (colorRgb >> 8) & 0xFF,
+        b: colorRgb & 0xFF,
       );
 }
 
+const int _defaultPenRgb = 0xE5484D; // the classic marker red
+
 /// Plain-data stroke for the background isolate (no dart:ui dependencies).
 class _BakeStroke {
-  _BakeStroke({required this.mosaic, required this.xs, required this.ys, required this.width});
+  _BakeStroke({
+    required this.mosaic,
+    required this.xs,
+    required this.ys,
+    required this.width,
+    this.r = 0xE5,
+    this.g = 0x48,
+    this.b = 0x4D,
+  });
   final bool mosaic;
   final List<double> xs;
   final List<double> ys;
   final double width;
+  final int r, g, b;
 }
 
 class _BakeArgs {
@@ -127,10 +151,8 @@ img.Image _bakeStrokes(_BakeArgs args) {
   return image;
 }
 
-const int _penR = 0xE5, _penG = 0x48, _penB = 0x4D; // #E5484D, matches preview
-
 void _bakePen(img.Image image, _BakeStroke s) {
-  final color = image.getColor(_penR, _penG, _penB);
+  final color = image.getColor(s.r, s.g, s.b);
   final thickness = s.width.round().clamp(1, 512);
   final radius = (s.width / 2).round();
   // a filled circle at EVERY point + line segments between: the circles mask
@@ -219,10 +241,26 @@ class _CropScreenState extends State<CropScreen> {
   // ── strokes ──────────────────────────────────────────────────────────────
   _DrawMode _drawMode = _DrawMode.crop;
   final List<_Stroke> _strokes = [];
-  int _penSizeIdx = 1; // 0=细 1=中 2=粗
-  int _mosaicIdx = 1; // 0=轻 1=中 2=重
-  static const _penFracs = [0.012, 0.03, 0.06]; // of image width
-  static const _mosaicFracs = [0.02, 0.04, 0.08]; // block size, of image width
+  // Pen width / mosaic block size as a fraction of image width — the
+  // secondary toolbar sliders map continuously onto these ranges. Defaults
+  // match the old middle tiers (0.03 pen / 0.04 mosaic).
+  static const _penFracMin = 0.004, _penFracMax = 0.08;
+  static const _mosaicFracMin = 0.01, _mosaicFracMax = 0.12;
+  double _penFrac = 0.03;
+  double _mosaicFrac = 0.04;
+  int _penColorIdx = 0;
+  /// Secondary toolbar visibility: tapping the already-active mode button in
+  /// the main bar toggles this (so the size/color panel stops covering the
+  /// image while drawing). Picking a new mode always opens it again.
+  bool _settingsOpen = true;
+  static const _penColors = [
+    Color(0xFFE5484D), // red
+    Color(0xFF0090FF), // blue
+    Color(0xFFFFC53D), // amber
+    Color(0xFF46A758), // green
+    Color(0xFF17181C), // black
+    Color(0xFFF5F5F5), // white
+  ];
   ui.Image? _pixelated; // pixelated WHOLE image, for the mosaic preview layer
   bool _pixelating = false;
   /// Generation counter: every discard/rotate/load bumps it; a build whose
@@ -231,8 +269,32 @@ class _CropScreenState extends State<CropScreen> {
   /// layer built from the pre-rotation image).
   int _pixelGen = 0;
 
-  double get _penWidth => (_imgW * _penFracs[_penSizeIdx]).clamp(8.0, 512.0);
-  double get _mosaicCell => (_imgW * _mosaicFracs[_mosaicIdx]).clamp(8.0, 512.0);
+  // ── zoom (fine editing) ──────────────────────────────────────────────────
+  // Pinch-zoom pans the WHOLE canvas (image + strokes + crop frame together);
+  // every stroke is stored in image space, so zoom never touches stroke data.
+  static const _zoomMin = 1.0, _zoomMax = 6.0;
+  double _zoom = 1.0;
+  Offset _pan = Offset.zero; // screen-space translation at the current zoom
+  // gesture bookkeeping: per-gesture pinch flag (a second finger must never
+  // morph into a stray pen stroke / crop drag when it lifts), and the zoom
+  // gesture's start values for focal-anchored scaling
+  bool _pinchedThisGesture = false;
+  /// Edge-trigger flag: the stray-dot sweep for the in-progress pinch has
+  /// already run (start + update callbacks of the same gesture must not
+  /// re-run it).
+  bool _pinchStraySwept = false;
+  /// A stroke younger than this and still a single untouched point is treated
+  /// as the stray tap-dot a pinch finger leaves behind (finger lands → stroke
+  /// created → next finger lands a moment later → zoom starts). Deliberate
+  /// tap-dots are older than any realistic tap→pinch switch and survive.
+  static const _strayDotWindowMs = 600;
+  double _zoomBase = 1.0;
+  Offset _panBase = Offset.zero;
+  Offset _focalStart = Offset.zero;
+  bool get _zoomed => _zoom > 1.001;
+
+  double get _penWidth => (_imgW * _penFrac).clamp(8.0, 512.0);
+  double get _mosaicCell => (_imgW * _mosaicFrac).clamp(8.0, 512.0);
 
   bool get _isBatch => widget.batch != null && widget.batch!.isNotEmpty;
   int _currentIndex = 0;
@@ -264,6 +326,8 @@ class _CropScreenState extends State<CropScreen> {
       _displayBytes = _encode(decoded);
       _strokes.clear();
       _drawMode = _DrawMode.crop; // fresh image: back to crop mode (batch flow)
+      _settingsOpen = true;
+      _resetZoom();
       _discardPixelated();
       if (mounted) setState(() => _loading = false);
       // entering mosaic mode later builds it lazily; nothing eager here
@@ -284,8 +348,24 @@ class _CropScreenState extends State<CropScreen> {
     return Rect.fromLTWH((w * (1 - r)) / 2, (h * (1 - r)) / 2, w * r, h * r);
   }
 
-  void _rotate90() {
+  Future<void> _rotate90() async {
     if (_image == null) return;
+    // stroke coordinates are image-space; rotation remaps every point and
+    // cannot be preserved — warn before wiping visible user work
+    if (_strokes.isNotEmpty) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('清除标注并旋转?'),
+          content: const Text('画笔和马赛克无法随旋转保留,旋转后将全部清除。'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('旋转')),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) return;
+    }
     final rotated = img.copyRotate(_image!, angle: 90);
     setState(() {
       _image = rotated;
@@ -296,23 +376,95 @@ class _CropScreenState extends State<CropScreen> {
       // stroke coordinates are image-space; rotation remaps every point, so
       // the honest (and simplest) behaviour is to start clean
       _strokes.clear();
+      _resetZoom(); // new frame geometry — a stale zoom would mis-clamp
       _discardPixelated();
     });
   }
 
   void _setDrawMode(_DrawMode m) {
-    setState(() => _drawMode = m);
+    setState(() {
+      _drawMode = m;
+      if (m != _DrawMode.crop) _settingsOpen = true;
+    });
     if (m == _DrawMode.mosaic) _ensurePixelated();
   }
 
-  void _setPenSize(int i) => setState(() => _penSizeIdx = i);
+  /// Tapping the already-active pen/mosaic button in the main bar toggles the
+  /// secondary toolbar (crop has no secondary toolbar — tapping it just
+  /// switches back).
+  void _toggleSettings() => setState(() => _settingsOpen = !_settingsOpen);
 
-  void _setMosaic(int i) {
-    setState(() {
-      _mosaicIdx = i;
+  void _setPenFrac(double v) => setState(() => _penFrac = v);
+
+  /// Slider drag: [onChanged] updates the fraction only; [onChangeEnd] also
+  /// rebuilds the pixelated mosaic layer (expensive — never run per-frame).
+  void _setMosaicFrac(double v, {required bool commit}) {
+    setState(() => _mosaicFrac = v);
+    if (commit) {
       _discardPixelated();
+      _ensurePixelated();
+    }
+  }
+
+  void _setPenColor(int i) => setState(() => _penColorIdx = i);
+
+  /// Sweep away every single-point stroke younger than [_strayDotWindowMs] —
+  /// the tap-dot EACH pinch finger can leave before the zoom kicks in.
+  /// Time-window based on purpose: Flutter may tear a pinch down into
+  /// end→start reconfigurations as fingers land, so per-gesture tracking
+  /// misses fingers; a fresh untouched dot can only be pinch debris (a
+  /// deliberate dot always predates the pinch by a clear margin).
+  void _cancelPinchStrayDots() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final strays = <_Stroke>[
+      for (final s in _strokes)
+        if (s.points.length == 1 && now - s.createdMs < _strayDotWindowMs) s,
+    ];
+    if (strays.isEmpty) return;
+    setState(() {
+      for (final s in strays) {
+        _strokes.remove(s);
+      }
     });
-    _ensurePixelated();
+  }
+
+  // ── zoom helpers ─────────────────────────────────────────────────────────
+  void _resetZoom() {
+    _zoom = 1.0;
+    _pan = Offset.zero;
+    _pinchedThisGesture = false;
+  }
+
+  /// Screen-space → content-space (the un-transformed canvas the image,
+  /// strokes and crop frame live in). Pan/zoom only ever change the VIEW.
+  Offset _toContent(Offset screen) => (screen - _pan) / _zoom;
+
+  /// Apply a zoom/pan from the pinch gesture, clamped so the image can never
+  /// leave the viewport: each axis with enough content pins its edges to the
+  /// viewport, a smaller axis stays centred. [imgRect] is the fit-contain
+  /// rectangle in content space, [viewport] the LayoutBuilder size.
+  void _applyZoomPan(double zoom, Offset pan, Rect imgRect, Size viewport) {
+    final z = zoom.clamp(_zoomMin, _zoomMax);
+    if (z <= 1.001) {
+      // fully zoomed out == the initial fit view; kill any residual pan
+      if (_zoom != 1.0 || _pan != Offset.zero) {
+        setState(_resetZoom);
+      }
+      return;
+    }
+    double clampAxis(double edge, double size, double view) {
+      if (size >= view) return edge.clamp(view - size, 0.0);
+      return (view - size) / 2; // smaller than the viewport: always centred
+    }
+
+    final w = imgRect.width * z;
+    final h = imgRect.height * z;
+    final left = clampAxis(imgRect.left * z + pan.dx, w, viewport.width);
+    final top = clampAxis(imgRect.top * z + pan.dy, h, viewport.height);
+    setState(() {
+      _zoom = z;
+      _pan = Offset(left - imgRect.left * z, top - imgRect.top * z);
+    });
   }
 
   void _discardPixelated() {
@@ -502,8 +654,12 @@ class _CropScreenState extends State<CropScreen> {
               : _error != null
                   ? Center(child: Text(_error!, style: const TextStyle(color: Colors.white70)))
                   : _buildCrop(),
-          // bottom: draw-mode bar (crop / pen / mosaic + undo) with the stroke
-          // size rows only while a drawing mode is active
+          // zoom indicator/reset pill — top-right of the canvas, visible only
+          // while zoomed in; tap returns to the original fit view
+          if (!_loading && _error == null && _zoomed) _zoomResetButton(),
+          // bottom: draw-mode bar (crop / pen / mosaic + undo) with the
+          // stroke size/color rows only while a drawing mode is active AND
+          // the user hasn't collapsed the panel via the main-bar toggle
           Positioned(
             left: 0,
             right: 0,
@@ -513,7 +669,7 @@ class _CropScreenState extends State<CropScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (_drawMode != _DrawMode.crop) _strokeSettings(),
+                  if (_drawMode != _DrawMode.crop && _settingsOpen) _strokeSettings(),
                   _modeBar(),
                 ],
               ),
@@ -548,7 +704,17 @@ class _CropScreenState extends State<CropScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 2),
         child: InkWell(
           borderRadius: BorderRadius.circular(10),
-          onTap: _uploading ? null : () => _setDrawMode(m),
+          // Active pen/mosaic tapped again toggles the secondary toolbar so it
+          // stops covering the image; picking a different mode opens it.
+          onTap: _uploading
+              ? null
+              : () {
+                  if (_drawMode == m) {
+                    if (m != _DrawMode.crop) _toggleSettings();
+                    return;
+                  }
+                  _setDrawMode(m);
+                },
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: BoxDecoration(
@@ -597,52 +763,113 @@ class _CropScreenState extends State<CropScreen> {
     );
   }
 
+  /// Secondary toolbar: color swatches + a continuous size slider for the
+  /// pen, a coarseness slider for mosaic. Fixed widths throughout so it never
+  /// overflows narrow screens; hidden entirely via the main-bar toggle.
   Widget _strokeSettings() {
     final penActive = _drawMode == _DrawMode.pen;
+    final slider = SizedBox(
+      width: 148,
+      height: 28,
+      child: SliderTheme(
+        data: SliderThemeData(
+          trackHeight: 3,
+          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 9),
+          overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+          padding: EdgeInsets.zero,
+        ),
+        child: penActive
+            ? Slider(
+                value: _penFrac.clamp(_penFracMin, _penFracMax),
+                min: _penFracMin,
+                max: _penFracMax,
+                onChanged: _uploading ? null : _setPenFrac,
+              )
+            : Slider(
+                value: _mosaicFrac.clamp(_mosaicFracMin, _mosaicFracMax),
+                min: _mosaicFracMin,
+                max: _mosaicFracMax,
+                // rebuild the (expensive) pixelated layer only when the drag ends
+                onChanged: _uploading ? null : (v) => _setMosaicFrac(v, commit: false),
+                onChangeEnd: _uploading ? null : (v) => _setMosaicFrac(v, commit: true),
+              ),
+      ),
+    );
+    // live preview glyph at the left of the slider: pen = a dot in the
+    // current color & size, mosaic = a square of the current block size
+    final previewSize = penActive
+        ? (_penFrac * 260).clamp(5.0, 34.0)
+        : (_mosaicFrac * 260).clamp(6.0, 34.0);
+    final preview = penActive
+        ? Container(
+            width: previewSize,
+            height: previewSize,
+            decoration: BoxDecoration(shape: BoxShape.circle, color: _penColors[_penColorIdx]),
+          )
+        : Container(
+            width: previewSize,
+            height: previewSize,
+            decoration: BoxDecoration(
+              color: Colors.white38,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          );
     return Center(
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         decoration: BoxDecoration(
           color: const Color(0xEE101418),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: Colors.white12),
         ),
-        child: Row(
+        child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(penActive ? '笔画大小' : '模糊度', style: const TextStyle(fontSize: 11, color: Colors.white70)),
-            const SizedBox(width: 10),
-            for (var i = 0; i < 3; i++)
+            if (penActive)
+              // color swatches — one tight row, tap to pick, ring marks active
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(16),
-                  onTap: _uploading ? null : () => penActive ? _setPenSize(i) : _setMosaic(i),
-                  child: Container(
-                    width: 34,
-                    height: 34,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: (penActive ? _penSizeIdx : _mosaicIdx) == i ? const Color(0xFF2A5D8F) : Colors.white10,
-                    ),
-                    child: penActive
-                        ? Icon(
-                            // same brush glyph, growing with the size tier
-                            Icons.brush,
-                            size: 13.0 + i * 4.0,
-                            color: Colors.white,
-                          )
-                        : Container(
-                            // dot size previews the block coarseness
-                            width: 8.0 + i * 5,
-                            height: 8.0 + i * 5,
-                            decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white70),
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    for (var i = 0; i < _penColors.length; i++)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: InkWell(
+                          customBorder: const CircleBorder(),
+                          onTap: _uploading ? null : () => _setPenColor(i),
+                          child: Container(
+                            width: 26,
+                            height: 26,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _penColors[i],
+                              border: Border.all(
+                                color: _penColorIdx == i ? Colors.white : Colors.white24,
+                                width: _penColorIdx == i ? 2 : 1,
+                              ),
+                            ),
                           ),
-                  ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 30,
+                  child: Text(
+                    penActive ? '大小' : '模糊',
+                    style: const TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                ),
+                SizedBox(width: 34, height: 34, child: Center(child: preview)),
+                slider,
+              ],
+            ),
           ],
         ),
       ),
@@ -656,13 +883,16 @@ class _CropScreenState extends State<CropScreen> {
         // where Android edge-gestures (back swipe / gesture nav) steal them.
         const pad = 18.0;
         final avail = Size(constraints.maxWidth - pad * 2, constraints.maxHeight - pad * 2);
+        final viewport = constraints.biggest;
         // fit-contain the image into the available area
         final scale = (avail.width / _imgW) < (avail.height / _imgH) ? avail.width / _imgW : avail.height / _imgH;
         final dw = _imgW * scale;
         final dh = _imgH * scale;
         final imgRect = Rect.fromLTWH((constraints.maxWidth - dw) / 2, (constraints.maxHeight - dh) / 2, dw, dh);
         final crop = _crop!;
-        // absolute-space crop rect (for gesture hit-testing)
+        // content-space crop rect (for gesture hit-testing) — the inverse of
+        // the pan/zoom view transform is applied to gesture positions first,
+        // so hit-testing runs in the SAME space as before zooming existed
         final cd = Rect.fromLTWH(
           imgRect.left + crop.left * scale,
           imgRect.top + crop.top * scale,
@@ -687,6 +917,7 @@ class _CropScreenState extends State<CropScreen> {
             else
               _DisplayStroke(
                 mosaic: false,
+                color: Color(0xFF000000 | s.colorRgb),
                 centerline: s.points.length > 1 ? _polylinePath([for (final p in s.points) Offset(p.dx * scale, p.dy * scale)]) : null,
                 dot: s.points.length == 1 ? Offset(s.points.first.dx * scale, s.points.first.dy * scale) : null,
                 lineWidth: s.width * scale,
@@ -694,31 +925,138 @@ class _CropScreenState extends State<CropScreen> {
         ];
         final drawing = _drawMode != _DrawMode.crop;
         return GestureDetector(
-          onPanStart: (d) => drawing ? _beginStroke(d.localPosition, imgRect, scale) : _onPanStart(d.localPosition, imgRect, cd),
-          onPanUpdate: (d) => drawing ? _extendStroke(d.localPosition, imgRect, scale) : _onPanUpdate(d.delta, scale),
-          onPanEnd: (_) => _lastPanDrawing = false,
+          // scale gestures are a strict superset of pan: one finger drags
+          // (draw / crop), two fingers pinch-zoom+pan the whole canvas.
+          onScaleStart: (d) => _onScaleStart(d, imgRect, scale, drawing, cd),
+          onScaleUpdate: (d) => _onScaleUpdate(d, imgRect, scale, drawing, cd, viewport),
+          onScaleEnd: (d) {
+            _lastPanDrawing = false;
+            _mode = _none; // crop drag state must never survive a reconfigure
+            // The recognizer fires end ALSO when going 2→1 fingers (then
+            // re-fires start for the surviving finger with the scale reset) —
+            // only reset the pinch bookkeeping when EVERY finger has lifted,
+            // else the surviving finger would instantly start a stray stroke
+            // or drag the crop frame.
+            if (d.pointerCount == 0) {
+              _pinchedThisGesture = false;
+              _pinchStraySwept = false; // next pinch sweeps its own strays
+            }
+          },
           child: Stack(
             children: [
-              Positioned.fromRect(
-                rect: imgRect,
-                child: Image.memory(_displayBytes!, fit: BoxFit.fill, gaplessPlayback: true),
-              ),
-              Positioned.fromRect(
-                rect: imgRect,
-                child: CustomPaint(
-                  painter: _CropPainter(
-                    cropBox: cropBox,
-                    handleSize: widget.handleSize,
-                    strokes: displayStrokes,
-                    pixelated: _pixelated,
-                    drawHandles: !drawing,
-                  ),
+              // The zoom view: translate+scale the whole canvas. Stroke data,
+              // the crop rect and the painter all stay in content space —
+              // zoom only changes how that space is displayed.
+              Transform(
+                transform: Matrix4.identity()
+                  ..translateByDouble(_pan.dx, _pan.dy, 0, 1)
+                  ..scaleByDouble(_zoom, _zoom, _zoom, 1),
+                child: Stack(
+                  children: [
+                    Positioned.fromRect(
+                      rect: imgRect,
+                      child: Image.memory(_displayBytes!, fit: BoxFit.fill, gaplessPlayback: true),
+                    ),
+                    Positioned.fromRect(
+                      rect: imgRect,
+                      child: CustomPaint(
+                        painter: _CropPainter(
+                          cropBox: cropBox,
+                          handleSize: widget.handleSize,
+                          zoomScale: 1.0 / _zoom, // frame/handles stay screen-sized
+                          strokes: displayStrokes,
+                          pixelated: _pixelated,
+                          drawHandles: !drawing,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
           ),
         );
       },
+    );
+  }
+
+  void _onScaleStart(ScaleStartDetails d, Rect imgRect, double scale, bool drawing, Rect cd) {
+    if (_uploading) return;
+    if (d.pointerCount > 1) {
+      _pinchedThisGesture = true; // only ever SET here; cleared on final lift
+      _lastPanDrawing = false;
+      if (!_pinchStraySwept) {
+        _pinchStraySwept = true;
+        _cancelPinchStrayDots();
+      }
+      _zoomBase = _zoom;
+      _panBase = _pan;
+      _focalStart = d.localFocalPoint;
+      return;
+    }
+    // A finger surviving a pinch re-fires onStart (pointerCount==1, scale
+    // reset) — ignore it until every finger lifts, else it would start a
+    // stray stroke or drag the crop frame.
+    if (_pinchedThisGesture) return;
+    final content = _toContent(d.localFocalPoint);
+    if (drawing) {
+      _beginStroke(content, imgRect, scale);
+    } else {
+      _onPanStart(content, imgRect, cd);
+    }
+  }
+
+  void _onScaleUpdate(ScaleUpdateDetails d, Rect imgRect, double scale, bool drawing, Rect cd, Size viewport) {
+    if (_uploading) return;
+    if (d.pointerCount > 1) {
+      // focal-anchored zoom: the content point under the gesture's starting
+      // focus stays under the moving focus, so the pinch feels pinned
+      if (!_pinchStraySwept) {
+        // edge-triggered — Flutter may skip the re-issued onScaleStart when
+        // the pointer count changes (end→start reconfiguration), so the
+        // update path must sweep too, exactly once per pinch
+        _pinchStraySwept = true;
+        _cancelPinchStrayDots();
+      }
+      final z = (_zoomBase * d.scale).clamp(_zoomMin, _zoomMax);
+      final anchor = (_focalStart - _panBase) / _zoomBase;
+      _applyZoomPan(z, d.localFocalPoint - anchor * z, imgRect, viewport);
+      return;
+    }
+    if (_pinchedThisGesture) {
+      // the second finger lifted off a pinch — ignore the leftover pointer
+      // until the gesture fully ends, else it would start a stray stroke or
+      // drag the crop frame
+      return;
+    }
+    if (drawing) {
+      _extendStroke(_toContent(d.localFocalPoint), imgRect, scale);
+    } else {
+      _onPanUpdate(d.focalPointDelta / _zoom, scale);
+    }
+  }
+
+  /// "Back to 1:1" pill, top-right of the canvas; only visible while zoomed.
+  Widget _zoomResetButton() {
+    return Positioned(
+      top: 12,
+      right: 12,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(20),
+          onTap: _uploading ? null : () => setState(_resetZoom),
+          child: Container(
+            padding: const EdgeInsets.all(9),
+            decoration: BoxDecoration(
+              color: const Color(0xEE101418),
+              shape: BoxShape.circle,
+              border: Border.all(color: Colors.white12),
+            ),
+            child: const Icon(Icons.zoom_out_map, size: 20, color: Colors.white70),
+          ),
+        ),
+      ),
     );
   }
 
@@ -736,6 +1074,8 @@ class _CropScreenState extends State<CropScreen> {
         mosaic: mosaic,
         points: [Offset(px, py)],
         width: mosaic ? _mosaicCell : _penWidth,
+        colorRgb: _penColors[_penColorIdx].toARGB32() & 0xFFFFFF,
+        createdMs: DateTime.now().millisecondsSinceEpoch,
       ));
     });
   }
@@ -746,7 +1086,9 @@ class _CropScreenState extends State<CropScreen> {
     final py = ((local.dy - imgRect.top) / scale).clamp(0.0, _imgH);
     final s = _strokes.last;
     final last = s.points.last;
-    if ((Offset(px, py) - last).distance < 2) return; // dedupe micro-jitter
+    // dedupe micro-jitter (screen-space ~2px, so divide by the zoom factor —
+    // under zoom the same screen jitter maps to fewer content px)
+    if ((Offset(px, py) - last).distance < 2 / _zoom) return;
     setState(() => s.points.add(Offset(px, py)));
   }
 
@@ -757,7 +1099,9 @@ class _CropScreenState extends State<CropScreen> {
       _bl: cd.bottomLeft,
       _br: cd.bottomRight,
     };
-    final grab = widget.handleSize + 20; // generous hit zone around each handle
+    // generous hit zone around each handle (content-space: divided by zoom
+    // so the on-screen grab radius stays constant while zoomed in)
+    final grab = (widget.handleSize + 20) / _zoom;
     for (final e in handles.entries) {
       if ((local - e.value).distance <= grab && local.dx >= imgRect.left - grab && local.dx <= imgRect.right + grab && local.dy >= imgRect.top - grab && local.dy <= imgRect.bottom + grab) {
         _mode = e.key;
@@ -798,7 +1142,14 @@ class _CropScreenState extends State<CropScreen> {
 
 /// Stroke already converted to display space (canvas origin == image TL).
 class _DisplayStroke {
-  _DisplayStroke({required this.mosaic, this.outline, this.centerline, this.dot, this.lineWidth = 0});
+  _DisplayStroke({
+    required this.mosaic,
+    this.outline,
+    this.centerline,
+    this.dot,
+    this.lineWidth = 0,
+    this.color = const Color(0xFFE5484D),
+  });
   final bool mosaic;
   /// Mosaic only: coverage outline the pixelated layer is clipped through.
   final Path? outline;
@@ -808,17 +1159,23 @@ class _DisplayStroke {
   final Offset? dot;
   /// Pen only: stroke width in display px.
   final double lineWidth;
+  /// Pen only: marker color (matches what the exporter bakes).
+  final Color color;
 }
 
 class _CropPainter extends CustomPainter {
   final Rect cropBox; // relative to the canvas origin (== image display box)
   final double handleSize;
+  /// 1 / zoom — shrinks frame stroke & corner handles by the view zoom so
+  /// they keep a constant on-screen size while the image is magnified.
+  final double zoomScale;
   final List<_DisplayStroke> strokes;
   final ui.Image? pixelated;
   final bool drawHandles;
   _CropPainter({
     required this.cropBox,
     required this.handleSize,
+    this.zoomScale = 1.0,
     this.strokes = const [],
     this.pixelated,
     this.drawHandles = true,
@@ -861,7 +1218,7 @@ class _CropPainter extends CustomPainter {
         // pen: ONE smooth round-cap/round-join stroke along the centerline
         // (per-segment rounded rects used to read as chained boxes)
         final paint = Paint()
-          ..color = const Color(0xFFE5484D)
+          ..color = s.color
           ..style = PaintingStyle.stroke
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round
@@ -870,22 +1227,23 @@ class _CropPainter extends CustomPainter {
         if (cl != null) canvas.drawPath(cl, paint);
         final d = s.dot;
         if (d != null) {
-          canvas.drawCircle(d, s.lineWidth / 2, Paint()..color = const Color(0xFFE5484D));
+          canvas.drawCircle(d, s.lineWidth / 2, Paint()..color = s.color);
         }
       }
     }
-    // crop frame
+    // crop frame (stroke width compensated for zoom so it stays 2 screen px)
     final frame = Paint()
       ..color = Colors.white
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 2;
+      ..strokeWidth = 2 * zoomScale;
     canvas.drawRect(r, frame);
     // corner handles at the configured size
     if (!drawHandles) return;
     final h = Paint()..color = Colors.white;
-    final half = handleSize / 2;
+    final hs = handleSize * zoomScale;
+    final half = hs / 2;
     for (final p in [r.topLeft, r.topRight, r.bottomLeft, r.bottomRight]) {
-      canvas.drawRect(Rect.fromLTWH(p.dx - half, p.dy - half, handleSize, handleSize), h);
+      canvas.drawRect(Rect.fromLTWH(p.dx - half, p.dy - half, hs, hs), h);
     }
   }
 
@@ -893,6 +1251,7 @@ class _CropPainter extends CustomPainter {
   bool shouldRepaint(covariant _CropPainter old) =>
       old.cropBox != cropBox ||
       old.handleSize != handleSize ||
+      old.zoomScale != zoomScale ||
       !identical(old.strokes, strokes) ||
       !identical(old.pixelated, pixelated) ||
       old.drawHandles != drawHandles;

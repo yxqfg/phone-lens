@@ -23,9 +23,14 @@ class UpdateInfo {
 }
 
 /// Gitee first (CN-reachable, the default APK source), GitHub as fallback.
-/// Both feeds share the GitHub-shaped JSON (tag_name / body / assets).
+/// Gitee uses the releases LIST endpoint + client-side compare: its
+/// /releases/latest returns the most-recently-EDITED release, so merely
+/// touching an old release (rename, reformat) advertises a stale version as
+/// latest — hit for real on 2026-11-04 (an old-release rename made the App
+/// report v1.0.0 as newest and kept phones from seeing updates). GitHub keeps
+/// /releases/latest: its "latest" is the newest non-prerelease, no edit trap.
 const _releaseFeeds = [
-  'https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest',
+  'https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases?per_page=10&direction=desc',
   'https://api.github.com/repos/yxqfg/phone-lens/releases/latest',
 ];
 
@@ -83,12 +88,36 @@ Future<UpdateInfo?> checkForUpdate({http.Client? client}) async {
             .timeout(const Duration(seconds: 6));
         if (resp.statusCode != 200) continue;
         final data = jsonDecode(resp.body);
-        if (data is! Map<String, dynamic>) continue;
-        final tag = data['tag_name'];
-        if (tag is! String || tag.isEmpty) continue;
+        // Gitee's list endpoint returns an array; GitHub's latest returns one
+        // object — normalize both into a list of GitHub-shaped releases.
+        final List<dynamic> releases;
+        if (data is List) {
+          releases = data;
+        } else if (data is Map<String, dynamic>) {
+          releases = [data];
+        } else {
+          continue;
+        }
+
+        // Highest tag client-side (immune to the Gitee edit-trap, see
+        // _releaseFeeds), then that release's APK asset — only the newest
+        // release is consulted: no trusted APK means a broken upload, and
+        // failing over beats silently offering an older version.
+        String? bestTag;
+        Map<String, dynamic>? newest;
+        for (final r in releases) {
+          if (r is! Map) continue;
+          final tag = r['tag_name'];
+          if (tag is! String || tag.trim().isEmpty) continue;
+          if (bestTag == null || compareVersions(tag, bestTag) > 0) {
+            bestTag = tag.trim();
+            newest = r as Map<String, dynamic>;
+          }
+        }
+        if (newest == null || bestTag == null) continue;
 
         String? apkUrl;
-        final assets = data['assets'];
+        final assets = newest['assets'];
         if (assets is List) {
           for (final a in assets) {
             if (a is! Map) continue;
@@ -105,8 +134,8 @@ Future<UpdateInfo?> checkForUpdate({http.Client? client}) async {
 
         return UpdateInfo(
           currentVersion: current,
-          latestVersion: tag.replaceFirst(RegExp(r'^v'), '').trim(),
-          changelog: (data['body'] is String ? data['body'] as String : '').trim(),
+          latestVersion: bestTag.replaceFirst(RegExp(r'^v'), '').trim(),
+          changelog: (newest['body'] is String ? newest['body'] as String : '').trim(),
           downloadUrl: apkUrl,
         );
       } on TimeoutException {

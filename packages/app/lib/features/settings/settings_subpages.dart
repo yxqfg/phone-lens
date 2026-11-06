@@ -342,9 +342,11 @@ class _CaptureSettingsPageState extends State<CaptureSettingsPage> {
           _buildHandleSizeTile(),
           const SectionHeader('上传画质'),
           for (final entry in const [
-            (LensStore.qualityHigh, '高(原图直传)', '保持相机原始画质,仅超出电脑端大小限制时压缩;文件最大'),
-            (LensStore.qualityMedium, '中(推荐)', '重编码至长边 2560px,画质几乎无损,体积约为原图的 1/3'),
-            (LensStore.qualityLow, '低(省流量)', '重编码至长边 1600px,弱网环境下上传更快'),
+            (LensStore.qualityHigh, '原图', '原始尺寸'),
+            (LensStore.qualityMedium, '高', '2048px 超精细细节,注意图片过大不仅影响传输速率,模型厂商收费可能因此较贵'),
+            (LensStore.qualityLow, '中(默认)', '1280px 覆盖多数需求'),
+            (LensStore.qualityVeryLow, '低', '960px 覆盖常规需求,文档常规字体可辨认'),
+            (LensStore.qualityUltraLow, '极低', '320px 细节完全不可辨认'),
           ])
             RadioListTile<String>(
               value: entry.$1,
@@ -556,9 +558,11 @@ Chip linkChip(LensLinkState link) {
 
 /// Quality label helper for the capture entry's summary line.
 String qualityLabel(String quality) => switch (quality) {
-  LensStore.qualityHigh => '高(原图直传)',
-  LensStore.qualityMedium => '中(推荐)',
-  LensStore.qualityLow => '低(省流量)',
+  LensStore.qualityHigh => '原图',
+  LensStore.qualityMedium => '高',
+  LensStore.qualityLow => '中',
+  LensStore.qualityVeryLow => '低',
+  LensStore.qualityUltraLow => '极低',
   _ => quality,
 };
 

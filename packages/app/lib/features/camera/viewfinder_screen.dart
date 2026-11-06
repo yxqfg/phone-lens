@@ -1067,9 +1067,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     final maxBytes = widget.store.maxUploadBytes;
     switch (widget.store.uploadQuality) {
       case LensStore.qualityMedium:
-        return compute(_normalize, _NormArgs(bytes, maxBytes, 2560, 80));
+        return compute(_normalize, _NormArgs(bytes, maxBytes, 2048, 88));
       case LensStore.qualityLow:
-        return compute(_normalize, _NormArgs(bytes, maxBytes, 1600, 65));
+        return compute(_normalize, _NormArgs(bytes, maxBytes, 1280, 80));
+      case LensStore.qualityVeryLow:
+        return compute(_normalize, _NormArgs(bytes, maxBytes, 960, 80));
+      case LensStore.qualityUltraLow:
+        return compute(_normalize, _NormArgs(bytes, maxBytes, 320, 60));
       default: // high: original bytes unless they exceed the receiver's ceiling
         return bytes.length > maxBytes ? compute(_fit, _FitArgs(bytes, maxBytes, 4096)) : bytes;
     }

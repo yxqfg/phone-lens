@@ -260,18 +260,29 @@ class LensStore {
   static const _kLimits = 'lens.limits';
   static const _kUploadQuality = 'lens.uploadQuality';
 
-  // Upload quality presets (Settings → 上传). "high" keeps the original
-  // camera bytes; medium/low always re-encode to a bounded width.
+  // Upload quality presets (Settings → 拍摄与上传 → 上传画质), best→worst:
+  // high = original camera bytes; the rest re-encode to a bounded width.
+  // medium is the default (3rd of the five tiers).
   static const qualityHigh = 'high';
   static const qualityMedium = 'medium';
   static const qualityLow = 'low';
+  static const qualityVeryLow = 'veryLow';
+  static const qualityUltraLow = 'ultraLow';
 
   /// Fresh installs default to medium (volume ≈ 1/3 of the original at
   /// near-lossless quality). An EXPLICIT choice — including high — is
-  /// honoured forever once written to prefs.
+  /// honoured forever once written to prefs. Unknown stored values degrade
+  /// to medium.
   String get uploadQuality {
     final v = _prefs.getString(_kUploadQuality);
-    if (v != null && (v == qualityHigh || v == qualityMedium || v == qualityLow)) return v;
+    if (v != null &&
+        (v == qualityHigh ||
+            v == qualityMedium ||
+            v == qualityLow ||
+            v == qualityVeryLow ||
+            v == qualityUltraLow)) {
+      return v;
+    }
     return qualityMedium;
   }
 

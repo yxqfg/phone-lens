@@ -482,7 +482,7 @@ const ERROR_CODES = {
 
 //#endregion
 //#region src/server/update-check.ts
-const GITEE_LATEST_API$1 = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest";
+const GITEE_RELEASES_API$1 = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases?per_page=10&direction=desc";
 /** A fresh result suppresses further API calls for 12h (host sits open all day). */
 const OK_TTL_MS = 12 * 60 * 60 * 1e3;
 /** A failed check retries after 30min instead of hammering the API per panel-open. */
@@ -514,15 +514,25 @@ function compareVersions(a, b) {
 	}
 	return 0;
 }
-/** Latest release tag from the trusted Gitee feed, or null on any failure. */
+/** Highest release tag across the first page of the trusted Gitee feed, or
+*  null on any failure. Client-side max() over tag_name, so a stale-but-recently
+*  edited release can never shadow the real newest version. */
 async function fetchLatestGiteeTag() {
 	try {
-		const url = new URL(GITEE_LATEST_API$1);
+		const url = new URL(GITEE_RELEASES_API$1);
 		if (url.protocol !== "https:" || url.host !== "gitee.com") return null;
 		const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
 		if (!res.ok) return null;
 		const data = await res.json();
-		return typeof data.tag_name === "string" && data.tag_name.trim() ? data.tag_name.trim() : null;
+		if (!Array.isArray(data)) return null;
+		let best = null;
+		for (const row of data) {
+			const tag = row?.tag_name;
+			if (typeof tag !== "string" || !tag.trim()) continue;
+			const clean = tag.trim();
+			if (best === null || compareVersions(clean, best) > 0) best = clean;
+		}
+		return best;
 	} catch {
 		return null;
 	}
@@ -607,7 +617,7 @@ async function admitImage(input, attachments, fallbackDir) {
 
 //#endregion
 //#region src/server/apk-link.ts
-const GITEE_LATEST_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest";
+const GITEE_RELEASES_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases?per_page=10&direction=desc";
 const CACHE_TTL_MS = 10 * 60 * 1e3;
 const REQUEST_TIMEOUT_MS = 6e3;
 let cached = null;
@@ -628,15 +638,17 @@ async function fetchLatestGiteeApk() {
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
 	try {
-		const resp = await fetch(GITEE_LATEST_API, {
+		const resp = await fetch(GITEE_RELEASES_API, {
 			signal: ctrl.signal,
 			headers: { accept: "application/json" }
 		});
 		if (!resp.ok) return null;
 		const data = await resp.json();
-		const assets = data?.assets;
-		if (!Array.isArray(assets)) return null;
-		for (const asset of assets) {
+		if (!Array.isArray(data)) return null;
+		const rows = data.filter((row) => typeof row?.tag_name === "string" && !!row.tag_name.trim()).sort((a, b) => compareVersions(b.tag_name.trim(), a.tag_name.trim()));
+		const newest = rows[0];
+		if (!newest || !Array.isArray(newest.assets)) return null;
+		for (const asset of newest.assets) {
 			const row = asset;
 			if (typeof row.name === "string" && row.name.startsWith("app-release.apk") && isTrustedGiteeAsset(row.browser_download_url)) return row.browser_download_url;
 		}

@@ -5,13 +5,19 @@
  * 302s to /repository/archive/ and 404s), so a hardcoded asset URL goes stale
  * the moment a new release ships — v1.0.0 shipped with a v0.3.11 link exactly
  * this way. Instead of bumping a constant on every release, ask Gitee's public
- * latest-release API for the current asset URL and cache it; the constant in
+ * releases list API for the current asset URL and cache it; the constant in
  * config.ts is only the offline fallback and needs no per-release bump.
  */
 import { GITEE_APK_DEFAULT } from "../config.js";
 import type { LensConfig } from "../types.js";
+import { compareVersions } from "./update-check.js";
 
-const GITEE_LATEST_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest";
+// List endpoint + client-side compare, NOT /releases/latest — Gitee's "latest"
+// endpoint returns the most-recently-EDITED release, so touching an old release
+// (rename, reformat) would surface a stale APK as current (hit for real on
+// 2026-11-04, see update-check.ts). Ordered by creation date; we pick the
+// highest tag client-side.
+const GITEE_RELEASES_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases?per_page=10&direction=desc";
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 6000;
 
@@ -35,12 +41,19 @@ async function fetchLatestGiteeApk(): Promise<string | null> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const resp = await fetch(GITEE_LATEST_API, { signal: ctrl.signal, headers: { accept: "application/json" } });
+    const resp = await fetch(GITEE_RELEASES_API, { signal: ctrl.signal, headers: { accept: "application/json" } });
     if (!resp.ok) return null;
     const data: unknown = await resp.json();
-    const assets = (data as { assets?: unknown } | null)?.assets;
-    if (!Array.isArray(assets)) return null;
-    for (const asset of assets) {
+    if (!Array.isArray(data)) return null;
+    // Newest tag first (client-side compare), then that release's APK asset —
+    // only the newest release is consulted: if it carries no trusted APK the
+    // upload is broken and falling back beats silently serving an older APK.
+    const rows = (data as { tag_name?: unknown; assets?: unknown }[])
+      .filter((row): row is { tag_name: string; assets?: unknown } => typeof row?.tag_name === "string" && !!row.tag_name.trim())
+      .sort((a, b) => compareVersions(b.tag_name.trim(), a.tag_name.trim()));
+    const newest = rows[0];
+    if (!newest || !Array.isArray(newest.assets)) return null;
+    for (const asset of newest.assets) {
       const row = asset as { name?: unknown; browser_download_url?: unknown };
       // startsWith tolerates Gitee's double-suffix quirk (uploads have landed
       // as "app-release.apk.apk"); the trusted-host check below still gates

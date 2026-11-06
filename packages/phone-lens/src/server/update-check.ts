@@ -10,7 +10,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const GITEE_LATEST_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases/latest";
+// List endpoint + client-side compare, NOT /releases/latest: Gitee's "latest"
+// endpoint returns the most-recently-EDITED release, so merely touching an old
+// release (rename, note reformat) advertises a stale version as latest — hit
+// for real on 2026-11-04 (edit bumped an old release's updated time and the
+// App/host all reported v1.0.0 as newest). The list endpoint is ordered by
+// creation date; picking the highest tag client-side is immune to that.
+const GITEE_RELEASES_API = "https://gitee.com/api/v5/repos/qianfengbingtang/phone-lens/releases?per_page=10&direction=desc";
 /** A fresh result suppresses further API calls for 12h (host sits open all day). */
 const OK_TTL_MS = 12 * 60 * 60 * 1000;
 /** A failed check retries after 30min instead of hammering the API per panel-open. */
@@ -58,16 +64,26 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-/** Latest release tag from the trusted Gitee feed, or null on any failure. */
+/** Highest release tag across the first page of the trusted Gitee feed, or
+ *  null on any failure. Client-side max() over tag_name, so a stale-but-recently
+ *  edited release can never shadow the real newest version. */
 async function fetchLatestGiteeTag(): Promise<string | null> {
   try {
-    const url = new URL(GITEE_LATEST_API);
+    const url = new URL(GITEE_RELEASES_API);
     // request-URL hygiene: only https on the trusted release host
     if (url.protocol !== "https:" || url.host !== "gitee.com") return null;
     const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
     if (!res.ok) return null;
-    const data = (await res.json()) as { tag_name?: unknown };
-    return typeof data.tag_name === "string" && data.tag_name.trim() ? data.tag_name.trim() : null;
+    const data = (await res.json()) as unknown;
+    if (!Array.isArray(data)) return null;
+    let best: string | null = null;
+    for (const row of data) {
+      const tag = (row as { tag_name?: unknown } | null)?.tag_name;
+      if (typeof tag !== "string" || !tag.trim()) continue;
+      const clean = tag.trim();
+      if (best === null || compareVersions(clean, best) > 0) best = clean;
+    }
+    return best;
   } catch {
     return null;
   }

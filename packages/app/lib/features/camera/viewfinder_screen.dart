@@ -13,6 +13,7 @@ import 'package:vibration/vibration.dart';
 
 import '../../core/api.dart';
 import '../../core/camera_socket.dart';
+import '../work/work_store.dart';
 import '../../core/jpeg.dart';
 import '../../core/preview_encoder.dart';
 import '../../core/routes.dart';
@@ -53,7 +54,7 @@ class ViewfinderScreen extends StatefulWidget {
 
 class _ViewfinderScreenState extends State<ViewfinderScreen>
     with WidgetsBindingObserver, RouteAware {
-  final _api = LensApi();
+  final _api = sharedLensApi; // long-lived shared client (never disposed here)
   CameraController? _camera;
   bool _cameraReady = false;
   String? _cameraError;
@@ -180,8 +181,28 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// the camera only if it isn't already up; `_autoClosed` (idle shutdown)
   /// still requires an explicit shutter/preview tap.
   void _onHomeTabChanged() {
-    if (!mounted || homeTab.value != 0 || cameraReadyCheck) return;
-    _initCamera();
+    if (!mounted) return;
+    if (homeTab.value == 0) {
+      if (cameraReadyCheck) return;
+      _initCamera();
+      return;
+    }
+    // Leaving the viewfinder for ANY other tab voids an armed work-capture:
+    // the handshake is only meaningful for "arm → shutter → bounce back"
+    // without leaving in between. The handoff's own bounce-back is safe —
+    // _shoot already consumed (nulled) pendingWorkCapture before the callback
+    // flips the tab, so this is a no-op on that path. Without this, an armed
+    // callback survived the tab switch and silently hijacked the NEXT local
+    // shutter into a work draft (never reaching the upload queue).
+    pendingWorkCapture.value = null;
+    // Leaving for the WORK tab (slot tracked by global_link.workTabIndex —
+    // NOT a hard-coded number, the work tab moved to slot 1 in 2026-11):
+    // the RouteAware release above never fires on IndexedStack tab switches,
+    // so without this the camera + preview encoding/upload keep grinding while
+    // the user scrolls the work session list (jank). Remote shutters are
+    // covered — _reviveFromAutoClose's non-autoClosed branch reopens the
+    // camera on demand. Other tabs keep the old always-on behavior.
+    if (homeTab.value == workTabIndex && cameraReadyCheck) _releaseCamera();
   }
 
   /// Track physical device orientation via the accelerometer, so the rotation
@@ -460,6 +481,10 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
 
   bool _authProbeDone = false; // one 401 probe per link lifetime
   bool _authFailed = false; // receiver no longer knows our token
+  /// One port-fallback scan per link lifetime (cleared when the link comes
+  /// back): disconnected events fire on every backoff attempt, and a
+  /// 10-port sweep per event would be both slow and noisy.
+  bool _portScanDone = false;
   /// Announced in every hello (cross-end version hint). Resolved async at
   /// startup — an early hello may go out without it; the next announce carries it.
   String? _appVersion;
@@ -486,11 +511,18 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         _reconnectStreak = 0;
         _authProbeDone = false;
         _authFailed = false;
+        _portScanDone = false; // a fresh link may need a fresh scan again
         UploadQueue.instance.kick(); // network is back — flush queued shots
         // The stream survived the outage as DESIRED state; the new uplink has
         // no meta yet. Re-announce so the PC-side canvas gets size + rotation
         // immediately (resume_preview alone doesn't carry them).
         if (_streaming && cameraReadyCheck) _announceStream();
+        // plain TCP-level reconnects never rebind (no _connectSocket → no
+        // refresh): pull the receiver's live preview config again, so a host
+        // restarted with a changed config doesn't leave us on stale
+        // fps/resolution/quality. Idempotent with the _connectSocket pull.
+        final sNow = _server;
+        if (sNow != null) _refreshPreviewParams(sNow);
       } else if (st == LensLinkState.disconnected) {
         _reconnectStreak++;
         _maybeProbeAuth();
@@ -502,6 +534,7 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     socket.onCameraControl = (type, reqId) => _onHostCameraControl(type, reqId);
     socket.onZoomControl = (factor, step, reqId) => _onHostZoom(factor, step, reqId);
     socket.onLensControl = (lens, reqId) => _onHostLens(lens, reqId);
+    socket.onTorchControl = (on, reqId) => _onHostTorch(on, reqId);
     // cancel the PREVIOUS socket's subscription before taking the new one:
     // an overwritten-but-live subscription leaks when the old close() stalls
     _cmdSub?.cancel();
@@ -514,6 +547,14 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _fpsTimer?.cancel();
     _fpsTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
+      // IndexedStack keeps this screen alive on every tab: while the
+      // viewfinder is NOT the visible tab, skip the per-second whole-screen
+      // rebuild and the logcat line entirely (invisible work = jank on the
+      // settings/work pages + logcat flood).
+      if (homeTab.value != 0) {
+        _fpsWindowFrames = 0; // drop the accumulation: the first visible tick shows a real rate
+        return;
+      }
       setState(() {
         _currentFps = _fpsWindowFrames;
         _fpsWindowFrames = 0;
@@ -544,8 +585,34 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         setState(() => _authFailed = true);
       }
     } catch (_) {
-      // network-level failure: keep the generic "not connected" state
+      // network-level failure: keep the generic "not connected" state — but
+      // if the receiver's host fell back to another port (EADDRINUSE on the
+      // host side), the stored port NEVER heals on its own. Scan the fallback
+      // range once for an AUTHED hit and rebind onto it.
+      await _rescanPortFallback(s);
     }
+  }
+
+  /// Port-fallback rescan (the App half of the host's 8791~8800 EADDRINUSE
+  /// fallback): probe the candidate ports with AUTHED /status calls, and on
+  /// a hit rebind EVERYTHING onto the new port — store record, camera socket,
+  /// work link, upload queue — then tell the user what happened.
+  Future<void> _rescanPortFallback(PairedServer s) async {
+    if (_portScanDone) return;
+    _portScanDone = true;
+    final hit = await _api.rescanPort(s);
+    if (!mounted || hit == null) return;
+    await widget.store.updateServerPort(s.id, hit.port);
+    // same rebind sequence as the auto-select path above
+    _socket?.close();
+    _socket = null;
+    _connectSocket();
+    // the work link follows the store: attach() diffs host+port+deviceId+token
+    // and rebuilds onto the new port (detaching also kills the old socket's
+    // backoff loop on the dead port)
+    WorkStore.instance.attach(widget.store);
+    UploadQueue.instance.kick(); // uploads re-read store.server per attempt
+    _toast('电脑端端口已切换为 ${hit.port},已自动重连');
   }
 
   /// Auto-select an available paired receiver when autoSelect is on and the
@@ -568,6 +635,9 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
           _socket = null;
           _connectSocket(); // rebind to the new receiver
           if (mounted) setState(() {});
+          // 「工作(Beta)」长连接跟着换靶——这里的 setState 只重建取景页，
+          // WorkScreen 的 didUpdateWidget 看不到；attach 幂等，配置变了才重建
+          WorkStore.instance.attach(widget.store);
           _toast('已切换到可用连接: ${s.name}');
           return;
         }
@@ -612,6 +682,12 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   bool _pendingHostIdle = false;
 
   void _onRemoteShutter(CaptureCommand cmd) {
+    // Busy FIRST: a declined capture must not buzz/toast the user — the
+    // reminder below is for a shot that will actually happen.
+    if (_sending) {
+      _socket?.reportCapture(cmd.captureId, 'declined', 'busy');
+      return;
+    }
     // The phone must speak up whenever someone else drives its camera — the
     // user-fired web-UI shutter and the model's phone_take_photo alike ride
     // this same command. Opt-out lives in Settings (拍照提醒).
@@ -620,10 +696,11 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       _toast(note == null || note.isEmpty ? '电脑端请求拍照并上传' : '电脑端请求拍照并上传: $note');
       unawaited(_alertBuzz());
     }
-    if (_sending) {
-      _socket?.reportCapture(cmd.captureId, 'declined', 'busy');
-      return;
-    }
+    // A remote shutter takes the NORMAL queue path (_shoot keeps remote
+    // captures out of the work handoff by design), so an armed work-capture
+    // is silently bypassed here — clear it or the banner stays up and
+    // hijacks the NEXT local shutter into a work draft.
+    pendingWorkCapture.value = null;
     // A remote shutter is still a user action: it must wake the camera from
     // ANY down state — the idle auto-off, or released-under-a-covering-route
     // while the user sits on another tab — exactly like the on-screen shutter.
@@ -760,6 +837,41 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
       // controller released mid-await, camera busy, or the set genuinely
       // failed — report and keep the last known-good ratio
       _socket?.reportZoom(reqId, ok: false, reason: '变焦执行失败(相机忙或已释放)');
+    }
+  }
+
+  /// Host-initiated torch on/off/query (the model tool phone_camera_torch;
+  /// no arg = pure query). Shares the SAME `_flash` state the user's flash
+  /// button cycles, so the UI badge and the next user tap start from the
+  /// model's value. Like zoom, a torch command NEVER revives a parked camera
+  /// on its own — the light is only reachable through a live controller, and
+  /// an invisible model action must not have that visible side effect.
+  /// Caveat carried in the tool description: on devices without torch
+  /// hardware (most front lenses) the platform may swallow the failure and
+  /// the receipt still reads ok — the honest limit of the camera plugin.
+  Future<void> _onHostTorch(bool? on, String? reqId) async {
+    final c = _camera;
+    if (c == null || !cameraReadyCheck) {
+      _socket?.reportTorch(reqId, ok: false, reason: '相机未开启');
+      return;
+    }
+    if (on == null) {
+      // pure query: the receipt mirrors what the flash button would show
+      _socket?.reportTorch(reqId, ok: true, on: _flash == FlashMode.torch);
+      return;
+    }
+    try {
+      // NOT via _applyFlash: that helper swallows all exceptions (its job is
+      // best-effort re-apply on revive); the tool receipt needs the real
+      // throw, and the badge must only update after a confirmed set
+      await c.setFlashMode(on ? FlashMode.torch : FlashMode.off);
+      setState(() => _flash = on ? FlashMode.torch : FlashMode.off);
+      _touchCamera(); // toggling the light is camera activity
+      _socket?.reportTorch(reqId, ok: true, on: on);
+    } catch (_) {
+      // controller released mid-await or the set genuinely failed — the
+      // badge keeps the last known-good mode and the host hears the failure
+      _socket?.reportTorch(reqId, ok: false, reason: '手电筒执行失败(相机忙或已释放)');
     }
   }
 
@@ -1032,6 +1144,22 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
         }
         bytes = cropped;
       }
+      // Work-chat handoff: when the work composer armed a capture, a LOCAL
+      // shutter's JPEG goes to the work conversation instead of the camera
+      // upload queue — the callback adds it as a draft attachment and flips
+      // the user back. Remote shutters (captureId != null, model-initiated)
+      // always take the normal queue path: the model asked for THAT photo.
+      // Runs BEFORE the upload-quality preset: the handoff compresses with
+      // its own budget (_fitWorkImage), and letting the main queue's preset
+      // (e.g. ultra-low 320px) grind it first would double-compress a photo
+      // meant to be readable in the chat.
+      final handoff = captureId == null ? pendingWorkCapture.value : null;
+      if (handoff != null) {
+        pendingWorkCapture.value = null;
+        _toast('已转交工作对话');
+        handoff.call(bytes, _shotName());
+        return;
+      }
       bytes = await _applyUploadQuality(bytes);
       await UploadQueue.instance.enqueue(
         bytes: bytes,
@@ -1095,6 +1223,13 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
   /// Queueing (not sending) keeps the UI responsive and gives every picture
   /// the queue's retry/backoff behaviour for free.
   Future<void> _pickFromGallery() async {
+    // Gallery picks bypass the armed handoff — the work chat only consumes
+    // the SHUTTER's JPEG. An armed callback left alive here keeps the banner
+    // up ("本次拍摄将发送到工作对话") while the photos take the gallery path,
+    // and silently hijacks the NEXT local shutter into a work draft. Clear it
+    // up front: picking up the gallery voids the handshake (also covers the
+    // user cancelling the picker).
+    pendingWorkCapture.value = null;
     final files = await ImagePicker().pickMultiImage(limit: 12);
     if (files.isEmpty || !mounted) return;
     final maxBytes = widget.store.maxUploadBytes;
@@ -1276,7 +1411,8 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
     _encoder.stop();
     _zoom.dispose();
     _camera?.dispose();
-    _api.dispose();
+    // NOTE: _api is the shared long-lived client — closing it here would
+    // kill the upload queue's in-flight requests. Never dispose it.
     super.dispose();
   }
 
@@ -1327,6 +1463,62 @@ class _ViewfinderScreenState extends State<ViewfinderScreen>
                 // area, UNDER the shutter chrome so the user can revive without
                 // hunting for a hidden control.
                 if (_autoClosed) _autoClosedOverlay(),
+                // armed work-capture handoff: make the destination VISIBLE —
+                // the user landed here from the work composer and the next
+                // local shutter diverts to the work chat (cancellable).
+                // ALWAYS mounted: an outer `if (pendingWorkCapture.value != null)`
+                // used to gate the whole subtree, so the null→armed transition
+                // only showed the banner when some other rebuild happened to
+                // run (e.g. _initCamera's setState) — arming from the idle
+                // shutdown state never lit it. The inner VLB's
+                // armed == null → shrink branch owns the visibility.
+                Positioned(
+                    top: 8,
+                    left: 8,
+                    // NOT full-width: this banner sits ABOVE the preview stack
+                    // in z-order, and the preview's top-right column (flash /
+                    // lens / zoom, right:12) lived under a right:8 banner —
+                    // painted over, and taps near it hit the banner's 取消
+                    // button instead. Shrink-wrap to the content instead,
+                    // reserving the button column's corner (~48px) plus a gap.
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width - 64),
+                      child: ValueListenableBuilder<void Function(Uint8List bytes, String name)?>(
+                        valueListenable: pendingWorkCapture,
+                        builder: (context, armed, _) => armed == null
+                            ? const SizedBox.shrink()
+                            : Container(
+                                padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xCC2C4A66),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(Icons.workspaces_outline, size: 16, color: Color(0xFFFFB74D)),
+                                    const SizedBox(width: 8),
+                                    const Flexible(
+                                      child: Text(
+                                        '本次拍摄将发送到工作对话',
+                                        style: TextStyle(color: Colors.white, fontSize: 12),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    TextButton(
+                                      onPressed: () => pendingWorkCapture.value = null,
+                                      style: TextButton.styleFrom(
+                                        minimumSize: const Size(44, 30),
+                                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                                      ),
+                                      child: const Text('取消', style: TextStyle(fontSize: 12, color: Colors.white70)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                      ),
+                    ),
+                  ),
                 // chrome lives here (not inside the camera stack) so the
                 // shutter stays reachable in EVERY state — including the idle
                 // shutdown, where reviving the camera is the whole point.

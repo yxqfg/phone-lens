@@ -1,10 +1,10 @@
 import { join } from "node:path";
+import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs";
 import { Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { normalizeConfig } from "./config.js";
-import { HostDeliverySink, type EventedAgent } from "./inject/host-sink.js";
 import { TargetTracker } from "./inject/target.js";
 import { DeviceStore } from "./store/devices.js";
 import { PairingStore } from "./store/pairing.js";
@@ -12,6 +12,7 @@ import { AppSettingsStore } from "./store/settings.js";
 import { startLensServer, type LensServerHandle } from "./server/http.js";
 import { ViewHub } from "./server/hub.js";
 import { buildPairingQr } from "./server/qr.js";
+import { WorkBridge } from "./work/bridge.js";
 import type { AttachmentStoreLike } from "./inject/admit.js";
 import { lensDataDir } from "./paths.js";
 
@@ -33,7 +34,12 @@ export default class PhoneLens extends Service {
   // asar ships it); a host without it has no model to serve anyway. The
   // trade-off: on such a host this whole plugin (receiver included) stays
   // dormant rather than running half-broken.
-  static inject: string[] = ["tools"];
+  // 'typertGateway' (dsh-api-remotes) powers the phone-side approval/question
+  // answerer's desktop-card teardown: after the phone answers first we settle
+  // the remote bridge's pending waterfall so the gateway cancels the desktop
+  // card. api-remotes is on the plugin manager's PROTECTED list (same tier as
+  // dsh-tools) — every dsh host ships it, same trade-off as 'tools'.
+  static inject: string[] = ["tools", "typertGateway"];
   static Config = z.any();
 
   constructor(ctx: any, rawConfig: unknown) {
@@ -43,6 +49,17 @@ export default class PhoneLens extends Service {
     const log = (level: LogLevel, msg: string) => {
       const target = (ctx.logger as Record<LogLevel, (m: string) => void> | undefined) ?? console;
       target[level]?.(`[phone-lens] ${msg}`);
+      // the desktop logger swallows plugin output; keep a tiny boot trace on
+      // disk so a receiver that never starts is diagnosable at all. The file
+      // is append-only and previously grew without bound — cap it at ~1MB,
+      // rotating to .1 (one generation of history is plenty for diagnosis).
+      try {
+        const file = join(dataDir, "boot.log");
+        try {
+          if (statSync(file).size > 1_000_000) renameSync(file, `${file}.1`);
+        } catch {}
+        appendFileSync(file, `${new Date().toISOString()} [${level}] ${msg}\n`, "utf8");
+      } catch {}
     };
 
     const pairing = new PairingStore(config.pairing.codeTtlMs);
@@ -51,79 +68,17 @@ export default class PhoneLens extends Service {
     const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
     const hub = new ViewHub(config, (level, msg) => log(level, msg));
     const targets = new TargetTracker(config);
-    // Phase 2: real delivery into a live dsh session; the LoggingSink remains
-    // the standalone/dev fallback. Agent events keep the sink's active target.
-    const sink = new HostDeliverySink(config, (level, msg) => log(level, msg));
-    const attachments = (): AttachmentStoreLike | undefined => ctx.get?.("attachments") as AttachmentStoreLike | undefined;
-
-    // agent wiring (scope-filtered events fire on the root ctx for global
-    // listeners): the sink tracks the last-active session for delivery.
-    // Dispatched by dsh-agent-loop (dsh-agent only owns created/disposed):
-    // inbox/inserted rides every inbox insert, agent/status rides every phase
-    // flip — both fused with the agent field, matching the payload reads below.
-    const onAgent = (agent: EventedAgent) => sink.track(agent);
-    const offAgent = (agent: EventedAgent) => sink.untrack(agent);
-    ctx.on?.("agent/created", (payload: { agent: EventedAgent }) => onAgent(payload.agent));
-    ctx.on?.("agent/inbox/inserted", (payload: { agent: EventedAgent }) => onAgent(payload.agent));
-    ctx.on?.("agent/status", (payload: { agent: EventedAgent; status: string }) => {
-      if (payload.status === "running") onAgent(payload.agent);
-    });
-    ctx.on?.("agent/disposed", (payload: { agent: EventedAgent }) => offAgent(payload.agent));
-
-    // Hot-reload backfill: agent/created is announced exactly once at agent
-    // creation (no replay) and cordis events carry no retain, so agents that
-    // already exist when this plugin (re)loads never reach the wiring above.
-    // CRITICAL: reading `ctx.agents` during the constructor THROWS on the real
-    // host while the agents service is not yet mounted (cordis service
-    // accessors throw on inactive services; a plain-object smoke ctx returns
-    // undefined instead — this exact gap took the receiver down once). Access
-    // it lazily: ctx.inject fires when the service mounts (verified working on
-    // cordis 4.0.5 by dsh-acp), with a guarded direct read as the fallback.
-    let backfilled = false;
-    const runBackfill = (registry?: { list?: () => (EventedAgent[] | undefined) }) => {
-      if (backfilled) return;
-      if (!registry) {
-        try {
-          registry = (ctx as { agents?: { list?: () => (EventedAgent[] | undefined) } }).agents;
-        } catch {
-          // the real host THROWS on undeclared service access ("cannot get
-          // property ... without inject") — the inject callback below is the
-          // authorized path, this direct read is only the last-resort probe
-          return;
-        }
-      }
-      if (!registry || typeof registry.list !== "function") return;
-      const live = registry.list() ?? [];
-      let running = 0;
-      for (const agent of live) {
-        if (agent?.status === "running") {
-          running++;
-          onAgent(agent);
-        } else {
-          sink.trackIdle(agent);
-        }
-      }
-      backfilled = true;
-      if (live.length > 0) log("info", `backfilled ${live.length} live agent(s) (${running} running) from ctx.agents`);
-    };
-    // authorized access path: inject(deps, callback) starts a fiber whose body
-    // runs once all deps are mounted; the callback receives `(ctx, config)` —
-    // the service is read off THAT ctx (declared deps grant property access),
-    // not off the outer host ctx. Reading ctx.agents during the constructor
-    // throws until the service mounts, so this is the ONLY safe entry.
-    ctx.inject?.(["agents"], (injectCtx: { agents?: { list?: () => (EventedAgent[] | undefined) } }) => {
+    // 「工作(Beta)」bridge: inert until the settings switch is flipped — the
+    // constructor subscribes to nothing and /ws/work refuses upgrades while
+    // the beta is off, so camera-receiver paths stay untouched by default.
+    const workBridge = new WorkBridge(ctx, appSettings, log, () => {
       try {
-        runBackfill(injectCtx.agents);
+        return String(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version ?? "0.0.0");
       } catch {
-        // never let the backfill take the receiver down
+        return "0.0.0";
       }
     });
-    // fallback for hosts where imperative inject never fires (cordis 4.0.2
-    // defect; 4.0.5 verified working): also poke once on the next tick, when
-    // the service may have mounted after our constructor ran.
-    setTimeout(() => {
-      if (!backfilled) runBackfill();
-    }, 0).unref?.();
+    const attachments = (): AttachmentStoreLike | undefined => ctx.get?.("attachments") as AttachmentStoreLike | undefined;
 
     // ── model-facing camera tools (dsh-tools) ─────────────────────────────
     // The WHOLE wiring sits inside a try/catch and must NEVER throw out: an
@@ -132,7 +87,7 @@ export default class PhoneLens extends Service {
     // INACTIVE_EFFECT and took the receiver down with it. The receiver is
     // mandatory; the tools are optional.
     try {
-      const PHONE_TOOLS = new Set(["phone_take_photo", "phone_camera_pause", "phone_camera_resume", "phone_camera_zoom", "phone_camera_lens"]);
+      const PHONE_TOOLS = new Set(["phone_take_photo", "phone_camera_pause", "phone_camera_resume", "phone_camera_zoom", "phone_camera_lens", "phone_camera_torch"]);
     // Direct ctx.tools access, same as dsh-better-sidebar's registerOpenTool:
     // on the real host the tools service is already mounted by the time
     // plugins load, so a plain property read works. (ctx.inject(['tools'], …)
@@ -201,6 +156,10 @@ export default class PhoneLens extends Service {
         const v = (args as Record<string, unknown> | null)?.[key];
         return typeof v === "number" && Number.isFinite(v) ? v : undefined;
       };
+      const boolArg = (args: unknown, key: string): boolean | undefined => {
+        const v = (args as Record<string, unknown> | null)?.[key];
+        return typeof v === "boolean" ? v : undefined;
+      };
       disposers.push(
         toolsSvc.register(
           defineTool({
@@ -227,7 +186,7 @@ export default class PhoneLens extends Service {
                   done = true;
                   resolve(v as Awaited<typeof capture>);
                 };
-                void capture.then((r) => settle(r));
+                void capture.then((r) => settle(r)).catch((e) => settle({ ok: false, reason: String(e) }));
                 const sig = exec?.signal as { aborted?: boolean; addEventListener?: (t: string, l: () => void, o?: unknown) => void } | undefined;
                 if (sig?.aborted) {
                   settle({ ok: false, reason: "调用已被取消" });
@@ -352,6 +311,31 @@ export default class PhoneLens extends Service {
           }) as never,
         ),
       );
+      disposers.push(
+        toolsSvc.register(
+          defineTool({
+            name: "phone_camera_torch",
+            description:
+              "打开、关闭或查询用户配对手机的手电筒(闪光灯常亮)。" +
+              "三种用法:on=true 打开常亮照明、on=false 关闭、或不带参数查询当前开关状态。" +
+              "适用于光线不足的拍摄环境:先打开手电筒补光,再调用拍照,拍完关闭。" +
+              "注意:需要相机处于开启状态(相机未开启时返回失败,可先调用 phone_camera_resume 唤醒);" +
+              "前置镜头通常没有闪光灯硬件,部分设备会静默不亮;" +
+              "手机空闲自动关闭相机时手电筒会一同熄灭,长时间照明需保持相机活跃。" +
+              "手机 App 版本过旧(需 ≥ 1.1.6)时返回失败原因。",
+            parameters: {
+              on: { type: "boolean", description: "true 打开常亮照明 / false 关闭;不传即查询当前状态" },
+            },
+            output: textOutput,
+            async execute(args: unknown) {
+              const on = boolArg(args, "on");
+              const r = await hub.requestTorch({ on }, 8_000);
+              if (!r.ok) return `手电筒操作失败: ${r.reason}`;
+              return on === undefined ? `手电筒当前${r.on ? "已开启" : "已关闭"}。` : `手电筒已${r.on ? "开启" : "关闭"}。`;
+            },
+          }) as never,
+        ),
+      );
       // "2x" for whole numbers, "1.5x" otherwise — human-readable ratios
       const fmtX = (v: number): string => (Number.isInteger(v) ? `${v}x` : `${v.toFixed(2).replace(/\.?0+$/, "")}x`);
       ctx.effect?.(() => () => {
@@ -363,7 +347,7 @@ export default class PhoneLens extends Service {
           }
         }
       }, "phone-lens.modelTools()");
-      log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_lens)");
+      log("info", "model camera tools registered (phone_take_photo / phone_camera_pause / phone_camera_resume / phone_camera_zoom / phone_camera_lens / phone_camera_torch)");
     } else {
       log("info", "no tools service on this ctx — model camera tools skipped (standalone/dev)");
     }
@@ -384,11 +368,11 @@ export default class PhoneLens extends Service {
       devices,
       hub,
       targets,
-      sink,
       attachments,
       fallbackDir: join(dataDir, "uploads"),
       pendingDir: join(dataDir, "pending"),
       appSettings,
+      workBridge,
       log,
     })
       .then(async (h) => {
@@ -397,6 +381,10 @@ export default class PhoneLens extends Service {
           return;
         }
         handle = h;
+        // boot-time safety net: if settings.json already has the beta on
+        // (persisted from a previous run), wire the taps now — otherwise the
+        // bridge stays fully inert until /app-settings flips it
+        if (appSettings.get().workBetaEnabled) workBridge.setEnabled(true);
         const { code, expiresAt } = pairing.current();
         const qr = await buildPairingQr(code, expiresAt, config);
         // ASCII QR goes to the real stdout; prefixing it through the logger
@@ -404,7 +392,9 @@ export default class PhoneLens extends Service {
         process.stdout.write(`\n[phone-lens] 手机扫码配对(或浏览器打开 http://127.0.0.1:${h.port}/view.html):\n${qr.ascii}\n[phone-lens] 备用地址: ${qr.urls.join("  ")}\n\n`);
       })
       .catch((error: unknown) => {
-        log("error", `receiver failed to start: ${String(error)} (check port ${config.server.port})`);
+        // the thrown message already names the full busy range when every
+        // candidate port (8791~8800) was taken — no stale single-port hint
+        log("error", `receiver failed to start: ${String(error)}`);
         // the hub's 1s stall watchdog was armed in its constructor — without
         // this it (and the http heartbeat) would keep ticking on a dead
         // receiver and pile up across plugin reloads

@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -85,13 +85,11 @@ class PreviewParams {
 class UploadReceipt {
   final bool ok;
   final String? attachmentId;
-  final String? deliveredSessionId;
   final String? reason;
   final String errorCode;
   UploadReceipt({
     required this.ok,
     this.attachmentId,
-    this.deliveredSessionId,
     this.reason,
     this.errorCode = '',
   });
@@ -192,11 +190,11 @@ class LensApi {
       final err = body['error'] as Map<String, dynamic>?;
       return UploadReceipt(ok: false, reason: err?['message'] as String?, errorCode: err?['code'] as String? ?? 'UPLOAD_FAILED');
     }
-    final delivered = body['delivered'] as Map<String, dynamic>?;
     return UploadReceipt(
       ok: true,
       attachmentId: body['attachmentId'] as String?,
-      deliveredSessionId: delivered?['sessionId'] as String?,
+      // disposition label the history screen renders (saved-to-folder /
+      // staged-in-composer / …) — legacy name kept for wire compatibility
       reason: body['deliverReason'] as String?,
       errorCode: '',
     );
@@ -228,6 +226,33 @@ class LensApi {
     }
   }
 
+  /// Ports the receiver's host may have fallen back to (EADDRINUSE on 8791).
+  static const fallbackPorts = [8791, 8792, 8793, 8794, 8795, 8796, 8797, 8798, 8799, 8800];
+
+  /// Port-fallback rescan: probe candidate ports on [s.host] with AUTHED
+  /// /status calls — a bare /info cannot distinguish OUR receiver from
+  /// another phone-lens instance that happens to own the port; only "does
+  /// this instance accept our token" can. Returns a copy of [s] bound to
+  /// the answering port, or null when none did. The stored port is skipped:
+  /// it is already known unreachable (that is what triggered the scan).
+  Future<PairedServer?> rescanPort(PairedServer s) async {
+    for (final p in fallbackPorts) {
+      if (p == s.port) continue;
+      final probe = PairedServer(
+        id: s.id,
+        name: s.name,
+        host: s.host,
+        port: p,
+        deviceId: s.deviceId,
+        deviceName: s.deviceName,
+        deviceModel: s.deviceModel,
+        token: s.token,
+      );
+      if (await reachable(probe)) return probe;
+    }
+    return null;
+  }
+
   void dispose() => _http.close();
 }
 
@@ -239,6 +264,12 @@ class LensApiError implements Exception {
   String toString() => '[$code] $message';
 }
 
+/// Shared long-lived API client for the app's permanent consumers
+/// (viewfinder + upload queue), which used to each hold a private
+/// http.Client that was never disposed. Short-lived screens (pair, settings
+/// subpages) still build their own. NEVER dispose this instance.
+final LensApi sharedLensApi = LensApi();
+
 /// Device-local persistence: multiple paired receivers (one active),
 /// chosen target session, send history.
 class LensStore {
@@ -246,7 +277,6 @@ class LensStore {
   static const _kActive = 'lens.activeServer';
   static const _kLegacyServer = 'lens.server';
   static const _kHistory = 'lens.history';
-  static const _kPreview = 'lens.preview';
   static const _kPreviewParams = 'lens.previewParams';
   static const _kHistoryMode = 'lens.historyMode';
   static const _kCropRatio = 'lens.cropRatio';
@@ -259,6 +289,10 @@ class LensStore {
   static const _kDeviceName = 'lens.deviceName';
   static const _kLimits = 'lens.limits';
   static const _kUploadQuality = 'lens.uploadQuality';
+  // 「工作(Beta)」master switch: the whole work tab (session mirror + remote
+  // control) stays OUT of the app (no tab, no socket, nothing) until the user
+  // opts in here. Default off — beta code must never lean on main features.
+  static const _kWorkBeta = 'lens.workBeta';
 
   // Upload quality presets (Settings → 拍摄与上传 → 上传画质), best→worst:
   // high = original camera bytes; the rest re-encode to a bounded width.
@@ -317,12 +351,6 @@ class LensStore {
 
   Future<void> setPreviewQuality(String v) => _prefs.setString(_kPreviewQuality, v);
 
-  /// Last automatic update-check epoch ms (24h throttle for the startup check;
-  /// manual checks from Settings bypass it).
-  static const _kLastUpdateCheck = 'lens.lastUpdateCheckAt';
-  int get lastUpdateCheckAt => _prefs.getInt(_kLastUpdateCheck) ?? 0;
-  Future<void> setLastUpdateCheckAt(int v) => _prefs.setInt(_kLastUpdateCheck, v);
-
   /// Stable device identity: REUSED across pairings so re-pairing the same
   /// PC refreshes the token on the SAME host-side device record instead of
   /// accumulating a new one per scan.
@@ -376,6 +404,17 @@ class LensStore {
   /// unreachable. Off by default; the user opts in from Settings.
   bool get autoSelect => _prefs.getBool(_kAutoSelect) ?? false;
   Future<void> setAutoSelect(bool v) => _prefs.setBool(_kAutoSelect, v);
+
+  /// 「工作(Beta)」opt-in. The work tab mounts live when this flips on (no app
+  /// restart needed — HomeScreen rebuilds on the settings onChanged callback)
+  /// and unmounts with it, tearing the work socket down with the tab.
+  bool get workBetaEnabled => _prefs.getBool(_kWorkBeta) ?? false;
+  Future<void> setWorkBetaEnabled(bool v) => _prefs.setBool(_kWorkBeta, v);
+
+  static const _kWorkFontSizeScale = 'lens.workFontSizeScale';
+  /// 工作标签页专属文字大小缩放比例: 0.85(小) / 1.0(标准/默认) / 1.15(大) / 1.3(超大)
+  double get workFontSizeScale => (_prefs.getDouble(_kWorkFontSizeScale) ?? 1.0).clamp(0.7, 1.6);
+  Future<void> setWorkFontSizeScale(double v) => _prefs.setDouble(_kWorkFontSizeScale, v);
 
   /// Default crop frame = a box of this fraction of the image, centered
   /// (0.5 → the middle half). Configurable from Settings.
@@ -464,9 +503,6 @@ class LensStore {
   final SharedPreferences _prefs;
   LensStore(this._prefs) {
     _migrateLegacy();
-    // the chroma-swap toggle was removed with the color-correction feature;
-    // clear the stale key so prefs don't carry dead state forever
-    _prefs.remove('lens.chromaSwap');
   }
 
   // ── paired receivers ────────────────────────────────────────────────────
@@ -518,6 +554,23 @@ class LensStore {
     await _prefs.setString(_kServers, jsonEncode(all.map((e) => e.toJson()).toList()));
   }
 
+  /// Update the stored port of a paired receiver (port-fallback rescan hit).
+  /// Same in-place rewrite as [renameServer] — do NOT route through
+  /// [addServer]: its dedup key includes host+port, so re-adding would
+  /// strand the old dead-port record. When the display name is still the
+  /// pairing default ("host:port"), refresh it so the settings list shows
+  /// the live port.
+  Future<void> updateServerPort(String id, int port) async {
+    final all = servers();
+    for (final s in all) {
+      if (s.id != id) continue;
+      final defaultedName = s.name == '${s.host}:${s.port}';
+      s.port = port;
+      if (defaultedName) s.name = '${s.host}:$port';
+    }
+    await _prefs.setString(_kServers, jsonEncode(all.map((e) => e.toJson()).toList()));
+  }
+
   Future<void> setActive(String id) => _prefs.setString(_kActive, id);
 
   /// Legacy single-server key → list + active pointer.
@@ -530,14 +583,7 @@ class LensStore {
     _prefs.remove(_kLegacyServer);
   }
 
-  // ── preview overrides / history ─────────────────────────────────────────
-
-  Map<String, dynamic>? get previewOverrides => decode(_prefs.getString(_kPreview));
-  Future<void> setPreviewOverride(String key, int value) async {
-    final map = decode(_prefs.getString(_kPreview)) ?? <String, dynamic>{};
-    map[key] = value;
-    await _prefs.setString(_kPreview, jsonEncode(map));
-  }
+  // ── history ─────────────────────────────────────────────────────────────
 
   // Preview parameters last advertised by the active receiver (serverInfo).
   // Fallbacks mirror the host's own defaults (config.ts) so a missing field
@@ -654,6 +700,101 @@ class LensStore {
     File(p).delete().ignore();
   }
 
+  // ── work downloads ────────────────────────────────────────────────────────
+  static const _kWorkDownloads = 'lens.workDownloads';
+  // decoded-list cache keyed by globalWorkDownloadsVersion: the file sheet
+  // used to call isWorkFileDownloaded/getDownloadedLocalPath per ROW on every
+  // build, each re-decoding the whole persisted JSON (O(n²) with 100 files)
+  List<WorkDownloadItem>? _workDownloadsCache;
+  int _workDownloadsCacheVersion = -1;
+
+  List<WorkDownloadItem> workDownloads() {
+    final cached = _workDownloadsCache;
+    if (cached != null && _workDownloadsCacheVersion == globalWorkDownloadsVersion.value) {
+      return cached;
+    }
+    final raw = _prefs.getString(_kWorkDownloads);
+    if (raw == null || raw.isEmpty) {
+      _workDownloadsCache = [];
+    } else {
+      try {
+        final list = jsonDecode(raw) as List;
+        final decoded = list
+            .map((e) => WorkDownloadItem.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList();
+        final alive = decoded
+            .where((e) => e.id.isNotEmpty && File(e.localPath).existsSync())
+            .toList();
+        _workDownloadsCache = alive;
+        if (alive.length < decoded.length) {
+          // dead records (files deleted outside the app) used to be filtered
+          // out of the cache on every read while the persisted JSON grew
+          // forever — write the survivors back once, right here
+          _prefs.setString(_kWorkDownloads, jsonEncode(alive.map((e) => e.toJson()).toList())).ignore();
+        }
+      } catch (_) {
+        _workDownloadsCache = [];
+      }
+    }
+    _workDownloadsCacheVersion = globalWorkDownloadsVersion.value;
+    return _workDownloadsCache!;
+  }
+
+  Future<void> addWorkDownload(WorkDownloadItem item) async {
+    final list = workDownloads()..removeWhere((x) => x.id == item.id || (x.workspace == item.workspace && x.remotePath == item.remotePath));
+    list.insert(0, item);
+    await _prefs.setString(_kWorkDownloads, jsonEncode(list.map((e) => e.toJson()).toList()));
+    globalWorkDownloadsVersion.value++;
+  }
+
+  Future<void> removeWorkDownload(String id) async {
+    final list = workDownloads();
+    final item = list.firstWhereOrNull((x) => x.id == id);
+    if (item != null) {
+      try {
+        final f = File(item.localPath);
+        if (f.existsSync()) f.deleteSync();
+      } catch (_) {}
+    }
+    list.removeWhere((x) => x.id == id);
+    await _prefs.setString(_kWorkDownloads, jsonEncode(list.map((e) => e.toJson()).toList()));
+    globalWorkDownloadsVersion.value++;
+  }
+
+  Future<void> clearWorkDownloads() async {
+    final list = workDownloads();
+    for (final item in list) {
+      try {
+        final f = File(item.localPath);
+        if (f.existsSync()) f.deleteSync();
+      } catch (_) {}
+    }
+    await _prefs.remove(_kWorkDownloads);
+    globalWorkDownloadsVersion.value++;
+  }
+
+  bool isWorkFileDownloaded(String workspace, String remotePath) {
+    final list = workDownloads();
+    final it = list.firstWhereOrNull((x) => x.workspace == workspace && x.remotePath == remotePath);
+    if (it == null) return false;
+    if (!File(it.localPath).existsSync()) {
+      removeWorkDownload(it.id).ignore();
+      return false;
+    }
+    return true;
+  }
+
+  String? getDownloadedLocalPath(String workspace, String remotePath) {
+    final list = workDownloads();
+    final it = list.firstWhereOrNull((x) => x.workspace == workspace && x.remotePath == remotePath);
+    if (it == null) return null;
+    if (!File(it.localPath).existsSync()) {
+      removeWorkDownload(it.id).ignore();
+      return null;
+    }
+    return it.localPath;
+  }
+
   static Map<String, dynamic>? decode(String? s) {
     if (s == null || s.isEmpty) return null;
     try {
@@ -662,6 +803,48 @@ class LensStore {
       return null;
     }
   }
+}
+
+final ValueNotifier<int> globalWorkDownloadsVersion = ValueNotifier(0);
+
+class WorkDownloadItem {
+  final String id;
+  final String workspace;
+  final String remotePath;
+  final String localPath;
+  final String fileName;
+  final int size;
+  final int downloadedAt;
+
+  WorkDownloadItem({
+    required this.id,
+    required this.workspace,
+    required this.remotePath,
+    required this.localPath,
+    required this.fileName,
+    required this.size,
+    required this.downloadedAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'workspace': workspace,
+        'remotePath': remotePath,
+        'localPath': localPath,
+        'fileName': fileName,
+        'size': size,
+        'downloadedAt': downloadedAt,
+      };
+
+  factory WorkDownloadItem.fromJson(Map<String, dynamic> json) => WorkDownloadItem(
+        id: json['id'] as String? ?? '',
+        workspace: json['workspace'] as String? ?? '默认工作区',
+        remotePath: json['remotePath'] as String? ?? '',
+        localPath: json['localPath'] as String? ?? '',
+        fileName: json['fileName'] as String? ?? '',
+        size: (json['size'] as num?)?.toInt() ?? 0,
+        downloadedAt: (json['downloadedAt'] as num?)?.toInt() ?? 0,
+      );
 }
 
 extension _FirstWhereOrNull<T> on Iterable<T> {

@@ -15,7 +15,6 @@
           allowedTypes:
             - 'image/jpeg'
             - 'image/png'
-          uploadsPerMinute: 10
           previewFrameMaxBytes: 524288
         pairing:
           codeTtlMs: 900000
@@ -24,9 +23,6 @@
           maxHeight: 480
           fps: 10
           jpegQuality: 70
-        inject:
-          mode: 'followup'
-          notePrefix: '[手机拍照]'
         target:
           mode: 'latest'
           pinnedSessionId: null

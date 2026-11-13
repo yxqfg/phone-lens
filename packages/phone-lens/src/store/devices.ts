@@ -11,7 +11,6 @@ import { tokenHashMatches } from "./pairing.js";
 export class DeviceStore {
   private devices = new Map<string, DeviceRecord>();
   private readonly file: string;
-  private dirty = false;
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
@@ -34,9 +33,14 @@ export class DeviceStore {
   }
 
   private persist() {
-    const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ version: 1, devices: [...this.devices.values()] }, null, 2), "utf8");
-    renameSync(tmp, this.file);
+    try {
+      const tmp = `${this.file}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ version: 1, devices: [...this.devices.values()] }, null, 2), "utf8");
+      renameSync(tmp, this.file);
+    } catch {
+      // persistence is best-effort (disk full / permission): the in-memory
+      // registry keeps serving auth, same posture as AppSettingsStore
+    }
   }
 
   /** Register/re-register a device, uniquifying the name against others. */
@@ -49,7 +53,6 @@ export class DeviceStore {
       lastSeenAt: Date.now(),
     };
     this.devices.set(record.deviceId, full);
-    this.dirty = true;
     this.persist();
     return full;
   }
@@ -70,7 +73,6 @@ export class DeviceStore {
     const record = this.devices.get(deviceId);
     if (!record) return null;
     record.name = name.trim() || record.name;
-    this.dirty = true;
     this.persist();
     return record;
   }
@@ -80,8 +82,16 @@ export class DeviceStore {
     const record = this.devices.get(deviceId);
     if (!record) return null;
     if (!tokenHashMatches(record.tokenHash, token)) return null;
-    record.lastSeenAt = Date.now();
-    this.dirty = true;
+    // authenticate runs on every WS upgrade AND every authenticated HTTP
+    // request (each /upload, /status, /app-settings call passes here) — the
+    // 60s floor keeps lastSeenAt honest on disk without rewriting the file
+    // on every single request
+    if (Date.now() - record.lastSeenAt > 60_000) {
+      record.lastSeenAt = Date.now();
+      this.persist();
+    } else {
+      record.lastSeenAt = Date.now();
+    }
     return record;
   }
 

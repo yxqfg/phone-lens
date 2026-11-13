@@ -26,6 +26,13 @@ export interface AppSettings {
    * is an explicit opt-IN.
    */
   modelToolsConfirmFree: boolean;
+  /**
+   * 「工作(Beta)」master switch. **Defaults to false**: the whole work domain
+   * (session mirror bridge + /ws/work endpoint + host-side event taps) stays
+   * inert until explicitly enabled in the web UI settings — testing code must
+   * never lean on the camera receiver's main paths.
+   */
+  workBetaEnabled: boolean;
 }
 
 /**
@@ -42,7 +49,7 @@ export class AppSettingsStore {
     /** Built-in default folder when saveDir is empty. */
     private readonly defaultSaveDir: string,
   ) {
-    this.data = { saveMode: "composer", saveDir: "", modelToolsEnabled: true, modelToolsConfirmFree: false };
+    this.data = { saveMode: "composer", saveDir: "", modelToolsEnabled: true, modelToolsConfirmFree: false, workBetaEnabled: false };
     this.load();
   }
 
@@ -54,6 +61,7 @@ export class AppSettingsStore {
       if (typeof raw.saveDir === "string") this.data.saveDir = raw.saveDir;
       if (typeof raw.modelToolsEnabled === "boolean") this.data.modelToolsEnabled = raw.modelToolsEnabled;
       if (typeof raw.modelToolsConfirmFree === "boolean") this.data.modelToolsConfirmFree = raw.modelToolsConfirmFree;
+      if (typeof raw.workBetaEnabled === "boolean") this.data.workBetaEnabled = raw.workBetaEnabled;
     } catch {
       // corrupt settings file: start with defaults rather than refuse to boot
     }
@@ -76,6 +84,7 @@ export class AppSettingsStore {
     }
     if (typeof patch.modelToolsEnabled === "boolean") this.data.modelToolsEnabled = patch.modelToolsEnabled;
     if (typeof patch.modelToolsConfirmFree === "boolean") this.data.modelToolsConfirmFree = patch.modelToolsConfirmFree;
+    if (typeof patch.workBetaEnabled === "boolean") this.data.workBetaEnabled = patch.workBetaEnabled;
     this.persist();
     return this.get();
   }

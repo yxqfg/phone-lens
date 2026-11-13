@@ -1,7 +1,7 @@
 {
   "name": "phone-lens",
   "description": "Turn your phone into a full-featured camera for dsh sessions (requires the companion app; open source — install the plugin and scan the QR code it shows to get the app): 1. Live viewfinder over LAN or USB, injectable into the chat or savable to a folder. 2. Callable tools let the dsh model take photos, zoom, and switch lenses on demand mid-conversation, so in fully automated workflows the model can actively \"see\" the physical world. 3. Full zoom/flash, crop, and annotation. 4. Rich settings.",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -31,6 +31,7 @@
   },
   "files": [
     "lib",
+    "!lib/*.map",
     "cordis.patch.yml",
     "CHANGELOG.md"
   ],

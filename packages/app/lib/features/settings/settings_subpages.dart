@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -5,6 +7,7 @@ import '../../core/api.dart';
 import '../../core/camera_socket.dart';
 import '../../core/global_link.dart';
 import '../pair/pair_screen.dart';
+import '../work/work_store.dart';
 import 'settings_screen.dart' show SectionHeader;
 
 /// The settings screen collapsed into a few entry points; each page here
@@ -91,6 +94,9 @@ class _ConnectionSettingsPageState extends State<ConnectionSettingsPage> {
     if (!mounted || action == null) return;
     if (action == 'activate') {
       await widget.store.setActive(s.id);
+      // 活动接收端换了：「工作(Beta)」长连接同步重绑（pop 不触发 main
+      // rebuild，WorkScreen.didUpdateWidget 看不到这次切换；attach 幂等）
+      WorkStore.instance.attach(widget.store);
     } else if (action == 'rename') {
       if (!mounted) return;
       final ctrl = TextEditingController(text: s.name);
@@ -582,3 +588,171 @@ String historyModeLabel(String mode) => switch (mode) {
   LensStore.historyNoTrace => '不留任何痕迹',
   _ => mode,
 };
+
+/// 工作 (Beta) 设置子页面
+class WorkBetaSettingsPage extends StatefulWidget {
+  final LensStore store;
+  final VoidCallback onChanged;
+  const WorkBetaSettingsPage({super.key, required this.store, required this.onChanged});
+
+  @override
+  State<WorkBetaSettingsPage> createState() => _WorkBetaSettingsPageState();
+}
+
+class _WorkBetaSettingsPageState extends State<WorkBetaSettingsPage> {
+  static const _fontSizeOptions = [
+    (0.85, '较小'),
+    (1.0, '标准(默认)'),
+    (1.15, '较大'),
+    (1.3, '超大'),
+  ];
+
+  String _fontSizeLabel(double scale) {
+    for (final opt in _fontSizeOptions) {
+      if ((opt.$1 - scale).abs() < 0.05) return opt.$2;
+    }
+    return '标准(默认)';
+  }
+
+  Future<void> _pickFontSize() async {
+    final v = await showModalBottomSheet<double>(
+      context: context,
+      backgroundColor: const Color(0xFF1E2228),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('工作页文字大小', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            ),
+            for (final opt in _fontSizeOptions)
+              ListTile(
+                title: Text(opt.$2),
+                trailing: (opt.$1 - widget.store.workFontSizeScale).abs() < 0.05 ? const Icon(Icons.check, color: Colors.blue) : null,
+                onTap: () => Navigator.pop(ctx, opt.$1),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (v == null || (v - widget.store.workFontSizeScale).abs() < 0.01) return;
+    await widget.store.setWorkFontSizeScale(v);
+    if (mounted) setState(() {});
+    widget.onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('工作 (Beta)')),
+      body: ListView(
+        children: [
+          Container(
+            margin: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              color: Colors.amber.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.amber.withValues(alpha: 0.25)),
+            ),
+            child: const Row(
+              children: [
+                Icon(Icons.info_outline, size: 16, color: Colors.amber),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '该功能处于实验期，仅作预览测试',
+                    style: TextStyle(fontSize: 12, color: Colors.amber),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          SwitchListTile(
+            secondary: const Icon(Icons.power_settings_new),
+            title: const Text('启用工作 (Beta)'),
+            subtitle: const Text('在手机上镜像并操作电脑会话;开启后出现"工作"标签页'),
+            value: widget.store.workBetaEnabled,
+            onChanged: (v) async {
+              if (!v) {
+                await widget.store.setWorkBetaEnabled(false);
+                WorkStore.instance.onBetaSwitchChanged(widget.store);
+                if (mounted) setState(() {});
+                widget.onChanged();
+                return;
+              }
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (_) => const _WorkBetaConfirmDialog(),
+              );
+              if (ok != true) return;
+              await widget.store.setWorkBetaEnabled(true);
+              WorkStore.instance.onBetaSwitchChanged(widget.store);
+              if (mounted) setState(() {});
+              widget.onChanged();
+            },
+          ),
+          const Divider(color: Colors.white12, height: 1),
+          ListTile(
+            leading: const Icon(Icons.format_size),
+            title: const Text('工作页文字大小'),
+            subtitle: const Text('专攻工作页及工作对话文字大小;其他标签页不受影响'),
+            trailing: Text(
+              _fontSizeLabel(widget.store.workFontSizeScale),
+              style: const TextStyle(color: Colors.white70),
+            ),
+            onTap: _pickFontSize,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 3s hold-off confirmation before the beta switch actually turns on.
+class _WorkBetaConfirmDialog extends StatefulWidget {
+  const _WorkBetaConfirmDialog();
+
+  @override
+  State<_WorkBetaConfirmDialog> createState() => _WorkBetaConfirmDialogState();
+}
+
+class _WorkBetaConfirmDialogState extends State<_WorkBetaConfirmDialog> {
+  int _left = 3;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) return;
+      setState(() => _left -= 1);
+      if (_left <= 0) t.cancel();
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('开启「工作 (Beta)」?'),
+      content: const Text('该功能在测试期,仅作前瞻测试,部分功能不完善,确定要现在开启吗?'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('暂不开启'),
+        ),
+        TextButton(
+          onPressed: _left > 0 ? null : () => Navigator.pop(context, true),
+          child: Text(_left > 0 ? '确定($_left)' : '确定开启'),
+        ),
+      ],
+    );
+  }
+}

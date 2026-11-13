@@ -1,13 +1,12 @@
 /**
  * Standalone receiver for protocol development and smoke tests — no dsh
  * runtime required. Uploads fall back to content-addressed files under
- * ./.data/uploads and delivery is simulated (Phase 1 behaviour).
+ * ./.data/uploads and are staged pre-send (no agent delivery).
  *
  * Run: node lib/dev.js   (after `pnpm build`)
  */
 import { join } from "node:path";
 import { normalizeConfig } from "./config.js";
-import { LoggingSink } from "./inject/deliver.js";
 import { TargetTracker } from "./inject/target.js";
 import { DeviceStore } from "./store/devices.js";
 import { PairingStore } from "./store/pairing.js";
@@ -15,10 +14,15 @@ import { AppSettingsStore } from "./store/settings.js";
 import { startLensServer } from "./server/http.js";
 import { ViewHub } from "./server/hub.js";
 import { buildPairingQr } from "./server/qr.js";
+import { WorkBridge } from "./work/bridge.js";
 import { lensDataDir } from "./paths.js";
 
 const config = normalizeConfig(process.env.LENS_PORT ? { server: { port: Number(process.env.LENS_PORT) } } : undefined);
-const dataDir = process.env.LENS_DATA_DIR ?? lensDataDir();
+// Smoke tests must NOT write the real registry: without this, every dev.js
+// run upserted its sim device straight into ~/.dsh/phone-lens/devices.json
+// ("模拟手机 (N)" entries). Default to a dedicated sibling dir; set
+// LENS_DATA_DIR explicitly to reuse an existing data directory.
+const dataDir = process.env.LENS_DATA_DIR ?? `${lensDataDir()}-dev`;
 const log = (level: "info" | "warn" | "error", msg: string) => console[level](`[phone-lens:dev] ${msg}`);
 
 const pairing = new PairingStore(config.pairing.codeTtlMs);
@@ -26,7 +30,9 @@ const devices = new DeviceStore(dataDir);
 const appSettings = new AppSettingsStore(join(dataDir, "settings.json"), join(dataDir, "saved"));
 const hub = new ViewHub(config, (lvl, msg) => log(lvl, msg));
 const targets = new TargetTracker(config);
-const sink = new LoggingSink((lvl, msg) => log(lvl, msg));
+// standalone: no dsh host around the bridge — every tap/session call degrades
+// into a warn log or an ok:false ack, exactly the posture the bridge is built for
+const workBridge = new WorkBridge({}, appSettings, (lvl, msg) => log(lvl, msg), () => "dev");
 
 const handle = await startLensServer({
   config,
@@ -34,7 +40,7 @@ const handle = await startLensServer({
   devices,
   hub,
   targets,
-  sink,
+  workBridge,
   attachments: () => undefined,
   fallbackDir: join(dataDir, "uploads"),
   pendingDir: join(dataDir, "pending"),

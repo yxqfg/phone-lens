@@ -1,14 +1,18 @@
 package com.lensmate.lens_mate
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.os.Handler
 import android.os.Looper
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
+import java.io.File
 
 /**
  * LensMate native JPEG encoder.
@@ -18,9 +22,14 @@ import java.io.ByteArrayOutputStream
  * system libjpeg via YuvImage — ~10-20ms per 720p frame, vs 100ms+ for the
  * pure-Dart fallback. Output stays sensor-oriented; the receiver rotates it
  * (the phone reports the rotation via the stream handshake).
+ *
+ * `lensmate/openwith.open` shows the system app chooser for a downloaded
+ * work-directory file — see [openWithChooser] for why the open_filex plugin
+ * can't be used for this.
  */
 class MainActivity : FlutterActivity() {
     private val channelName = "lensmate/jpeg"
+    private val openWithChannel = "lensmate/openwith"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -53,6 +62,48 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, openWithChannel).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "open" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val path = args?.get("path") as? String
+                    val mime = (args?.get("mime") as? String) ?: "*/*"
+                    val file = path?.let { File(it) }
+                    if (file == null || !file.exists()) {
+                        result.error("NO_FILE", "file not found: $path", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        openWithChooser(file, mime)
+                        result.success(true)
+                    } catch (e: ActivityNotFoundException) {
+                        result.error("NO_APP", e.message, null)
+                    } catch (e: Exception) {
+                        result.error("OPEN_FAILED", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    /**
+     * ACTION_VIEW wrapped in an explicit chooser. A bare startActivity lets
+     * the ROM decide, and Flyme auto-registers default apps — an untyped
+     * file is silently opened by whatever it picked (a novel reader, a CAD
+     * viewer) with no list shown. createChooser bypasses default-app
+     * resolution on every ROM. The content URI reuses open_filex's merged
+     * FileProvider (all roots exposed), so any app-private path is shareable;
+     * createChooser migrates the read grant onto the chooser intent.
+     */
+    private fun openWithChooser(file: File, mime: String) {
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileProvider.com.crazecoder.openfile", file)
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(Intent.createChooser(view, "选择打开方式"))
     }
 
     /**

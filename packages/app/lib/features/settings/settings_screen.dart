@@ -1,10 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../core/api.dart';
 import '../../core/camera_socket.dart';
 import '../../core/global_link.dart';
-import '../../core/update_check.dart';import '../../ui/background_art.dart';
+import '../../core/update_check.dart';
+import '../../ui/background_art.dart';
 import 'about_screen.dart';
 import 'settings_subpages.dart';
 
@@ -155,6 +158,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute(builder: (_) => const AboutScreen()),
             ),
+          ),
+          const Divider(color: Colors.white12, height: 1),
+          ListTile(
+            leading: const Icon(Icons.workspaces_outline),
+            title: const Text('工作 (Beta)'),
+            subtitle: Text(
+              widget.store.workBetaEnabled
+                  ? '已启用 · 该功能处于实验期，仅作预览测试'
+                  : '未启用 · 该功能处于实验期，仅作预览测试',
+            ),
+            trailing: const Icon(Icons.chevron_right, color: Colors.white54),
+            onTap: () => _pushSub(WorkBetaSettingsPage(store: widget.store, onChanged: widget.onChanged)),
           ),
             ],
           ),

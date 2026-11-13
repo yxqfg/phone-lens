@@ -129,7 +129,7 @@ class UploadQueue {
   final ValueNotifier<List<UploadItem>> items = ValueNotifier(const []);
 
   LensStore? _store;
-  final LensApi _api = LensApi();
+  final LensApi _api = sharedLensApi; // long-lived shared client (never disposed here)
   String? _dirPath;
   bool _pumping = false;
   Timer? _timer;
@@ -146,6 +146,10 @@ class UploadQueue {
     try {
       final dir = await getApplicationDocumentsDirectory();
       _dirPath = '${dir.path}/upload_queue';
+      // a platform that once refused rename-over-existing leaves
+      // queue.json.tmp behind (see _persist's fallback) — sweep the stale
+      // leftover on every boot instead of letting it linger forever
+      File('$_dirPath/queue.json.tmp').delete().ignore();
       final meta = File('$_dirPath/queue.json');
       if (await meta.exists()) {
         final raw = jsonDecode(await meta.readAsString()) as List;
@@ -161,14 +165,34 @@ class UploadQueue {
         }
         items.value = restored;
       }
+      // a previous boot's corrupt backup served its diagnostic purpose once
+      // the queue restores cleanly — don't let it linger forever
+      File('$_dirPath/queue.json.corrupt').delete().ignore();
     } catch (e) {
       debugPrint('[lens-mate] upload queue restore failed: $e');
       // keep the corrupt file from poisoning every future boot (it would
-      // parse-fail again each start while its photos sit orphaned); the
-      // orphaned photo files themselves stay on disk, user-recoverable
-      try {
-        await File('$_dirPath/queue.json').rename('$_dirPath/queue.json.corrupt');
-      } catch (_) {}
+      // parse-fail again each start). Its photo files are unreachable in-app
+      // from now on — the queue that listed them is gone — so sweep them
+      // here instead of letting up to 200 × a few MB pile up invisibly;
+      // ONE corrupt backup (a few KB of JSON) stays as the diagnostic of
+      // WHAT was lost.
+      final dir = _dirPath;
+      if (dir != null) {
+        try {
+          final backup = File('$dir/queue.json.corrupt');
+          if (backup.existsSync()) backup.deleteSync(); // rename refuses an existing target
+          await File('$dir/queue.json').rename(backup.path);
+        } catch (_) {}
+        try {
+          for (final f in Directory(dir).listSync()) {
+            if (f is! File) continue;
+            if (f.uri.pathSegments.last.startsWith('queue.json')) continue;
+            try {
+              f.deleteSync();
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }
     }
     kick();
   }
@@ -210,6 +234,7 @@ class UploadQueue {
     );
     items.value = [...items.value, item];
     await _persist();
+    await _trimOverflow();
     kick();
   }
 
@@ -412,18 +437,26 @@ class UploadQueue {
       } catch (_) {
         imagePath = null; // archive failure must not lose the history row
       }
-      await store.addHistory({
-        'at': DateTime.fromMillisecondsSinceEpoch(item.capturedAt).toIso8601String(),
-        'name': item.name,
-        'bytes': item.bytes,
-        'ok': true,
-        'attachmentId': receipt.attachmentId,
-        'reason': receipt.reason,
-        'errorCode': '',
-        'captureId': item.captureId,
-        'server': serverName,
-        'imagePath': imagePath,
-      });
+      try {
+        await store.addHistory({
+          'at': DateTime.fromMillisecondsSinceEpoch(item.capturedAt).toIso8601String(),
+          'name': item.name,
+          'bytes': item.bytes,
+          'ok': true,
+          'attachmentId': receipt.attachmentId,
+          'reason': receipt.reason,
+          'errorCode': '',
+          'captureId': item.captureId,
+          'server': serverName,
+          'imagePath': imagePath,
+        });
+      } catch (_) {
+        // prefs write failed AFTER the archive rename (keepImage mode): the
+        // moved file now has NO history row pointing at it — an orphan
+        // nothing in the app can reach. Delete it; the photo itself already
+        // lives on the receiver (receipt.ok), so nothing is lost.
+        if (imagePath != null) File(imagePath).delete().ignore();
+      }
     }
     items.value = items.value.where((i) => i.id != item.id).toList();
     await _persist();
@@ -493,6 +526,36 @@ class UploadQueue {
     // items are in enqueue order, so the oldest failed come first
     final evict = failed.take(failed.length - _maxFailed).toList();
     final evictIds = evict.map((e) => e.id).toSet();
+    items.value = items.value.where((i) => !evictIds.contains(i.id)).toList();
+    for (final e in evict) {
+      _deleteFileQuietly(e.filePath);
+    }
+    await _persist();
+  }
+
+  /// Soft-failed (queued, backing off forever while the receiver stays
+  /// unreachable) entries have NO cap of their own: shooting through an
+  /// outage would stack every photo on disk indefinitely. Total cap across
+  /// queued+failed (uploading entries are never touched) — evict the OLDEST
+  /// beyond [_maxTotal]. 200 entries ≈ 400-600MB, far past any realistic
+  /// outage, yet still a hard ceiling.
+  static const _maxTotal = 200;
+  Future<void> _trimOverflow() async {
+    final evictable = items.value.where((i) => i.status == UploadStatus.queued || i.status == UploadStatus.failed).toList();
+    if (evictable.length <= _maxTotal) return;
+    final over = evictable.length - _maxTotal;
+    // Evict QUEUED entries first: a hard-failed photo is the one the user
+    // may want to inspect (AUTH_REQUIRED / BAD_MAGIC …) — sacrifice it only
+    // when queued entries alone cannot fit the cap. Both lists keep enqueue
+    // order, so the oldest go out first either way.
+    final queued = evictable.where((i) => i.status == UploadStatus.queued).toList();
+    final failed = evictable.where((i) => i.status == UploadStatus.failed).toList();
+    final evict = <UploadItem>[
+      ...queued.take(over),
+      if (queued.length < over) ...failed.take(over - queued.length),
+    ];
+    final evictIds = evict.map((e) => e.id).toSet();
+    debugPrint('[lens-mate] queue overflow: evicting ${evict.length} oldest queued/failed entries');
     items.value = items.value.where((i) => !evictIds.contains(i.id)).toList();
     for (final e in evict) {
       _deleteFileQuietly(e.filePath);

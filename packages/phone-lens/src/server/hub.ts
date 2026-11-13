@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
-import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, LensStateOutcome, ViewClientMessage, ViewServerMessage, ZoomOutcome } from "../types.js";
+import type { AdmittedImage, CameraControl, CameraStateOutcome, LensConfig, LensStateOutcome, TorchStateOutcome, ViewClientMessage, ViewServerMessage, ZoomOutcome } from "../types.js";
 
 /** Per-device camera uplink state; multiple phones coexist without kicking. */
 interface CamState {
@@ -55,8 +55,32 @@ const ZOOM_MIN_APP = "1.1.2";
  * The lens switch ships in 1.1.3 together with the app_info handshake. */
 const LENS_MIN_APP = "1.1.3";
 
+/** Oldest phone App that understands the camera_torch control (torch tool).
+ * The torch on/off/query ships in 1.1.6. */
+const TORCH_MIN_APP = "1.1.6";
+
+/** Oldest phone App that answers camera_idle/resume (the appVersion handshake
+ * landed together with the camera_state receipt in 1.0.4). */
+const CAMSTATE_MIN_APP = "1.0.4";
+
 /** How long a timed-out direct capture stays "abandoned" (late-photo guard). */
 const ABANDON_DIRECT_TTL_MS = 5 * 60_000;
+
+/**
+ * Panel flash is user-facing: map the phone's raw capture_result status/detail
+ * (see reportCapture on the app side) into plain Chinese instead of leaking
+ * wire strings like "phone reported declined: throttled".
+ */
+function captureDeclineText(status?: string, detail?: string): string {
+  if (status === "declined") {
+    if (detail === "throttled") return "手机忙:刚拍过一张,稍候再试";
+    if (detail === "busy") return "手机正在处理上一张";
+    if (detail === "cancelled") return "拍照已取消";
+    return "手机拒绝了本次拍摄";
+  }
+  if (status === "failed") return "拍摄失败:手机相机不可用";
+  return `手机报告拍摄异常(${status ?? "未知"}${detail ? `: ${detail}` : ""})`;
+}
 
 /**
  * Compare "1.2.0"-style dotted versions. Malformed/missing segments parse as
@@ -133,6 +157,8 @@ export class ViewHub {
   private zoomWaiters = new Map<string, { deviceId: string; settle: (r: ZoomOutcome) => void }>();
   /** reqId → settle callback for in-flight camera_lens requests (switch/query). */
   private lensWaiters = new Map<string, { deviceId: string; settle: (r: LensStateOutcome) => void }>();
+  /** reqId → settle callback for in-flight camera_torch requests (on/off/query). */
+  private torchWaiters = new Map<string, { deviceId: string; settle: (r: TorchStateOutcome) => void }>();
   /**
    * Derived stream state of the ACTIVE device, read off the traffic mix:
    *   "on"      — frames flowing
@@ -170,10 +196,17 @@ export class ViewHub {
       waiter.settle({ ok: false, reason: "接收端服务已停止" });
       this.lensWaiters.delete(id);
     }
+    for (const [id, waiter] of this.torchWaiters) {
+      waiter.settle({ ok: false, reason: "接收端服务已停止" });
+      this.torchWaiters.delete(id);
+    }
     for (const [id, p] of this.pendingCaptures) {
       p.onFail?.("接收端服务已停止");
       this.pendingCaptures.delete(id);
     }
+    // late-photo guard entries: the server is going away, nothing to keep —
+    // without this the map lingers until the instance is dropped entirely
+    this.abandonedDirect.clear();
   }
 
   // ── camera side ───────────────────────────────────────────────────────────
@@ -258,6 +291,12 @@ export class ViewHub {
       if (waiter.deviceId === deviceId) {
         waiter.settle({ ok: false, reason: "手机已断开连接" });
         this.lensWaiters.delete(id);
+      }
+    }
+    for (const [id, waiter] of this.torchWaiters) {
+      if (waiter.deviceId === deviceId) {
+        waiter.settle({ ok: false, reason: "手机已断开连接" });
+        this.torchWaiters.delete(id);
       }
     }
     if (this.activeDeviceId === deviceId) {
@@ -361,7 +400,7 @@ export class ViewHub {
           // a MODEL-initiated capture declining is already handled by the
           // tool's own failure path — flashing the panel too would be noise
           if (!failed?.direct) {
-            this.broadcastToViews({ type: "error", code: "CAPTURE_DECLINED", message: `phone reported ${msg.status}${msg.detail ? `: ${msg.detail}` : ""}` });
+            this.broadcastToViews({ type: "error", code: "CAPTURE_DECLINED", message: captureDeclineText(msg.status, msg.detail) });
           }
         }
         break;
@@ -409,6 +448,23 @@ export class ViewHub {
               msg.ok && (msg.lens === "front" || msg.lens === "back")
                 ? { ok: true, lens: msg.lens, ...(Array.isArray(msg.available) ? { available: msg.available } : {}) }
                 : { ok: false, reason: msg.reason ?? "手机报告镜头切换失败" },
+            );
+          }
+        }
+        break;
+      }
+      case "torch_result": {
+        // receipt for the model tools' camera_torch on/off/query requests
+        if (msg.reqId) {
+          const waiter = this.torchWaiters.get(msg.reqId);
+          if (waiter) {
+            this.torchWaiters.delete(msg.reqId);
+            // explicit whitelist: ok:true without a boolean `on` is a garbled
+            // receipt — read as failure, never as an optimistic state
+            waiter.settle(
+              msg.ok && typeof msg.on === "boolean"
+                ? { ok: true, on: msg.on }
+                : { ok: false, reason: msg.reason ?? "手机报告手电筒操作失败" },
             );
           }
         }
@@ -542,7 +598,7 @@ export class ViewHub {
       if (msg.type === "capture") {
         const captureId = randomUUID();
         if (!this.requestCapture(captureId, msg.note)) {
-          this.broadcastToViews({ type: "error", code: "NO_CAMERA", message: "no camera uplink connected" });
+          this.broadcastToViews({ type: "error", code: "NO_CAMERA", message: "手机未连接,暂无可用相机" });
         }
       } else if (msg.type === "select_device") {
         this.selectDevice(msg.deviceId);
@@ -665,10 +721,6 @@ export class ViewHub {
     return this.pendingCaptures.get(captureId) ?? null;
   }
 
-  noteFor(captureId: string): string | undefined {
-    return this.pendingCaptures.get(captureId)?.note;
-  }
-
   private gcCaptures(): void {
     const cutoff = Date.now() - this.captureTimeoutMs;
     for (const [id, p] of this.pendingCaptures) {
@@ -780,7 +832,7 @@ export class ViewHub {
         return;
       }
       if (active.meta.appVersion === undefined) {
-        resolve({ ok: false, reason: "手机 App 版本过旧(需 ≥ 1.0.4),请先更新手机端" });
+        resolve({ ok: false, reason: `手机 App 版本过旧(需 ≥ ${CAMSTATE_MIN_APP}),请先更新手机端` });
         return;
       }
       const reqId = randomUUID();
@@ -883,6 +935,51 @@ export class ViewHub {
       this.sendControl(deviceId, {
         type: "camera_lens",
         ...(params.lens !== undefined ? { lens: params.lens } : {}),
+        reqId,
+      } satisfies CameraControl);
+    });
+  }
+
+  /**
+   * Model tool: turn the ACTIVE phone's torch (flashlight) on/off (on given)
+   * or query its state (on omitted). Settles with the phone's torch_result
+   * receipt (or a timeout). App builds before 1.1.6 have no camera_torch
+   * branch — same failure modes as zoom/lens: handshake gap ≠ old build.
+   * Note the torch needs a live camera session: an idle camera answers
+   * "相机未开启"; use phone_camera_resume to wake it first.
+   */
+  async requestTorch(params: { on?: boolean }, timeoutMs: number): Promise<TorchStateOutcome> {
+    await this.awaitHandshake();
+    return new Promise((resolve) => {
+      const active = this.activeCam();
+      if (!active || active.ws.readyState !== active.ws.OPEN || this.activeDeviceId === null) {
+        resolve({ ok: false, reason: "没有已连接的手机" });
+        return;
+      }
+      if (!active.helloSeen) {
+        // reconnect window, NOT an old build — see requestCameraState
+        resolve({ ok: false, reason: "手机刚重连,连接握手尚未完成,请稍候重试(或在手机端打开预览)" });
+        return;
+      }
+      if (active.meta.appVersion === undefined || !versionAtLeast(active.meta.appVersion, TORCH_MIN_APP)) {
+        resolve({ ok: false, reason: `手机 App 版本过旧(手电筒需 ≥ ${TORCH_MIN_APP}),请先更新手机端` });
+        return;
+      }
+      const reqId = randomUUID();
+      const deviceId = this.activeDeviceId;
+      let settled = false;
+      const timer = setTimeout(() => finish({ ok: false, reason: "手机未在时限内回执(可能不在前台或已断连)" }), timeoutMs);
+      const finish = (r: TorchStateOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.torchWaiters.delete(reqId);
+        resolve(r);
+      };
+      this.torchWaiters.set(reqId, { deviceId, settle: finish });
+      this.sendControl(deviceId, {
+        type: "camera_torch",
+        ...(params.on !== undefined ? { on: params.on } : {}),
         reqId,
       } satisfies CameraControl);
     });

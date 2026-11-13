@@ -12,6 +12,9 @@ export class RateLimiter {
     const now = Date.now();
     const cutoff = now - this.windowMs;
     const list = (this.hits.get(key) ?? []).filter((t) => t > cutoff);
+    // fully expired entries must not linger: an empty array would stay in the
+    // Map forever (one dead row per key that ever tripped the limiter)
+    if (list.length === 0) this.hits.delete(key);
     if (list.length >= this.max) {
       this.hits.set(key, list);
       return false;

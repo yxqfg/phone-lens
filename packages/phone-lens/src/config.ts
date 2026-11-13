@@ -17,7 +17,6 @@ export function normalizeConfig(raw: unknown): LensConfig {
   const limits = (r.limits ?? {}) as Record<string, any>;
   const pairing = (r.pairing ?? {}) as Record<string, any>;
   const preview = (r.preview ?? {}) as Record<string, any>;
-  const inject = (r.inject ?? {}) as Record<string, any>;
   const target = (r.target ?? {}) as Record<string, any>;
   const app = (r.app ?? {}) as Record<string, any>;
   // App download sources: Gitee first (CN-friendly), GitHub as the fallback
@@ -28,7 +27,6 @@ export function normalizeConfig(raw: unknown): LensConfig {
   const GITHUB_APK = "https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk";
   const giteeUrl = typeof app.giteeUrl === "string" && app.giteeUrl ? app.giteeUrl : GITEE_APK_DEFAULT;
   const allowed = Array.isArray(limits.allowedTypes) ? limits.allowedTypes.filter((t: unknown): t is string => typeof t === "string") : undefined;
-  const mode = inject.mode === "steer" ? "steer" : "followup";
   return {
     server: {
       host: typeof server.host === "string" && server.host ? server.host : "0.0.0.0",
@@ -47,10 +45,6 @@ export function normalizeConfig(raw: unknown): LensConfig {
       maxHeight: positiveInt(preview.maxHeight, 480),
       fps: clampInt(preview.fps, 1, 30, 10),
       jpegQuality: clampInt(preview.jpegQuality, 20, 95, 70),
-    },
-    inject: {
-      mode,
-      notePrefix: typeof inject.notePrefix === "string" ? inject.notePrefix : "[手机拍照]",
     },
     target: {
       mode: target.mode === "pinned" ? "pinned" : "latest",

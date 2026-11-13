@@ -11,6 +11,7 @@ import 'features/camera/viewfinder_screen.dart';
 import 'features/history/history_screen.dart';
 import 'features/pair/pair_screen.dart';
 import 'features/settings/settings_screen.dart';
+import 'features/work/work_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -62,12 +63,6 @@ class _HomeScreenState extends State<HomeScreen> {
   int _tab = 0;
   bool _updateDialogShown = false;
 
-  @override
-  void initState() {
-    super.initState();
-    _maybeAutoCheckUpdate();
-  }
-
   /// Startup update check: EVERY launch (user request — no daily throttle).
   /// Silent on failure; a newer release pops the dialog AND lights the amber
   /// "有更新!" badge next to Settings → 检查更新 — unless the user tapped
@@ -89,6 +84,28 @@ class _HomeScreenState extends State<HomeScreen> {
   void _refresh() => setState(() {});
 
   @override
+  void initState() {
+    super.initState();
+    _maybeAutoCheckUpdate();
+    // Programmatic tab switches (e.g. the work composer arming a capture then
+    // flipping to/from the viewfinder) drive homeTab directly — mirror it into
+    // _tab so IndexedStack actually follows. Assignment from the nav bar sets
+    // homeTab first, so this listener also fires there (idempotent).
+    homeTab.addListener(_onHomeTab);
+  }
+
+  @override
+  void dispose() {
+    homeTab.removeListener(_onHomeTab);
+    super.dispose();
+  }
+
+  void _onHomeTab() {
+    final i = homeTab.value;
+    if (i != _tab && mounted) setState(() => _tab = i);
+  }
+
+  @override
   Widget build(BuildContext context) {
     // No paired receiver → pairing flow (also covers "removed them all").
     final server = widget.store.server;
@@ -101,21 +118,53 @@ class _HomeScreenState extends State<HomeScreen> {
       HistoryScreen(store: widget.store),
       SettingsScreen(store: widget.store, onChanged: _refresh),
     ];
+    final destinations = [
+      const NavigationDestination(icon: Icon(Icons.photo_camera), label: '取景'),
+      const NavigationDestination(icon: Icon(Icons.history), label: '历史'),
+      const NavigationDestination(icon: Icon(Icons.settings), label: '设置'),
+    ];
+    // 「工作(Beta)」mounts ONLY while the settings switch is on — in slot 1,
+    // right of 取景 (user spec). The viewfinder's camera gating compares
+    // homeTab against workTabIndex (never a hard-coded slot), so it follows
+    // this order automatically. Toggling the switch rebuilds this screen via
+    // the settings onChanged callback; when removed, IndexedStack drops its
+    // State and the work socket tears down with it.
+    final workBeta = widget.store.workBetaEnabled;
+    workTabIndex = workBeta ? 1 : -1;
+    if (workBeta) {
+      pages.insert(1, WorkScreen(store: widget.store, key: const ValueKey('work')));
+      destinations.insert(1, const NavigationDestination(icon: Icon(Icons.workspaces_outline), label: '工作'));
+    }
+    // Clamp AND write the clamped value back into homeTab: every consumer of
+    // homeTab (viewfinder camera gating, work bounce-back) must see the same
+    // slot the IndexedStack shows, or the global tab drifts until the next
+    // nav-bar tap. The mirror listener no-ops on this write (i == _tab
+    // already). Only the viewfinder listener also fires: it can't setState
+    // synchronously (its init path awaits first), and any armed work-capture
+    // it clears is always already null on these clamp paths (tab switches and
+    // the shoot handoff consume it before they can leave us here).
+    if (_tab >= pages.length) {
+      _tab = pages.length - 1;
+      homeTab.value = _tab;
+    }
+    // a bounce-back racing a beta-off rebuild can hand us -1 (workTabIndex
+    // when the switch just flipped): IndexedStack would blank the whole body
+    if (_tab < 0) {
+      _tab = 0;
+      homeTab.value = _tab;
+    }
     return Scaffold(
       body: IndexedStack(index: _tab, children: pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
         onDestinationSelected: (i) {
-          // publish FIRST so tab-aware listeners (viewfinder camera gating)
-          // see the new tab before this frame's rebuild
+          // publish ONLY through homeTab: the mirror listener sets _tab (one
+          // setState per tap instead of two), and tab-aware listeners
+          // (viewfinder camera gating) still see the new tab before this
+          // frame's rebuild because listeners run synchronously.
           homeTab.value = i;
-          setState(() => _tab = i);
         },
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.photo_camera), label: '取景'),
-          NavigationDestination(icon: Icon(Icons.history), label: '历史'),
-          NavigationDestination(icon: Icon(Icons.settings), label: '设置'),
-        ],
+        destinations: destinations,
       ),
     );
   }

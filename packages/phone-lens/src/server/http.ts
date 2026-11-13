@@ -1,23 +1,23 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync } from "node:fs";
 import { readFile, readdir, rm, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import QRCode from "qrcode";
-import type { DeliveryReceipt, LensConfig } from "../types.js";
+import type { LensConfig } from "../types.js";
 import { ERROR_CODES } from "../types.js";
 import { checkHostUpdate } from "./update-check.js";
-import type { DeliverySink } from "../inject/deliver.js";
 import { admitImage, magicMatches, type AttachmentStoreLike } from "../inject/admit.js";
 import type { TargetTracker } from "../inject/target.js";
 import type { DeviceStore } from "../store/devices.js";
 import { hashToken, mintDeviceToken, type PairingStore } from "../store/pairing.js";
 import { SAVE_MODES, type AppSettingsStore, type SaveMode } from "../store/settings.js";
 import type { ViewHub } from "./hub.js";
+import type { WorkBridge } from "../work/bridge.js";
 import { refreshAppApkLinks, resolveLatestGiteeApk } from "./apk-link.js";
 import { buildPairingQr } from "./qr.js";
 import { VIEW_HTML } from "./static-view.js";
@@ -29,7 +29,6 @@ export interface ServerDeps {
   devices: DeviceStore;
   hub: ViewHub;
   targets: TargetTracker;
-  sink: DeliverySink;
   /** Read the attachment store lazily — the service may mount after us. */
   attachments: () => AttachmentStoreLike | undefined;
   /** Fallback dir for uploads when the attachment service is absent. */
@@ -38,6 +37,8 @@ export interface ServerDeps {
   pendingDir: string;
   /** User-selected capture mode + folder target (web UI settings). */
   appSettings: AppSettingsStore;
+  /** 「工作(Beta)」session-mirror bridge (inert while the beta switch is off). */
+  workBridge: WorkBridge;
   log: (level: "info" | "warn" | "error", msg: string) => void;
 }
 
@@ -65,21 +66,16 @@ function hostVersion(): string {
 }
 
 export async function startLensServer(deps: ServerDeps): Promise<LensServerHandle> {
-  const { config, pairing, devices, hub, targets, sink, log } = deps;
+  const { config, pairing, devices, hub, targets, log } = deps;
   const pairLimiter = new RateLimiter(60_000, 10);
   // POST /upload idempotency: the phone's upload queue retries with a stable
   // uploadId, and a retry after a lost response must not store/inject twice.
   const uploadReplays = new Map<string, { expires: number; body: unknown }>();
-  const injectionBox: { last: { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null } = { last: null };
 
   const server: HttpServer = createServer((req, res) => {
     handle(deps, req, res, {
       pairLimiter,
       uploadReplays,
-      noteInjection: (receipt, attachmentId) => {
-        injectionBox.last = { at: Date.now(), sessionId: receipt.sessionId, attachmentId, ok: receipt.ok };
-      },
-      getLastInjection: () => injectionBox.last,
     }).catch((error) => {
       log("error", `request failed: ${String(error)}`);
       if (!res.headersSent) sendJson(res, 500, { error: { code: ERROR_CODES.INTERNAL, message: String(error) } });
@@ -88,6 +84,9 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
   });
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: config.limits.previewFrameMaxBytes * 4 });
+  // work uplink carries base64 image parts inside work_send JSON frames —
+  // its own generous ceiling, independent of the camera frame budget
+  const workWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
   server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(req.url ?? "/", "http://phone-lens.local");
     const done = (status: number, message: string) => {
@@ -118,34 +117,99 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
       }));
       return;
     }
+    // 「工作(Beta)」uplink: paired-device auth (or loopback debugging). The
+    // bridge itself re-checks the beta switch and closes 4003 when off.
+    if (url.pathname === "/ws/work") {
+      const q = url.searchParams;
+      const deviceId = q.get("deviceId") ?? "";
+      const token = q.get("token") ?? "";
+      const record = devices.authenticate(deviceId, token);
+      if (!record && !isLoopback(req)) return done(401, "Unauthorized");
+      workWss.handleUpgrade(req, socket, head, (ws) => {
+        // pass the authenticated record through (lane-08 §8 item 3 / recheck-6
+        // R3) — dropping it made every work client fall back to deviceId=""
+        // and "本机调试", collapsing work_devices to one row and breaking the
+        // self-device marker; loopback debug links carry no record and keep
+        // the placeholder identity
+        deps.workBridge.attachClient(
+          ws as WebSocket,
+          record ? { deviceId: record.deviceId, name: record.name } : undefined,
+        );
+      });
+      return;
+    }
     done(404, "Not Found");
   });
 
-  const heartbeat = setInterval(() => hub.pingAll(), 20_000);
+  const heartbeat = setInterval(() => {
+    hub.pingAll();
+    deps.workBridge.pingAll();
+  }, 20_000);
 
+  // Port fallback: the default 8791 (or the configured port) may be held by a
+  // leaked previous instance — walk up to 8800 instead of refusing to start.
+  // Only EADDRINUSE moves on to the next candidate; EACCES/EINVAL and friends
+  // are real config errors and must rethrow (no silent 10× spin). The wss
+  // instances are noServer:true (bound in the "upgrade" handler), so retrying
+  // on the same server/wss needs no rebuild.
+  const preferredPort = config.server.port;
+  const candidates = [preferredPort, ...[8792, 8793, 8794, 8795, 8796, 8797, 8798, 8799, 8800].filter((p) => p !== preferredPort)];
+  let boundPort: number | null = null;
   try {
-    await new Promise<void>((resolve, reject) => {
-      const onError = reject as (e: Error) => void;
-      server.once("error", onError);
-      server.listen(config.server.port, config.server.host, () => {
-        // detach the startup reject: leaving it attached would silently swallow
-        // RUNTIME server errors into an already-settled promise
-        server.removeListener("error", onError);
-        server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
-        resolve();
+    for (const port of candidates) {
+      const ok = await new Promise<boolean>((resolve, reject) => {
+        const onError = reject as (e: Error) => void;
+        server.once("error", onError);
+        server.listen(port, config.server.host, () => {
+          // detach the startup reject: leaving it attached would silently swallow
+          // RUNTIME server errors into an already-settled promise
+          server.removeListener("error", onError);
+          server.on("error", (e) => log("warn", `http server error: ${String(e)}`));
+          resolve(true);
+        });
+      }).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException)?.code === "EADDRINUSE") return false;
+        throw error;
       });
-    });
+      if (ok) {
+        boundPort = port;
+        break;
+      }
+    }
   } catch (error) {
-    // listen failed (EADDRINUSE from a leaked previous instance is the usual
-    // one): the heartbeat interval and the wss above are ALREADY live —
-    // without this cleanup every failed start leaked a 20s timer that pings
-    // an empty hub forever and stacks across plugin reloads
+    // listen failed on a non-EADDRINUSE error: the heartbeat interval and the
+    // wss/workWss above are ALREADY live — without this cleanup every failed
+    // start leaked a 20s timer that pings an empty hub forever and stacks
+    // across plugin reloads
     clearInterval(heartbeat);
     for (const client of wss.clients) client.terminate();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
+    for (const client of workWss.clients) client.terminate();
+    await new Promise<void>((resolve) => workWss.close(() => resolve()));
     throw error;
   }
+  if (boundPort === null) {
+    // every candidate was busy: name the whole range so the boot log points
+    // at the actual situation instead of just the preferred port
+    throw new Error(`无可用端口: ${preferredPort} 及 8792~8800 均被占用`);
+  }
+  // Deliberately mutate the SHARED config object: /info, the pairing QR
+  // (qr.ts), the stdout announcements and the dev banner all read
+  // config.server.port — writing the bound port back keeps every consumer on
+  // the real port without threading it through handles. normalizeConfig
+  // rebuilds the object on every config apply, so this never persists into
+  // the profile's stored port value.
+  if (boundPort !== preferredPort) {
+    config.server.port = boundPort;
+    log("warn", `port ${preferredPort} busy, fell back to ${boundPort}`);
+  }
   log("info", `phone-lens listening on ${config.server.host}:${config.server.port} (paired devices: ${devices.count()})`);
+  // One-shot boot sweep: the per-upload prunes only run on successful /upload
+  // calls, so files that aged past their TTL while the host was down (or just
+  // idle — pure viewing / work-session use) sat until the next photo. Sweep
+  // once at startup; the per-upload sweeps stay the steady-state path.
+  void pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
+  void prunePending(deps.pendingDir, PENDING_TTL_MS).catch(() => {});
   // Warm the APK-link cache so the first rendered download QR already carries
   // the dynamically resolved URL (never blocks startup on the network).
   void resolveLatestGiteeApk().then((url) => {
@@ -158,6 +222,7 @@ export async function startLensServer(deps: ServerDeps): Promise<LensServerHandl
       clearInterval(heartbeat);
       hub.dispose();
       hub.detachAll();
+      deps.workBridge.dispose();
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
@@ -168,8 +233,6 @@ type RouteCtx = {
   pairLimiter: RateLimiter;
   /** uploadId → cached 200 response, so queued-upload retries are idempotent. */
   uploadReplays: Map<string, { expires: number; body: unknown }>;
-  noteInjection: (receipt: DeliveryReceipt, attachmentId: string) => void;
-  getLastInjection: () => { at: number; sessionId: string | null; attachmentId: string; ok: boolean } | null;
 };
 
 /** Composer-staged photos older than this get swept (best effort). */
@@ -205,7 +268,7 @@ async function prunePending(dir: string, ttlMs: number): Promise<void> {
 }
 
 async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerResponse, ctx: RouteCtx): Promise<void> {
-  const { config, pairing, devices, hub, targets, sink, log } = deps;
+  const { config, pairing, devices, hub, targets, log } = deps;
   const url = new URL(req.url ?? "/", "http://phone-lens.local");
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = req.method ?? "GET";
@@ -230,7 +293,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
   // ── open endpoints ────────────────────────────────────────────────────────
   if (method === "GET" && path === "/info") {
-    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: hostVersion(), requiresPairing: true }, cors);
+    return sendJson(res, 200, { name: "PhoneLens 直连取景", version: hostVersion(), requiresPairing: true, serverPort: config.server.port }, cors);
   }
 
   // Loopback: plugin-update check for the floating panel (a colored hint line,
@@ -361,15 +424,25 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     // the ledger entry dies only now that admit succeeded
     if (pending) hub.consumeCapture(captureId as string);
 
+    // keep the archives bounded on EVERY upload, not just when the owning
+    // branch fired this time: once the attachments service recovered, historic
+    // fallback files in uploads/ never got pruned again, and switching to
+    // folder-only mode stopped composer-pending sweeps entirely (both had real
+    // lingering stockpiles). This sits ABOVE the abandoned-late-direct early
+    // return — a swallowed late photo must still sweep, or fallback-mode files
+    // from timed-out captures only got cleaned by the NEXT non-abandoned one.
+    await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
+    void prunePending(deps.pendingDir, PENDING_TTL_MS).catch(() => {});
+
     if (abandoned) {
       log("warn", `dropping late direct-capture photo: ${name} (${admitted.ref.attachmentId})`);
-      const droppedBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, delivered: null, deliverReason: "dropped-late-direct" };
+      // NOTE: deliverReason is ALIVE — the phone App's history screen maps it
+      // to "saved to folder / staged" labels. The `delivered` object it used
+      // to ride with (sessionId per session) is dead and stays deleted.
+      const droppedBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, deliverReason: "dropped-late-direct" };
       rememberReplay(ctx, uploadId, droppedBody);
       return sendJson(res, 200, droppedBody);
     }
-
-    // keep the local archive bounded (retention: maxStoredUploads oldest-first)
-    if (admitted.storage === "file") await pruneUploads(deps.fallbackDir, config.limits.maxStoredUploads).catch((error) => log("warn", `upload pruning failed: ${String(error)}`));
 
     // Model-initiated capture (phone_take_photo tool): the photo goes straight
     // to the model as an image context — never staged into the composer, never
@@ -377,7 +450,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (pending?.direct && pending.onImage) {
       pending.onImage(admitted);
       log("info", `direct-to-model photo: ${name} (${admitted.ref.attachmentId})`);
-      const directBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, delivered: null, deliverReason: "delivered-to-model" };
+      const directBody = { ok: true, attachmentId: admitted.ref.attachmentId, width: admitted.ref.width, height: admitted.ref.height, bytes: admitted.ref.bytes, storage: admitted.storage, deliverReason: "delivered-to-model" };
       rememberReplay(ctx, uploadId, directBody);
       return sendJson(res, 200, directBody);
     }
@@ -396,12 +469,28 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       const dir = deps.appSettings.effectiveSaveDir();
       try {
         mkdirSync(dir, { recursive: true });
-        const fileName = nextAvailableName(dir, name);
-        const target = resolveUnder(dir, fileName);
-        if (!target) throw new Error("resolved path escapes the save directory");
-        writeFileSync(target, buf);
+        let fileName = nextAvailableName(dir, name);
+        for (let attempt = 0; ; attempt++) {
+          const target = resolveUnder(dir, fileName);
+          if (!target) throw new Error("resolved path escapes the save directory");
+          try {
+            // "wx" fails if the file appeared between the existsSync probe and
+            // this write (two devices racing the same second-resolution name)
+            // — retry with the next candidate instead of silently overwriting
+            const fd = openSync(target, "wx");
+            try {
+              writeSync(fd, buf);
+            } finally {
+              closeSync(fd);
+            }
+            break;
+          } catch (e) {
+            if (attempt >= 4 || (e as NodeJS.ErrnoException)?.code !== "EEXIST") throw e;
+            fileName = nextAvailableName(dir, fileName);
+          }
+        }
         savedDir = dir;
-        log("info", `folder-mode saved: ${target}`);
+        log("info", `folder-mode saved: ${join(dir, fileName)}`);
       } catch (error) {
         log("warn", `folder save failed (${String(error)}) — falling back to composer staging`);
       }
@@ -421,10 +510,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       } catch (error) {
         log("warn", `staging failed: ${String(error)}`);
       }
-      // nothing ever deletes staged copies otherwise (the client takes the
-      // bytes but sends no receipt) — sweep anything past the TTL so a
-      // long-running host doesn't slowly fill its disk with orphans
-      void prunePending(deps.pendingDir, PENDING_TTL_MS).catch(() => {});
+      // (TTL sweep moved to the unconditional prune right after admit)
       hub.broadcastToViews({ type: "pending_image", attachmentId: admitted.ref.attachmentId, name });
       // no direct delivery; the client owns placing it in the composer
     } else {
@@ -435,8 +521,8 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
 
     // Idempotency bookkeeping for queued-upload retries. uploadId serves only
     // as the lookup KEY; the cached receipt is entirely server-generated data
-    // (sha refs, probed dimensions, literal enums) — must stay byte-identical
-    // to the 200 body returned below.
+    // (sha refs, probed dimensions, literal enums) and IS the 200 body — one
+    // object for both, so they can never drift apart.
     {
       const replayBody = {
         ok: true,
@@ -445,21 +531,10 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
         height: admitted.ref.height,
         bytes: admitted.ref.bytes,
         storage: admitted.storage,
-        delivered: null,
         deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
       };
       rememberReplay(ctx, uploadId, replayBody);
-
-      return sendJson(res, 200, {
-        ok: true,
-        attachmentId: admitted.ref.attachmentId,
-        width: admitted.ref.width,
-        height: admitted.ref.height,
-        bytes: admitted.ref.bytes,
-        storage: admitted.storage,
-        delivered: null,
-        deliverReason: savedDir ? (wantComposer ? "saved-and-staged" : "saved-to-folder") : "staged-in-composer",
-      });
+      return sendJson(res, 200, replayBody);
     }
   }
 
@@ -470,7 +545,10 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
     if (!file) return sendError(res, 404, ERROR_CODES.BAD_REQUEST, "pending image not found");
     try {
       const data = await readFile(file);
-      res.writeHead(200, { "content-type": "image/jpeg", "cache-control": "no-store", ...cors });
+      // the staging file may hold any admitted type (high-quality uploads keep
+      // their original PNG bytes) — declare the type the BYTES say, not what
+      // the flattened .jpg filename implies
+      res.writeHead(200, { "content-type": imageContentType(data), "cache-control": "no-store", ...cors });
       res.end(data);
       return;
     } catch {
@@ -490,7 +568,6 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
       camera: hub.stats(),
       preview: config.preview,
       target: { mode: targets.mode(), sessionId: targets.resolve()?.sessionId ?? null },
-      lastInjection: ctx.getLastInjection(),
     }, cors);
   }
 
@@ -502,7 +579,7 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   // Loopback-only; the settings live on the host because the folder save runs here.
   if (method === "GET" && path === "/app-settings") {
     const st = deps.appSettings.get();
-    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree }, cors);
+    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree, workBetaEnabled: st.workBetaEnabled }, cors);
   }
   // Save-folder picker backend: lists DIRECTORIES under a path for the web
   // UI's browser-style folder dialog. The browser cannot learn absolute
@@ -515,14 +592,37 @@ async function handle(deps: ServerDeps, req: IncomingMessage, res: ServerRespons
   if (method === "POST" && path === "/app-settings") {
     const body = await readJsonBody(req, 4096);
     if (!body) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "invalid JSON body");
-    const patch: { saveMode?: SaveMode; saveDir?: string; modelToolsEnabled?: boolean; modelToolsConfirmFree?: boolean } = {};
+    const patch: { saveMode?: SaveMode; saveDir?: string; modelToolsEnabled?: boolean; modelToolsConfirmFree?: boolean; workBetaEnabled?: boolean } = {};
     if (typeof body.saveMode === "string" && SAVE_MODES.includes(body.saveMode as SaveMode)) patch.saveMode = body.saveMode as SaveMode;
     if (typeof body.saveDir === "string") patch.saveDir = body.saveDir;
     if (typeof body.modelToolsEnabled === "boolean") patch.modelToolsEnabled = body.modelToolsEnabled;
     if (typeof body.modelToolsConfirmFree === "boolean") patch.modelToolsConfirmFree = body.modelToolsConfirmFree;
+    if (typeof body.workBetaEnabled === "boolean") patch.workBetaEnabled = body.workBetaEnabled;
     const st = deps.appSettings.set(patch);
-    log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"} modelTools=${st.modelToolsEnabled}/${st.modelToolsConfirmFree}`);
-    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree }, cors);
+    // the work bridge reacts to the switch synchronously: off = taps removed
+    // and every /ws/work client closed (nothing keeps listening host-side)
+    if (typeof patch.workBetaEnabled === "boolean") deps.workBridge.setEnabled(patch.workBetaEnabled);
+    log("info", `app settings updated: mode=${st.saveMode} dir=${st.saveDir ? JSON.stringify(st.saveDir) : "(default)"} modelTools=${st.modelToolsEnabled}/${st.modelToolsConfirmFree} workBeta=${st.workBetaEnabled}`);
+    return sendJson(res, 200, { saveMode: st.saveMode, saveDir: st.saveDir, effectiveSaveDir: deps.appSettings.effectiveSaveDir(), modelToolsEnabled: st.modelToolsEnabled, modelToolsConfirmFree: st.modelToolsConfirmFree, workBetaEnabled: st.workBetaEnabled }, cors);
+  }
+
+  // Unbind a paired device (web UI settings "解绑" button). STRICTLY
+  // loopback-only: the auth gate above also passes for paired phones, and a
+  // phone must never be able to erase its own or a rival's pairing over the
+  // LAN — only the machine's own user may drop a device.
+  if (method === "POST" && path === "/devices/remove") {
+    if (!loop) return sendError(res, 403, ERROR_CODES.LOOPBACK_ONLY, "device removal is loopback-only");
+    const body = await readJsonBody(req, 4096);
+    const deviceId = str(body?.deviceId);
+    if (!deviceId) return sendError(res, 400, ERROR_CODES.BAD_REQUEST, "deviceId is required");
+    const removed = devices.remove(deviceId);
+    if (removed) {
+      // a live camera uplink of the removed device must not keep pumping
+      // frames: detach settles its tool waiters and refreshes the views
+      hub.detachCamera(deviceId);
+      log("info", `device removed: ${deviceId.slice(0, 8)}`);
+    }
+    return sendJson(res, 200, { ok: removed }, cors);
   }
 
   // View-side control also arrives over /ws/view; a loopback HTTP trigger is
@@ -610,6 +710,17 @@ function pendingFileName(attachmentId: string): string {
   return `${attachmentId.replace(/[^A-Za-z0-9._-]/g, "_")}.jpg`;
 }
 
+/** Content type for a staged/uploaded image buffer, decided by the bytes:
+ *  high-quality uploads pass original PNG (or WebP) through untouched, so a
+ *  `.jpg` filename may lie about the payload. */
+function imageContentType(buf: Buffer): string {
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "image/png";
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8) return "image/jpeg";
+  if (buf.length >= 12 && buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "WEBP") return "image/webp";
+  if (buf.length >= 5 && buf.toString("latin1", 0, 5) === "GIF8") return "image/gif";
+  return "application/octet-stream";
+}
+
 /** Resolve `name` under `baseDir` and refuse anything that escapes it
  *  (defense in depth on top of sanitizeFileName — e.g. a crafted name that
  *  survives sanitization but still resolves outside the base). */
@@ -662,10 +773,13 @@ function readRawBody(req: IncomingMessage, maxBytes: number): Promise<{ buf: Buf
   });
 }
 
-/** Delete the oldest files beyond `max` in a directory (mtime order). */
+/** Delete the oldest files beyond `max` in a directory (mtime order). A
+ *  missing directory is a no-op: the production attachments mode never
+ *  creates uploads/, and warning about it on EVERY /upload just floods
+ *  boot.log. */
 async function pruneUploads(dir: string, max: number): Promise<void> {
   if (max <= 0) return;
-  const names = await readdir(dir);
+  const names = await readdir(dir).catch(() => [] as string[]);
   if (names.length <= max) return;
   const entries = await Promise.all(
     names.map(async (name) => {

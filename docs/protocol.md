@@ -90,3 +90,26 @@ Header:`X-LM-Device: <deviceId>`、`X-LM-Token: <deviceToken>`
 ## 4. 错误码汇总
 
 `AUTH_REQUIRED` `PAIR_CODE_INVALID` `PAIR_CODE_EXPIRED` `RATE_LIMITED` `TYPE_NOT_ALLOWED` `TOO_LARGE` `BAD_MAGIC` `STORE_FAILED` `NO_TARGET` `NO_CAMERA` `CAPTURE_TIMEOUT` `LOOPBACK_ONLY`
+
+## 5. 工作通道 /ws/work (Beta, v1.1.6 起)
+
+独立于相机链路的会话通道(非回环 + 设备 token;多连接并存,订阅为 per-connection)。帧为 JSON 文本,上行 16MB 上限。要点先列:
+
+- **事件 seq 是 per-session、从 0 连续递增**(宿主会话日志长度),跨会话区间重叠,客户端必须按 sessionId 命名空间隔离去重。
+- **互不干扰**:host 只向「订阅该会话的连接」路由会话帧;App 端再按 sessionId 过滤兜底。
+- **在线判定**:host 以 PRESENCE_FRESH_MS=25s 无心跳判设备离线(与相机链路 90s 半开驱逐、App 30s 半开判定分工不同,勿混用)。
+
+上行主要类型:
+- `hello {deviceId, token}` → `work_hello`
+- `session_list` / `session_subscribe {sessionId, sinceSeq?}`(缺省/0=全量快照;`sessionId:""` = 退订)
+- `prompt(work_send) {sessionId, text, images[]}`(base64 mediaType+data+name,≤4 张)
+- `commands_list` / `mention_query {q}` / `interaction_answer {interactionId, ...}` / `session_fork {sessionId, atSeq, title?}` / `session_archive` / `download_request` / `ping`
+
+下行主要类型:
+- `session_snapshot`(含 sessionId;事件 seq>sinceSeq)/ `session_event` / `stream_frame` / `tool` 行 + `changes_summary`
+- `approval_request` / `approval_resolved`(先答先生效,后答撤卡;resolved 按 sessionId 定向)/ `question` / `approval_state {kind, interactionIds[]}`(对账清理用)
+- `session_list` 刷新 / `session_archived` / `session_unarchived {sessionId}` / `session_renamed`
+- `work_devices {devices:[{deviceId, name|deviceName, sessionId|null, cwd|null, online, lastSeenAt}]}`(设备在线列表,subscribe/退订/连接建立/断开/周期广播)
+- `model_changed` / `ack {reqId, ok, data}`(statusFrame 通道)/ `commands_list` 结果 / `mention_query` 结果 / `pong`
+
+完整字段定义以 `packages/phone-lens/src/types.ts` 与 `packages/phone-lens/src/work/bridge.ts` 为准;本节为概要,逐字段文档随迭代补全。

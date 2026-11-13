@@ -56,7 +56,7 @@ export const VIEW_HTML = `<!doctype html>
     <div class="row"><a href="https://github.com/yxqfg/phone-lens/releases/latest/download/app-release.apk" target="_blank" rel="noopener">📱 手机还没装 App？点此下载（Android APK）</a></div>
     <h2 style="margin-top:14px">快门</h2>
     <div class="row">
-      <button id="shoot" disabled>◉ 拍照并注入</button>
+      <button id="shoot" disabled>◉ 拍照</button>
       <button id="pip">置顶小窗</button>
     </div>
     <div id="log"></div>
@@ -71,6 +71,16 @@ const ctx2d = canvas.getContext('2d');
 const logEl = $('log');
 let lastFrameAt = 0, frames = 0, fpsTimer = 0, pendingShot = null;
 let streamRotation = 0;
+// The newest transient-error log entry (capture declined / no camera / timeout).
+// These describe a MOMENTARY condition — the moment the world recovers (stream
+// back on, phone back online, photo actually landing) the stale complaint must
+// go, instead of sitting in the log forever like a permanent failure.
+let lastTransientErr = null;
+function clearTransientErr() {
+  if (lastTransientErr && lastTransientErr.isConnected) lastTransientErr.remove();
+  lastTransientErr = null;
+}
+const TRANSIENT_ERR_CODES = new Set(['CAPTURE_DECLINED', 'NO_CAMERA', 'CAPTURE_TIMEOUT']);
 
 function log(msg, cls) {
   const d = document.createElement('div');
@@ -137,16 +147,10 @@ function connect() {
         $('shoot').disabled = !m.camera.connected;
         if (m.camera.rotation !== undefined) streamRotation = m.camera.rotation;
         $('hint').style.display = m.camera.connected ? 'none' : '';
+        if (m.camera.connected) clearTransientErr();
         break;
       case 'frame_meta':
         if (m.rotation !== undefined) streamRotation = m.rotation;
-        break;
-      case 'device':
-        $('dot').className = m.online ? 'on' : '';
-        $('dev').textContent = m.online ? (m.name || '已连接') : '未连接';
-        $('shoot').disabled = !m.online;
-        $('hint').style.display = m.online ? 'none' : '';
-        $('hint').textContent = '等待手机连接…';
         break;
       case 'paired':
         // pairing consumed the one-time code: rotate the QR now, don't wait
@@ -158,27 +162,22 @@ function connect() {
         pendingShot = m.captureId;
         log('快门已触发' + (m.note ? '(' + m.note + ')' : '') + '…');
         break;
-      case 'injected':
-        pendingShot = null;
-        if (m.ok) log('已注入会话 ' + (m.sessionId || '').slice(0, 8) + (m.name ? ' · ' + m.name : ''), 'ok');
-        else log('入库成功,注入未完成: ' + (m.reason || ''), 'err');
-        break;
-      case 'upload':
-        log('图片已入库 ' + (m.name || ''), 'ok');
-        break;
       // modern-protocol branches (this page previously only knew the retired
       // messages, so photos succeeded silently and preview-off was invisible)
       case 'pending_image':
         if (pendingShot) { pendingShot = null; log('照片已入库,已放入输入框' + (m.name ? ': ' + m.name : ''), 'ok'); }
         else log('照片已入库,已放入输入框' + (m.name ? ': ' + m.name : ''), 'ok');
+        clearTransientErr();
         break;
       case 'upload_saved':
         if (pendingShot) pendingShot = null;
         log('已保存至 ' + (m.dir || '指定文件夹') + (m.name ? ' · ' + m.name : ''), 'ok');
+        clearTransientErr();
         break;
       case 'preview_state':
         if (!m.on && m.reason === 'offline') { $('dev').textContent = '连接已断开'; $('hint').textContent = '等待手机连接…'; $('hint').style.display = ''; }
         else if (!m.on) { $('dev').textContent = '预览已关闭'; $('hint').textContent = '手机端已停止预览'; $('hint').style.display = ''; }
+        else if (m.on) clearTransientErr();
         break;
       case 'devices': {
         const active = (m.devices || []).find((d) => d.active);
@@ -187,11 +186,16 @@ function connect() {
         $('shoot').disabled = !active;
         $('hint').style.display = active ? 'none' : '';
         $('hint').textContent = '等待手机连接…';
+        if (active) clearTransientErr();
         break;
       }
-      case 'error':
-        log('错误 ' + m.code + (m.message ? ': ' + m.message : ''), 'err');
+      case 'error': {
+        // hub broadcasts carry a human-readable Chinese message now — show it
+        // alone; the wire code is only a fallback for unknown/legacy types
+        log(m.message || ('错误 ' + m.code), 'err');
+        if (TRANSIENT_ERR_CODES.has(m.code)) lastTransientErr = logEl.firstElementChild;
         break;
+      }
     }
   };
 }
@@ -204,6 +208,10 @@ $('pip').onclick = async () => {
   try {
     const stream = canvas.captureStream(10);
     const v = $('pipvid');
+    // stop the PREVIOUS stream's tracks before replacing srcObject — each
+    // unchecked re-request used to leak one live MediaStream per click
+    const old = v.srcObject;
+    if (old instanceof MediaStream) old.getTracks().forEach((t) => t.stop());
     v.srcObject = stream;
     await v.play();
     await v.requestPictureInPicture();

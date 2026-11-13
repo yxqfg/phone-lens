@@ -26,9 +26,62 @@ window.__ModuleLoader__.load({
 		// FAB_EV CustomEvent so both stay live without a host round-trip.
 		const FAB_KEY = "phoneLens.fab";
 		const FAB_EV = "phone-lens:fab-changed";
-		// port edits from the settings page push the overlay to re-point its
-		// URLs without a page reload
+		// port updates push the overlay to re-point its URLs without a page
+		// reload (fired by discovery when the cached port turns out stale)
 		const PORT_EV = "phone-lens:port-changed";
+		// The listen port is HOST-owned (plugin config server.port, default
+		// 8791) — the localStorage entry is only a discovery cache, never a
+		// source of truth. Discovery probes candidates against GET /info and
+		// locks onto whichever port actually answers as this plugin.
+		const DEFAULT_PORT = "8791";
+		function cachedLensPort() {
+			try {
+				return window.localStorage.getItem(PORT_KEY) || DEFAULT_PORT;
+			} catch {
+				return DEFAULT_PORT;
+			}
+		}
+		async function probeLensPort(p) {
+			try {
+				const ctl = new AbortController();
+				const timer = setTimeout(() => ctl.abort(), 2500);
+				const r = await fetch(`http://127.0.0.1:${p}/info`, { cache: "no-store", signal: ctl.signal });
+				clearTimeout(timer);
+				if (!r.ok) return null;
+				const d = await r.json().catch(() => null);
+				// strict identity: only the real phone-lens /info carries this exact
+				// name literal (same string as the host's /info route). Scanning a
+				// 10-port range makes loose "any JSON with a name" matching too
+				// easy to false-lock onto an unrelated loopback service.
+				if (!d || typeof d !== "object" || d.name !== "PhoneLens 直连取景") return null;
+				return { port: String(d.serverPort || p), version: d.version || "" };
+			} catch {
+				return null;
+			}
+		}
+		// Returns the first candidate that answers as phone-lens (cached port
+		// first, then the whole 8791~8800 range low→high — the host falls back
+		// upward over the same range when 8791 is taken), syncs the cache, and
+		// broadcasts PORT_EV on change. If nothing answers, returns the cached
+		// value so the UI keeps showing diagnostics against the last-known port
+		// instead of guessing.
+		async function discoverLensPort() {
+			const cached = cachedLensPort();
+			const ports = ["8791", "8792", "8793", "8794", "8795", "8796", "8797", "8798", "8799", "8800"];
+			const candidates = cached === DEFAULT_PORT ? ports : [cached, ...ports.filter((p) => p !== cached)];
+			for (const p of candidates) {
+				const hit = await probeLensPort(p);
+				if (!hit) continue;
+				if (hit.port !== cached) {
+					try {
+						window.localStorage.setItem(PORT_KEY, hit.port);
+						window.dispatchEvent(new CustomEvent(PORT_EV));
+					} catch {}
+				}
+				return hit.port;
+			}
+			return cached;
+		}
 		const FAB_SIZES = [
 			{ id: "s", label: "小", px: 38 },
 			{ id: "m", label: "标准", px: 46 },
@@ -135,6 +188,8 @@ window.__ModuleLoader__.load({
 .lm-device { flex: none; padding: 4px 8px; border-radius: 14px; border: 1px solid #2f3b48; background: #1f2937; color: #8fa1b5; font-size: 11px; cursor: pointer; }
 .lm-device.active { border-color: #46a758; color: #d2f5d8; background: #1f4a2c; }
 .lm-device:hover { background: #28323e; }
+.lm-unbind { flex: none; width: 15px; height: 15px; padding: 0; border: none; border-radius: 50%; background: none; color: #8fa1b5; font-size: 9px; line-height: 1; cursor: pointer; }
+.lm-unbind:hover { color: #e5696e; background: #2a1f22; }
 .lm-rename { position: absolute; right: 0; bottom: 56px; width: 268px; background: #14181d; border: 1px solid #2a333e; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.6); padding: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 5; }.lm-rename-title { font-size: 13px; color: #dfe7ee; font-weight: 600; }
 .lm-rename-input { background: #0d1117; color: #dfe7ee; border: 1px solid #2f3b48; border-radius: 8px; padding: 8px; font-size: 13px; }
 .lm-appqr { position: absolute; right: 0; bottom: 56px; width: 268px; background: #14181d; border: 1px solid #2a333e; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.6); padding: 12px; display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 6; }
@@ -280,7 +335,14 @@ window.__ModuleLoader__.load({
 			const resp = await fetch(`http://127.0.0.1:${port}/pending/${attachmentId}`).catch((e) => { throw new Error("fetch pending: " + String(e)); });
 			if (!resp.ok) throw new Error("pending fetch HTTP " + resp.status);
 			const buf = await resp.arrayBuffer();
-			const file = new File([buf], `phone-${attachmentId.slice(0, 8)}.jpg`, { type: "image/jpeg" });
+			// PNG/WebP uploads stage with their original bytes (high-quality
+			// passes originals through) — sniff the type, don't trust the
+			// flattened .jpg staging name
+			const u8 = new Uint8Array(buf);
+			const isPng = u8.length >= 4 && u8[0] === 0x89 && u8[1] === 0x50 && u8[2] === 0x4e && u8[3] === 0x47;
+			const isWebp = !isPng && u8.length >= 12 && String.fromCharCode(u8[0], u8[1], u8[2], u8[3]) === "RIFF" && String.fromCharCode(u8[8], u8[9], u8[10], u8[11]) === "WEBP";
+			const mime = isPng ? "image/png" : isWebp ? "image/webp" : "image/jpeg";
+			const file = new File([buf], `phone-${attachmentId.slice(0, 8)}.${isPng ? "png" : isWebp ? "webp" : "jpg"}`, { type: mime });
 			// rc.2 path: the composer's own paste handler admits image files
 			// through the official intake (intakeFiles → createDrafts), so we
 			// dispatch a synthetic paste instead of touching package-internal
@@ -329,6 +391,10 @@ window.__ModuleLoader__.load({
 			const [qr, setQr] = useState(null);
 			const [, setTick] = useState(0); // 1s heartbeat: re-renders the QR countdown while pairing is visible
 			const [flash, setFlash] = useState("");
+			// last flash's kind: the recovery paths (stream back on / phone back
+			// online) clear only ERROR flashes — success messages own their
+			// lifetime and get replaced by the next event naturally
+			const flashIsErr = useRef(false);
 			const [pending, setPending] = useState([]); // [{id, name}] waiting to be staged
 			const [devices, setDevices] = useState([]); // [{id,name,active,appVersion?}]
 			// Host plugin-update check (update-check.ts): null = unchecked/failed —
@@ -364,6 +430,13 @@ window.__ModuleLoader__.load({
 
 			const baseUrl = `http://127.0.0.1:${port}`;
 			const wsUrl = `ws://127.0.0.1:${port}/ws/view`;
+
+			// one-shot port discovery on mount: the port state starts from the
+			// localStorage cache; discovery re-points it (via PORT_EV) if the
+			// cache is stale — the host's actual listen port is the only truth
+			useEffect(() => {
+				void discoverLensPort();
+			}, []);
 
 			// plugin-update check, once per panel-open (host caches the Gitee
 			// lookup 12h / failures 30min — this fetch never hits the API itself)
@@ -415,32 +488,40 @@ window.__ModuleLoader__.load({
 						} catch {
 							return;
 						}
-						if (m.type === "meta" || m.type === "device") {
-							const on = m.type === "meta" ? m.camera.connected : m.online;
-							setCamOn(Boolean(on));
-							setLink((prev) => {
-								if (!on) return "disconnected";
-								return prev === "disconnected" ? "connecting" : prev;
-							});
-							if (m.type === "meta" && m.camera.rotation !== undefined) rotRef.current = m.camera.rotation;
-						} else if (m.type === "frame_meta") {
+					if (m.type === "meta") {
+						const on = m.camera.connected;
+						setCamOn(Boolean(on));
+						setLink((prev) => {
+							if (!on) return "disconnected";
+							return prev === "disconnected" ? "connecting" : prev;
+						});
+						// phone (re)connected: same transient-error clearing as
+						// preview_state — the complaint is stale the moment it's back
+						if (on && flashIsErr.current) {
+							flashIsErr.current = false;
+							setFlash("");
+						}
+						if (m.camera.rotation !== undefined) rotRef.current = m.camera.rotation;
+					} else if (m.type === "frame_meta") {
 							if (m.rotation !== undefined) rotRef.current = m.rotation;
-						} else if (m.type === "preview_state") {
-							// host-derived: the ACTIVE phone's stream stopped — either the
-							// user turned preview off in the app (keepalive still alive) or
-							// the link itself died (no frames AND no keepalive for 25s →
-							// reason:"offline"). Old hosts never send `reason` → legacy
-							// behavior is kept bit-for-bit.
-							setPreviewOff(!m.on);
-							setPreviewOffline(!m.on && m.reason === "offline");
+					} else if (m.type === "preview_state") {
+						// host-derived: the ACTIVE phone's stream stopped — either the
+						// user turned preview off in the app (keepalive still alive) or
+						// the link itself died (no frames AND no keepalive for 25s →
+						// reason:"offline"). Old hosts never send `reason` → legacy
+						// behavior is kept bit-for-bit.
+						setPreviewOff(!m.on);
+						setPreviewOffline(!m.on && m.reason === "offline");
+						// the stream is live again: an error flash (CAPTURE_DECLINED /
+						// NO_CAMERA …) described a TRANSIENT condition — clear it now
+						// instead of letting the stale complaint sit there forever
+						if (m.on && flashIsErr.current) {
+							flashIsErr.current = false;
+							setFlash("");
+						}
 						} else if (m.type === "upload_saved") {
 							// folder-only mode: the photo bypassed the composer; local hint
 							setFlashOk(`已保存至 ${m.dir || "指定文件夹"}`);
-						} else if (m.type === "injected") {
-							if (m.ok) setFlashOk(`已注入会话 ${(m.sessionId || "").slice(0, 8)}…`);
-							else setFlashErr(`已保存到电脑 ✓(未注入:${m.reason || "无活动会话"})`);
-						} else if (m.type === "upload") {
-							setFlashOk("图片已入库…");
 						} else if (m.type === "pending_image") {
 							// pre-send: stage this photo into the composer draft
 							setPending((p) => [...p, { id: m.attachmentId, name: m.name || "" }]);
@@ -478,7 +559,9 @@ window.__ModuleLoader__.load({
 							setFlashOk(`设备已配对${m.name ? ": " + m.name : ""},二维码已更换`);
 							void refreshQr(true);
 						} else if (m.type === "error") {
-							setFlashErr(`${m.code}${m.message ? ":" + m.message : ""}`);
+							// human text first (all hub broadcasts carry Chinese messages
+							// now); the wire code is only a fallback for unknown/legacy types
+							setFlashErr(m.message || m.code || "未知错误");
 						}
 					};
 						ws.onclose = () => {
@@ -566,12 +649,14 @@ window.__ModuleLoader__.load({
 				setAnchor(`${vertical}-${horizontal}`);
 			}, [open, rename, appQr, dirPick, settingsOpen, camOn, previewOff, Boolean(qr), pending.length, fabSt]);
 
-			function setFlashOk(t) {
-				setFlash(t);
-			}
-			function setFlashErr(t) {
-				setFlash(t);
-			}
+						function setFlashOk(t) {
+							flashIsErr.current = false;
+							setFlash(t);
+						}
+						function setFlashErr(t) {
+							flashIsErr.current = true;
+							setFlash(t);
+						}
 
 			async function refreshQr(auto) {
 				try {
@@ -582,9 +667,31 @@ window.__ModuleLoader__.load({
 					if (auto && lastQrCode.current && lastQrCode.current !== data.code) setFlashOk("二维码已更新,请扫描最新码");
 					lastQrCode.current = data.code;
 					setQr(data);
-				} catch (e) {
-					setFlashErr(`接收服务不可达(${String(e).slice(0, 60)})`);
+			} catch (e) {
+				// the cached port may be stale (host re-bound / another
+				// instance) — one discovery pass may re-point the URLs via
+				// PORT_EV. When the port moved, re-fetch the QR against the
+				// new port right here: this closure still holds the old
+				// baseUrl, and the qr effect would not retry until the next
+				// expiry/drift tick, leaving the panel stuck on "加载中…".
+				const found = await discoverLensPort();
+				if (found !== port) {
+					try {
+						const r = await fetch(`http://127.0.0.1:${found}/qr.json`, { cache: "no-store" });
+						if (!r.ok) throw new Error(`HTTP ${r.status}`);
+						const data = await r.json();
+						lastQrCode.current = data.code;
+						setQr(data);
+						setFlashOk(`端口已自动切换为 ${found},二维码已恢复`);
+						return;
+					} catch {}
 				}
+				setFlashErr(
+					found !== port
+						? `端口已自动切换为 ${found},二维码恢复失败,请点「↻ 二维码」重试`
+						: `接收服务不可达(127.0.0.1:${port})——请确认电脑端 phone-lens 已启动且端口未被占用`,
+				);
+			}
 			}
 
 			// Manual refresh must FORCE a new pairing code server-side: /qr.json
@@ -674,7 +781,7 @@ window.__ModuleLoader__.load({
 			function shoot() {
 				const ws = wsRef.current;				if (ws && ws.readyState === 1) {
 					ws.send(JSON.stringify({ type: "capture" }));
-					setFlash("快门已触发,等待手机上传…");
+					setFlashOk("快门已触发,等待手机上传…");
 				}
 			}
 
@@ -692,12 +799,35 @@ window.__ModuleLoader__.load({
 				if (trimmed && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "rename_device", deviceId: rename.id, name: trimmed }));
 				setRename(null);
 			}
-			// port now lives in the settings page; edits arrive via PORT_EV so
-			// the overlay re-points baseUrl/wsUrl without a reload
+			// Unbind a paired device (host POST /devices/remove, loopback-only).
+			// Confirmed — this erases the pairing entry, the phone must re-scan
+			// to come back. Success removes the chip locally; the host also
+			// refreshes the views, so the next devices broadcast agrees.
+			async function unbindDevice(d) {
+				const label = d.name || d.id.slice(0, 8);
+				if (!window.confirm(`解绑设备「${label}」？解绑后该手机需重新扫码配对。`)) return;
+				try {
+					const r = await fetch(`${baseUrl}/devices/remove`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ deviceId: d.id }),
+					});
+					if (!r.ok) throw new Error(`HTTP ${r.status}`);
+					const data = await r.json().catch(() => null);
+					if (!data || data.ok !== true) throw new Error("设备不存在或已被解绑");
+					setDevices((prev) => prev.filter((x) => x.id !== d.id));
+					if (d.active) setCamOn(false);
+					setFlashOk(`设备已解绑: ${label}`);
+				} catch (e) {
+					setFlashErr("解绑失败: " + String((e && e.message) || e).slice(0, 80));
+				}
+			}
+			// port cache updates (discovery) arrive via PORT_EV so the overlay
+			// re-points baseUrl/wsUrl without a reload
 			useEffect(() => {
 				const onPort = () => {
 					try {
-						setPort(window.localStorage.getItem(PORT_KEY) || "8791");
+						setPort(window.localStorage.getItem(PORT_KEY) || DEFAULT_PORT);
 					} catch {}
 				};
 				window.addEventListener(PORT_EV, onPort);
@@ -847,15 +977,24 @@ window.__ModuleLoader__.load({
 									}
 									return h("div", { className: "lm-appver", key: "appver" }, `手机 App v${app}`);
 								})(),
-								devices && devices.length > 1
+								devices && devices.length > 0
 									? h(
 											"div",
 											{ className: "lm-devices" },
 											devices.map((d) =>
 												h(
-													"button",
-													{ key: d.id, className: "lm-device" + (d.active ? " active" : ""), onClick: () => selectDevice(d.id), onDoubleClick: () => renameDevice(d.id, d.name), title: "单击切换 · 双击重命名" },
-													(d.active ? "● " : "○ ") + d.name,
+													"span",
+													{ key: d.id, style: { display: "inline-flex", alignItems: "center", gap: "2px" } },
+													h(
+														"button",
+														{ className: "lm-device" + (d.active ? " active" : ""), onClick: () => selectDevice(d.id), onDoubleClick: () => renameDevice(d.id, d.name), title: "单击切换 · 双击重命名" },
+														(d.active ? "● " : "○ ") + d.name,
+													),
+													h(
+														"button",
+														{ className: "lm-unbind", onClick: () => void unbindDevice(d), title: "解绑此设备(解绑后需重新扫码配对)" },
+														"✕",
+													),
 												),
 											),
 										)
@@ -910,7 +1049,12 @@ window.__ModuleLoader__.load({
 									h("a", { className: "lm-dl", href: "#", onClick: (e) => { e.preventDefault(); void openAppQr(); }, title: "弹出二维码,手机扫码下载" }, "手机还没装 App？点此扫码下载"),
 										)
 									: null,
-								h("span", { className: `lm-flash${flash.startsWith("已") ? " ok" : ""}` }, flash),
+								// kind-flag styling, not string sniffing: "照片已注入输入框…"
+								// and friends don't start with "已" — judge by the
+								// flashIsErr ref that setFlashOk/setFlashErr maintain
+								// (kept in lockstep with the flash state, so it's current
+								// at render time)
+								h("span", { className: "lm-flash" + (flash ? (flashIsErr.current ? " err" : " ok") : "") }, flash),
 								h(
 									"div",
 									{ className: "lm-row" },
@@ -956,7 +1100,7 @@ window.__ModuleLoader__.load({
 															? h("div", { className: "lm-sethint" }, `留空路径即恢复默认目录: ${appSt.effectiveSaveDir}`)
 															: null,
 													]
-													: h("div", { className: "lm-sethint" }, "设置服务不可用(电脑端版本较旧),请更新后再调整拍照模式与保存目录;端口设置在 设置 → PhoneLens 内。"),
+													: h("div", { className: "lm-sethint" }, "设置服务不可用(电脑端版本较旧),请更新后再调整拍照模式与保存目录;端口查看在 设置 → PhoneLens 内。"),
 										)
 									: null,
 							),
@@ -1065,9 +1209,9 @@ window.__ModuleLoader__.load({
 		// settings stay in the overlay ⚙ panel on purpose (switched constantly).
 		function currentLensPort() {
 			try {
-				return window.localStorage.getItem(PORT_KEY) || "8791";
+				return window.localStorage.getItem(PORT_KEY) || DEFAULT_PORT;
 			} catch {
-				return "8791";
+				return DEFAULT_PORT;
 			}
 		}
 
@@ -1103,27 +1247,50 @@ window.__ModuleLoader__.load({
 		}
 
 		function LensSettingsSection() {
-			const [st, setSt] = useState(undefined); // host app-settings: undefined=loading, false=unavailable, object=live
+			// host app-settings: undefined=loading, false=unreachable (nothing
+			// listening on the port), "old"=404 (host < 1.0.4 lacks the
+			// endpoint), object=live
+			const [st, setSt] = useState(undefined);
 			const [flash, setFlash] = useState("");
 			const [fab, setFab] = useState(loadFabSt); // ball geometry (local, synced with the overlay via FAB_EV)
-			const [portDraft, setPortDraft] = useState(currentLensPort);
+			// resolved port: starts from the discovery cache; discovery owns
+			// the truth and re-points this via PORT_EV, then the st fetch
+			// below re-runs for the new port
+			const [port, setPort] = useState(currentLensPort);
+
+			useEffect(() => {
+				const onPort = () => setPort(currentLensPort());
+				window.addEventListener(PORT_EV, onPort);
+				return () => window.removeEventListener(PORT_EV, onPort);
+			}, []);
+			// kick discovery on mount (idempotent with the overlay's own run;
+			// both converge on the port that actually answers /info)
+			useEffect(() => {
+				void discoverLensPort();
+			}, []);
 
 			useEffect(() => {
 				let alive = true;
 				void (async () => {
 					try {
-						const r = await fetch(`http://127.0.0.1:${currentLensPort()}/app-settings`, { cache: "no-store" });
-						if (!r.ok) throw new Error(String(r.status));
+						const r = await fetch(`http://127.0.0.1:${port}/app-settings`, { cache: "no-store" });
+						if (!r.ok) {
+							const err = new Error(String(r.status));
+							err.httpStatus = r.status;
+							throw err;
+						}
 						const data = await r.json();
 						if (alive) setSt(data);
-					} catch {
-						if (alive) setSt(false);
+					} catch (e) {
+						// network error = nothing listening on this port;
+						// 404 = endpoint missing → host too old
+						if (alive) setSt(e && e.httpStatus === 404 ? "old" : false);
 					}
 				})();
 				return () => {
 					alive = false;
 				};
-			}, []);
+			}, [port]);
 
 			// the overlay drags the ball, this page edits it — stay in sync both ways
 			useEffect(() => {
@@ -1134,7 +1301,7 @@ window.__ModuleLoader__.load({
 
 			async function patch(p) {
 				try {
-					const r = await fetch(`http://127.0.0.1:${currentLensPort()}/app-settings`, {
+					const r = await fetch(`http://127.0.0.1:${port}/app-settings`, {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify(p),
@@ -1153,16 +1320,6 @@ window.__ModuleLoader__.load({
 			function fabPatch(next) {
 				saveFabSt(next);
 				setFab(next || null);
-			}
-			function savePortDraft() {
-				const p = String(portDraft).trim() || "8791";
-				setPortDraft(p);
-				try {
-					window.localStorage.setItem(PORT_KEY, p);
-					window.dispatchEvent(new CustomEvent(PORT_EV));
-					setFlash("端口已保存");
-					setTimeout(() => setFlash(""), 1800);
-				} catch {}
 			}
 
 			const infoRow = (title, desc, key) =>
@@ -1218,8 +1375,10 @@ window.__ModuleLoader__.load({
 						st === undefined
 							? h("div", { className: "lm-setsec-note", style: { padding: "12px 16px" }, key: "loading" }, "加载中…")
 							: st === false
-								? h("div", { className: "lm-setsec-note", style: { padding: "12px 16px" }, key: "unavail" }, "设置服务不可用(需电脑端 phone-lens ≥ 1.0.4)")
-								: [
+								? h("div", { className: "lm-setsec-note", style: { padding: "12px 16px" }, key: "unreach" }, `无法连接接收服务(127.0.0.1:${port})——可能服务未启动、端口被占用或插件配置了非默认端口。请确认电脑端 phone-lens 已随宿主启动。`)
+								: st === "old"
+									? h("div", { className: "lm-setsec-note", style: { padding: "12px 16px" }, key: "unavail" }, "设置服务不可用(需电脑端 phone-lens ≥ 1.0.4)")
+									: [
 										h(LensSetRow, {
 											key: "t1",
 											title: "启用模型相机工具",
@@ -1230,18 +1389,11 @@ window.__ModuleLoader__.load({
 											title: "模型免确认调用",
 											desc: "开启时模型调用不弹确认框;关闭后每次调用需你在弹窗中确认(若宿主不支持审批弹窗,则视为拒绝)",
 										}, h(LensSwitch, { checked: st.modelToolsConfirmFree, onChange: (v) => void patch({ modelToolsConfirmFree: v }) })),
-										// tool names in the open (user-requested): what the
-										// model will actually see in its tool list
-										infoRow("拍摄照片(phone_take_photo)", "手机立即拍照,照片直接进入模型视野——不放入输入框、不保存到电脑文件夹,与拍照注入模式设置无关。", "w1"),
-										infoRow("关闭手机摄像头(phone_camera_pause)", "让手机相机提前进入空闲省电状态。", "w2"),
-										infoRow("恢复手机摄像头(phone_camera_resume)", "立即打开相机并恢复预览拍摄。", "w3"),
-										infoRow("调整/查询变焦(phone_camera_zoom)", "按指定倍数(或步进)拉近/拉远手机镜头;不带参数调用即查询当前倍数与支持范围。超出设备范围自动收拢。", "w4"),
-										infoRow("切换/查询镜头(phone_camera_lens)", "切换手机前置/后置摄像头;不带参数调用即查询当前使用的镜头与设备可用镜头。需手机端 ≥ 1.1.3。", "w5"),
-										h(
-											"div",
-											{ className: "lm-set-row", key: "ft" },
-											h("span", { className: "lm-set-rowtext" }, h("span", { className: "lm-set-rowdesc" }, "高频的「拍照注入模式 / 保存目录(可浏览选择文件夹)」设置仍在悬浮窗 ⚙ 面板")),
-										),
+										h(LensSetRow, {
+											key: "t3",
+											title: "工作 (Beta)",
+											desc: "允许手机 App 镜像并操作本机会话(流式/发送/停止等)。默认关闭;关闭时手机端工作入口不可用",
+										}, h(LensSwitch, { checked: !!st.workBetaEnabled, onChange: (v) => void patch({ workBetaEnabled: v }) })),
 									],
 					),
 				),
@@ -1278,12 +1430,40 @@ window.__ModuleLoader__.load({
 					h(
 						"div",
 						{ className: "lm-setsec-rows" },
-						h(LensSetRow, { key: "c1", title: "接收端口", desc: "phone-lens 接收服务监听的端口(默认 8791,多实例/端口冲突时调整)" },
-							h("input", { value: portDraft, onChange: (e) => setPortDraft(e.target.value), onKeyDown: (e) => e.key === "Enter" && savePortDraft(), inputMode: "numeric", style: { width: 72, background: "var(--dsw-alias-bg-layer-2, rgba(255,255,255,.05))", color: "var(--dsw-alias-label-primary, #e6edf5)", border: "1px solid var(--dsw-alias-border-l2, rgba(255,255,255,.14))", borderRadius: 8, padding: "5px 8px", fontSize: 13 } }),
-							h("button", { type: "button", onClick: savePortDraft, style: { marginLeft: 8, padding: "5px 12px", borderRadius: 8, border: "1px solid var(--dsw-alias-button-primary-fill, #3b82f6)", background: "var(--dsw-alias-button-primary-fill, #3b82f6)", color: "#fff", fontSize: 12, cursor: "pointer" } }, "保存"),
+						// read-only: the listen port is host-owned (plugin config
+						// server.port). The browser only discovers it (/info) —
+						// editing it here could never re-bind the host anyway.
+						h(LensSetRow, { key: "c1", title: "接收端口", desc: "由电脑端插件配置决定(默认 8791),只读展示;端口被占用时接收端会自动尝试 8792~8800,此处显示的是实际生效端口。" },
+							h("span", { style: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", fontSize: 13, opacity: 0.9 } }, `127.0.0.1:${port}`),
 						),
 					),
 				),
+				// ── card: command reference (kept last per user-requested layout;
+				// only rendered when the tool list is actually live) ──
+				st && typeof st === "object"
+					? h(
+							"div",
+							{ className: "lm-setsec-card", key: "usage" },
+							h("div", { className: "lm-setsec-cardhead" }, "命令说明"),
+							h(
+								"div",
+								{ className: "lm-setsec-rows" },
+								// tool names in the open (user-requested): what the
+								// model will actually see in its tool list
+								infoRow("拍摄照片(phone_take_photo)", "手机立即拍照,照片直接进入模型视野——不放入输入框、不保存到电脑文件夹,与拍照注入模式设置无关。", "w1"),
+								infoRow("关闭手机摄像头(phone_camera_pause)", "让手机相机提前进入空闲省电状态。", "w2"),
+								infoRow("恢复手机摄像头(phone_camera_resume)", "立即打开相机并恢复预览拍摄。", "w3"),
+								infoRow("调整/查询变焦(phone_camera_zoom)", "按指定倍数(或步进)拉近/拉远手机镜头;不带参数调用即查询当前倍数与支持范围。超出设备范围自动收拢。", "w4"),
+								infoRow("切换/查询镜头(phone_camera_lens)", "切换手机前置/后置摄像头;不带参数调用即查询当前使用的镜头与设备可用镜头。需手机端 ≥ 1.1.3。", "w5"),
+								infoRow("开关/查询手电筒(phone_camera_torch)", "打开/关闭手机闪光灯常亮照明,或查询当前状态;需相机处于开启状态。需手机端 ≥ 1.1.6。", "w6"),
+								h(
+									"div",
+									{ className: "lm-set-row", key: "ft" },
+									h("span", { className: "lm-set-rowtext" }, h("span", { className: "lm-set-rowdesc" }, "高频的「拍照注入模式 / 保存目录(可浏览选择文件夹)」设置仍在悬浮窗 ⚙ 面板")),
+								),
+							),
+						)
+					: null,
 				flash ? h("div", { className: "lm-setsec-note", key: "f" }, flash) : null,
 			);
 		}

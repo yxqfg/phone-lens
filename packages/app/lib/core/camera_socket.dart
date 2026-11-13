@@ -87,6 +87,11 @@ class CameraSocket {
   /// [reqId] must be echoed back via [reportLens].
   void Function(String? lens, String? reqId)? onLensControl;
 
+  /// Host-initiated torch on/off/query (the model tool phone_camera_torch).
+  /// Null [on] = pure query of the torch state. [reqId] must be echoed back
+  /// via [reportTorch].
+  void Function(bool? on, String? reqId)? onTorchControl;
+
   void _setState(LensLinkState s) {
     _state = s;
     _states.add(s);
@@ -168,6 +173,8 @@ class CameraSocket {
             );
           } else if (msg['type'] == 'camera_lens') {
             onLensControl?.call(msg['lens'] as String?, msg['reqId'] as String?);
+          } else if (msg['type'] == 'camera_torch') {
+            onTorchControl?.call(msg['on'] as bool?, msg['reqId'] as String?);
           }
         },
         onDone: () {
@@ -381,6 +388,24 @@ class CameraSocket {
       'ok': ok,
       if (lens != null) 'lens': lens,
       if (available != null) 'available': available,
+      if (reason != null) 'reason': reason,
+    }));
+  }
+
+  /// Receipt for a host-initiated camera_torch (on/off/query alike):
+  /// [reqId] echoes what the host sent. [on] = the torch state AFTER the
+  /// operation, or the current state for a pure query.
+  void reportTorch(
+    String? reqId, {
+    required bool ok,
+    bool? on,
+    String? reason,
+  }) {
+    _send(jsonEncode({
+      'type': 'torch_result',
+      if (reqId != null) 'reqId': reqId,
+      'ok': ok,
+      if (on != null) 'on': on,
       if (reason != null) 'reason': reason,
     }));
   }
